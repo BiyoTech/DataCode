@@ -1,0 +1,236 @@
+syntax = "proto3";
+
+package sqlmesh.v1;
+
+option go_package = "github.com/agenticdata/proto/sqlmesh/v1;sqlmeshv1";
+
+import "common/v1/common.proto";
+
+// SQLMeshService encapsulates SQLMesh core operations.
+// Maps to "Model Development" and "Environment & Deployment" bounded contexts.
+service SQLMeshService {
+  // CreatePlan generates a Plan for the target Environment, showing change summary.
+  rpc CreatePlan(CreatePlanRequest) returns (PlanResponse);
+
+  // ApplyPlan executes a Plan against the target Environment (DDL/DML).
+  rpc ApplyPlan(ApplyPlanRequest) returns (ApplyResponse);
+
+  // GetLineage returns the dependency DAG (Lineage) for models in a project.
+  rpc GetLineage(GetLineageRequest) returns (LineageResponse);
+
+  // DiscoverSchema queries the Gateway (data source) for table/column schemas.
+  rpc DiscoverSchema(DiscoverSchemaRequest) returns (SchemaResponse);
+
+  // ListModels returns all Model entities in a project with metadata.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // GetModel returns detailed information about a single Model.
+  rpc GetModel(GetModelRequest) returns (GetModelResponse);
+
+  // ValidateModel checks a model SQL file for syntax/semantic errors.
+  rpc ValidateModel(ValidateModelRequest) returns (ValidateResponse);
+
+  // ExecuteQuery runs an ad-hoc SQL query against the Gateway with row/time limits.
+  rpc ExecuteQuery(ExecuteQueryRequest) returns (QueryResponse);
+
+  // RenderModel returns the rendered SQL for a model (with macro expansion).
+  rpc RenderModel(RenderModelRequest) returns (RenderModelResponse);
+}
+
+// --- Plan Operations ---
+
+message CreatePlanRequest {
+  string workspace_path = 1;
+  string environment = 2;     // target Environment name (e.g. "dev", "staging", "prod")
+  string start = 3;           // optional: start date override for backfill
+  string end = 4;             // optional: end date override for backfill
+  bool skip_backfill = 5;     // if true, create a forward-only plan
+  bool auto_apply = 6;        // if true, auto-apply after plan creation
+  repeated string select_models = 7;  // optional: only plan specific models
+}
+
+message PlanResponse {
+  string plan_id = 1;
+  string environment = 2;
+  string plan_type = 3;           // "backfill", "forward_only", "restatement"
+  string change_category = 4;    // "breaking", "non_breaking", "no_change"
+  bool is_virtual_update = 5;
+  repeated ModelChange added = 6;
+  repeated ModelChange modified = 7;
+  repeated string removed = 8;
+  string text_summary = 9;       // human-readable change summary
+  bool requires_backfill = 10;
+}
+
+message ModelChange {
+  string model_fqn = 1;          // Fully Qualified Name of the Model
+  string change_type = 2;        // "added", "direct_modified", "indirect_modified", "metadata_modified"
+  bool requires_backfill = 3;
+  string diff = 4;               // SQL diff for modified models
+}
+
+message ApplyPlanRequest {
+  string workspace_path = 1;
+  string environment = 2;
+}
+
+message ApplyResponse {
+  bool success = 1;
+  string message = 2;
+  repeated BackfillProgress backfill_tasks = 3;
+}
+
+message BackfillProgress {
+  string model_fqn = 1;
+  string status = 2;   // "pending", "running", "completed", "failed"
+  float progress = 3;  // 0.0 - 1.0
+  string error = 4;
+}
+
+// --- Lineage Operations ---
+
+message GetLineageRequest {
+  string workspace_path = 1;
+  string model_fqn = 2;  // optional: if empty, return full project lineage
+}
+
+message LineageResponse {
+  map<string, ModelLineageNode> models = 1;
+}
+
+message ModelLineageNode {
+  string fqn = 1;
+  string name = 2;
+  string kind = 3;              // "FULL", "INCREMENTAL_BY_TIME_RANGE", "VIEW", "SEED", etc.
+  string description = 4;
+  repeated string upstream = 5;   // upstream model FQNs
+  repeated string downstream = 6; // downstream model FQNs
+  repeated ColumnLineage columns = 7;
+}
+
+message ColumnLineage {
+  string column_name = 1;
+  string data_type = 2;
+  repeated ColumnSource sources = 3;
+}
+
+message ColumnSource {
+  string model_fqn = 1;
+  string column_name = 2;
+}
+
+// --- Schema Discovery ---
+
+message DiscoverSchemaRequest {
+  string workspace_path = 1;
+  string catalog = 2;  // optional: filter by catalog/database
+  string schema = 3;   // optional: filter by schema
+  string table = 4;    // optional: filter specific table
+}
+
+message SchemaResponse {
+  repeated TableSchema tables = 1;
+}
+
+message TableSchema {
+  string catalog = 1;
+  string schema = 2;
+  string table_name = 3;
+  repeated ColumnSchema columns = 4;
+}
+
+message ColumnSchema {
+  string name = 1;
+  string data_type = 2;
+  bool nullable = 3;
+  string description = 4;  // column comment if available
+  bool is_primary_key = 5;
+}
+
+// --- Model Operations ---
+
+message ListModelsRequest {
+  string workspace_path = 1;
+  string kind_filter = 2;  // optional: filter by model kind
+}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+message GetModelRequest {
+  string workspace_path = 1;
+  string model_fqn = 2;
+}
+
+message GetModelResponse {
+  ModelInfo model = 1;
+  string sql = 2;           // raw SQL content
+  string rendered_sql = 3;  // SQL after macro expansion
+}
+
+// ModelInfo represents the Model entity from domain model.
+message ModelInfo {
+  string model_id = 1;
+  string project_id = 2;
+  string fqn = 3;           // Fully Qualified Name
+  string name = 4;
+  string kind = 5;          // "FULL", "INCREMENTAL_BY_TIME_RANGE", "VIEW", "SEED", "SCD_TYPE_2"
+  string cron = 6;          // scheduling cron expression
+  repeated string grain = 7; // primary key columns (Grain)
+  string description = 8;
+  string owner = 9;
+  string fingerprint = 10;  // content hash for change detection
+  string dialect = 11;      // SQL Dialect
+  string file_path = 12;
+  repeated string tags = 13;
+  repeated string upstream_models = 14;
+}
+
+message ValidateModelRequest {
+  string workspace_path = 1;
+  string file_path = 2;     // relative path within workspace
+}
+
+message ValidateResponse {
+  bool valid = 1;
+  repeated ValidationError errors = 2;
+}
+
+message ValidationError {
+  string file_path = 1;
+  int32 line = 2;
+  int32 column = 3;
+  string severity = 4;  // "error", "warning"
+  string message = 5;
+}
+
+// --- Query Execution ---
+
+message ExecuteQueryRequest {
+  string workspace_path = 1;
+  string sql = 2;
+  int32 row_limit = 3;  // max rows to return, default 1000
+}
+
+message QueryResponse {
+  repeated string columns = 1;
+  repeated QueryRow rows = 2;
+  int64 total_rows = 3;
+  int64 execution_time_ms = 4;
+}
+
+message QueryRow {
+  repeated string values = 1;  // string-encoded column values
+}
+
+// --- Render ---
+
+message RenderModelRequest {
+  string workspace_path = 1;
+  string model_fqn = 2;
+}
+
+message RenderModelResponse {
+  string rendered_sql = 1;
+}

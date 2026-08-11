@@ -1,0 +1,59 @@
+# Infrastructure services for local development.
+# Usage: docker compose -f deploy/docker-compose.infra.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agenticdata-postgres
+    environment:
+      POSTGRES_USER: agenticdata
+      POSTGRES_PASSWORD: agenticdata_dev
+      POSTGRES_DB: agenticdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agenticdata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: agenticdata-redis
+    profiles: ["reserved"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gitea:
+    image: gitea/gitea:1.21-rootless
+    container_name: agenticdata-gitea
+    environment:
+      - GITEA__database__DB_TYPE=postgres
+      - GITEA__database__HOST=postgres:5432
+      - GITEA__database__NAME=gitea
+      - GITEA__database__USER=agenticdata
+      - GITEA__database__PASSWD=agenticdata_dev
+      - GITEA__server__ROOT_URL=http://localhost:3000
+      - GITEA__server__HTTP_PORT=3000
+    ports:
+      - "3000:3000"
+    volumes:
+      - gitea_data:/var/lib/gitea
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  gitea_data:

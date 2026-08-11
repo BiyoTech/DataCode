@@ -1,0 +1,67 @@
+# Agent Service Configuration
+server:
+  ws_port: 8001
+  grpc_port: 50051
+  host: "0.0.0.0"
+
+# LLM configuration
+# Supports multiple preset models; users can select or add custom models via frontend.
+#
+# API keys can be provided EITHER here in this file OR via environment variables.
+# Environment variables take precedence over the values below, so you can commit a
+# working default and override it per-environment without editing this file:
+#   - Per-model (by index): AGENT_SERVICE_LLM_MODELS__0__API_KEY / __BASE_URL
+#   - Per-model (by id):    AGENT_SERVICE_LLM_API_KEY__DATABRICKS_GPT_5_4
+#   - Global fallback:      AGENT_SERVICE_LLM_API_KEY (fills any model with an empty key)
+llm:
+  default_model: "databricks-gpt-5-4"       # Default model ID used when user doesn't specify
+  models:
+    - id: "databricks-gpt-5-4"
+      name: "databricks-gpt-5-4"
+      provider: "openai"
+      api_key: "dapid7c5e2e3d0a61e1734e2d706c7b05f51"   # Override via env AGENT_SERVICE_LLM_MODELS__0__API_KEY
+      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"              # Optional custom endpoint
+      max_tokens: 8192
+    - id: "databricks-gpt-5-1"
+      name: "databricks-gpt-5-1"
+      provider: "openai"
+      api_key: "dapid7c5e2e3d0a61e1734e2d706c7b05f51"   # Override via env AGENT_SERVICE_LLM_MODELS__1__API_KEY
+      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"
+      max_tokens: 4096
+
+# Upstream service endpoints
+services:
+  sqlmesh_service_url: "http://localhost:8002"
+  workspace_service_url: "localhost:50053"
+
+# Database for chat history & session persistence
+# Default: embedded SQLite (zero external dependencies, perfect for demo/dev).
+# Users can switch to MySQL/PostgreSQL via product settings UI later.
+database:
+  type: "sqlite"                 # "sqlite" (default) | "postgresql" | "mysql"
+  sqlite_path: ".data/agenticdata.db"
+  # host/port/name/username/password used when type=postgresql or mysql:
+  host: "localhost"
+  port: 5432
+  name: "agenticdata"
+  username: ""
+  password: ""
+
+# Agent behavior
+agent:
+  # Execution style controls autonomy (orthogonal to ask/craft/design capability mode):
+  #   agent       — autonomous: run the ReAct loop to completion (default)
+  #   interactive — step-by-step: confirm before proceeding
+  default_execution_style: "agent"
+  max_tool_call_timeout_seconds: 600
+  max_turns_per_message: 50
+  # Memory summarization — uses a cheaper/lighter model for background context compression
+  memory:
+    summarization:
+      model: "databricks-gpt-5-1"     # Model ID (must exist in llm.models above)
+      temperature: 0.8
+      max_tokens: 2000
+
+# Logging
+logging:
+  level: "debug"

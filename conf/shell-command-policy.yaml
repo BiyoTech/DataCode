@@ -1,0 +1,185 @@
+# Shell Command Security Policy
+# =============================================================================
+# Each rule defines a pattern (regex) matched against normalized commands.
+# Rules are evaluated in order; first match wins on deny, but strictest action
+# across all matches determines the final batch decision:
+#   deny > confirm > allow
+#
+# Shell connectors (;, &&, ||, |) are split before matching to prevent bypass.
+# Whitespace is normalized before pattern application.
+#
+# Known limitations (documented, not fixable at regex level):
+#   - Variable expansion ($VAR, `cmd`, $(cmd)) is NOT resolved
+#   - Quoted tokens ("rm -rf /") are matched as-is
+#   - Base64/eval obfuscation is NOT detected
+#   - These are defense-in-depth; the sandbox isolation is the primary guard.
+#
+# default_action: what to do when NO rule matches (allow / confirm / deny)
+# =============================================================================
+
+default_action: allow
+
+rules:
+  # -------------------------------------------------------------------
+  # DENY rules — dangerous commands that must NEVER execute
+  # -------------------------------------------------------------------
+
+  - name: block_rm_root_recursive
+    pattern: '(^|\s)rm\s+(-[a-zA-Z]*\s*)*(-rf|-fr|-r\s+-f)\s+(/|/\*)(\s|$)'
+    action: deny
+    risk_level: 6
+    reason: "Recursive force-delete of root filesystem is forbidden"
+
+  - name: block_rm_root_wildcard
+    pattern: '(^|\s)rm\s+.*([''"]?/[\*''"])'
+    action: deny
+    risk_level: 6
+    reason: "Deleting root-level paths is forbidden"
+
+  - name: block_mkfs
+    pattern: '(^|\s)mkfs\.?\w*\s'
+    action: deny
+    risk_level: 6
+    reason: "Filesystem creation commands are forbidden"
+
+  - name: block_dd_write_device
+    pattern: '(^|\s)dd\s+.*of=/dev/(?!null|zero|random|urandom)\w+'
+    action: deny
+    risk_level: 6
+    reason: "Writing raw data to block devices is forbidden"
+
+  - name: block_fork_bomb
+    pattern: '(^|\s):\(\)\s*\{.*:\|:'
+    action: deny
+    risk_level: 6
+    reason: "Fork bomb pattern detected"
+
+  - name: block_chmod_777_recursive
+    pattern: '(^|\s)chmod\s+(-[a-zA-Z]*\s*)*777\s+(-[a-zA-Z]*\s*)*(-R|-r|/)\s'
+    action: deny
+    risk_level: 6
+    reason: "Recursive chmod 777 on system paths is forbidden"
+
+  - name: block_dev_null_redirect_overwrite
+    pattern: '(^|\s)cat\s+/dev/(?!null|zero|random|urandom)\w+'
+    action: deny
+    risk_level: 5
+    reason: "Reading from raw device files is forbidden"
+
+  - name: block_proc_sys_write
+    pattern: '(^|\s)(echo|printf)\s+.*\s*>\s*/proc/sys/'
+    action: deny
+    risk_level: 5
+    reason: "Writing to /proc/sys kernel parameters is forbidden"
+
+  - name: block_iptables_firewall_disable
+    pattern: '(^|\s)iptables\s+-(F|X|P\s+ACCEPT)'
+    action: deny
+    risk_level: 5
+    reason: "Flushing or disabling firewall rules is forbidden"
+
+  - name: block_systemctl_disable_critical
+    pattern: '(^|\s)systemctl\s+(disable|mask|stop)\s+(ssh|sshd|firewalld|iptables|ufw)'
+    action: deny
+    risk_level: 5
+    reason: "Disabling critical system services is forbidden"
+
+  # -------------------------------------------------------------------
+  # CONFIRM rules — sensitive commands that need human approval
+  # -------------------------------------------------------------------
+
+  - name: confirm_rm
+    pattern: '(^|\s)rm\s'
+    action: confirm
+    risk_level: 4
+    reason: "File deletion may cause data loss"
+
+  - name: confirm_rmdir
+    pattern: '(^|\s)rmdir\s'
+    action: confirm
+    risk_level: 4
+    reason: "Directory removal may cause data loss"
+
+  - name: confirm_mv_system
+    pattern: '(^|\s)mv\s+.*\s+(/usr/|/etc/|/var/|/opt/|/home/|/root/|/tmp/|/srv/)'
+    action: confirm
+    risk_level: 4
+    reason: "Moving files to system directories"
+
+  - name: confirm_mv
+    pattern: '(^|\s)mv\s'
+    action: confirm
+    risk_level: 3
+    reason: "File move/rename operation"
+
+  - name: confirm_cat_large
+    pattern: '(^|\s)cat\s+.*(/var/log/|/etc/|/proc/)'
+    action: confirm
+    risk_level: 3
+    reason: "Reading system files or logs"
+
+  - name: confirm_sqlmesh_apply_prod
+    pattern: '(^|\s)sqlmesh\s+apply\s+prod(\s|$)'
+    action: confirm
+    risk_level: 5
+    reason: "sqlmesh apply to production environment — highest risk deployment"
+
+  - name: confirm_sqlmesh_apply
+    pattern: '(^|\s)sqlmesh\s+apply(\s|$)'
+    action: confirm
+    risk_level: 4
+    reason: "sqlmesh apply performs destructive deployment to environment"
+
+  - name: confirm_chmod
+    pattern: '(^|\s)chmod\s'
+    action: confirm
+    risk_level: 3
+    reason: "Permission changes may affect system security"
+
+  - name: confirm_chown
+    pattern: '(^|\s)chown\s'
+    action: confirm
+    risk_level: 4
+    reason: "Ownership changes may affect system security"
+
+  - name: confirm_pip_install
+    pattern: '(^|\s)pip\d*\s+install\s'
+    action: confirm
+    risk_level: 3
+    reason: "Python package installation"
+
+  - name: confirm_npm_install
+    pattern: '(^|\s)npm\s+(i|install)\s'
+    action: confirm
+    risk_level: 3
+    reason: "Node package installation"
+
+  - name: confirm_curl_pipe_bash
+    pattern: '(^|\s)curl\s+.*\s*\|\s*(ba)?sh'
+    action: confirm
+    risk_level: 5
+    reason: "Piping remote content directly to shell is risky"
+
+  - name: confirm_wget_pipe_bash
+    pattern: '(^|\s)wget\s+.*\s*\|\s*(ba)?sh'
+    action: confirm
+    risk_level: 5
+    reason: "Piping remote content directly to shell is risky"
+
+  - name: confirm_reboot
+    pattern: '(^|\s)(reboot|shutdown)\s'
+    action: confirm
+    risk_level: 5
+    reason: "System restart/shutdown"
+
+  - name: confirm_docker_privileged
+    pattern: '(^|\s)docker\s+(run|create).*--privileged'
+    action: confirm
+    risk_level: 5
+    reason: "Privileged Docker containers bypass security isolation"
+
+  - name: confirm_kubectl_delete
+    pattern: '(^|\s)kubectl\s+delete\s'
+    action: confirm
+    risk_level: 4
+    reason: "Deleting Kubernetes resources"

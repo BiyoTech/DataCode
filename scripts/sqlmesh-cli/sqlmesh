@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin executable that delegates to sqlmesh.sh.
+# Placed in PATH as "sqlmesh" so the shell tool picks it up transparently.
+exec "$(dirname "$0")/sqlmesh.sh" "$@"

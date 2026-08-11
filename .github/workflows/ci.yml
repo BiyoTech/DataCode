@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint gateway
+        run: cd gateway && go vet ./...
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint Python services
+        run: |
+          cd agent-service && ruff check src/ tests/
+          cd ../sqlmesh-service && ruff check src/ tests/
+          cd ../ontology-service && ruff check src/ tests/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test gateway
+        run: cd gateway && go test ./...
+      - name: Test agent-service
+        run: |
+          pip install -e shared/python
+          cd agent-service
+          pip install -e ".[dev]"
+          python -m pytest tests/ -q
+      - name: Test sqlmesh-service
+        run: |
+          pip install -e shared/python
+          cd sqlmesh-service
+          pip install -e ".[dev]"
+          python -m pytest tests/ -q
+      - name: Test ontology-service
+        run: |
+          cd ontology-service
+          pip install -e ".[dev]"
+          python -m pytest tests/ -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build

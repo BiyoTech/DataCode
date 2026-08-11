@@ -1,0 +1,468 @@
+@import "tailwindcss";
+
+/* =============================================================
+ * AgenticData Global Styles — TDesign Design System
+ *
+ * All colors, spacing, typography, and component tokens are
+ * sourced from TDesign's --td-* CSS variables (Light + Dark).
+ *
+ * Theme switching is handled by TDesign's native theme-mode
+ * attribute on <html>. See stores/theme.ts.
+ *
+ * Compatibility layer: legacy --bg-*, --text-*, --accent, etc.
+ * are mapped to --td-* tokens so existing scoped styles continue
+ * to work during the phased migration.
+ * ============================================================= */
+
+/* === Base layout variables (not from TDesign) === */
+:root {
+  --toolbar-height: 40px;
+  --sidebar-tab-width: 40px;
+
+  /* Transition durations */
+  --transition-fast: 0.1s ease;
+  --transition-base: 0.15s ease;
+  --transition-slow: 0.3s ease;
+}
+
+/* =============================================================
+ * Compatibility layer: map legacy CSS custom property names
+ * to TDesign --td-* tokens.
+ *
+ * These aliases let existing scoped styles work without
+ * immediate per-component rewrites. Over time, migrate each
+ * component to use --td-* tokens directly.
+ * ============================================================= */
+
+/* ── Light theme (default for :root / :root[theme-mode='light']) ── */
+:root,
+:root[theme-mode='light'] {
+  /* Backgrounds */
+  --bg-primary: var(--td-bg-color-page);
+  --bg-secondary: var(--td-bg-color-secondarycontainer);
+  --bg-surface: var(--td-bg-color-container);
+  --bg-hover: var(--td-bg-color-container-hover);
+  --bg-active: var(--td-bg-color-container-active);
+
+  /* Text */
+  --text-primary: var(--td-text-color-primary);
+  --text-secondary: var(--td-text-color-secondary);
+  --text-muted: var(--td-text-color-placeholder);
+  --text-disabled: var(--td-text-color-disabled);
+  --text-anti: var(--td-text-color-anti);
+  --text-brand: var(--td-text-color-brand);
+  --text-link: var(--td-text-color-link);
+
+  /* Brand / Accent */
+  --accent: var(--td-brand-color);
+  --accent-hover: var(--td-brand-color-hover);
+  --accent-active: var(--td-brand-color-active);
+  --accent-dim: var(--td-brand-color-light);
+  --accent-subtle: var(--td-brand-color-light);
+  --accent-subtler: var(--td-brand-color-1);
+  --accent-foreground: var(--td-text-color-anti);
+
+  /* Semantic colors */
+  --success: var(--td-success-color);
+  --success-subtle: var(--td-success-color-1);
+  --warning: var(--td-warning-color);
+  --warning-subtle: var(--td-warning-color-1);
+  --error: var(--td-error-color);
+  --error-subtle: var(--td-error-color-1);
+  --info: var(--td-brand-color-5);
+  --info-subtle: var(--td-brand-color-1);
+
+  /* Borders */
+  --border: var(--td-component-border);
+  --border-subtle: var(--td-component-stroke);
+
+  /* Inputs */
+  --input-bg: var(--td-bg-color-component);
+
+  /* Shadows */
+  --shadow-float: var(--td-shadow-1);
+  --shadow-float-lg: var(--td-shadow-2);
+  --shadow-glow: var(--td-shadow-3);
+
+  /* Fonts */
+  --font-sans: var(--td-font-family);
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Menlo", monospace;
+
+  /* Border radius */
+  --radius-lg: var(--td-radius-large);
+  --radius-md: var(--td-radius-medium);
+  --radius-sm: var(--td-radius-default);
+  --radius-lg-val: var(--td-radius-large);
+  --radius-md-val: var(--td-radius-medium);
+  --radius-sm-val: var(--td-radius-default);
+
+  /* Color scheme for native elements */
+  color-scheme: light;
+}
+
+/* ── Dark theme (TDesign native: [theme-mode='dark']) ── */
+[theme-mode='dark'] {
+  /* Backgrounds */
+  --bg-primary: var(--td-bg-color-page);
+  --bg-secondary: var(--td-bg-color-secondarycontainer);
+  --bg-surface: var(--td-bg-color-container);
+  --bg-hover: var(--td-bg-color-container-hover);
+  --bg-active: var(--td-bg-color-container-active);
+
+  /* Text */
+  --text-primary: var(--td-text-color-primary);
+  --text-secondary: var(--td-text-color-secondary);
+  --text-muted: var(--td-text-color-placeholder);
+  --text-disabled: var(--td-text-color-disabled);
+  --text-anti: var(--td-text-color-anti);
+  --text-brand: var(--td-text-color-brand);
+  --text-link: var(--td-text-color-link);
+
+  /* Brand / Accent */
+  --accent: var(--td-brand-color);
+  --accent-hover: var(--td-brand-color-hover);
+  --accent-active: var(--td-brand-color-active);
+  --accent-dim: var(--td-brand-color-light);
+  --accent-subtle: var(--td-brand-color-light);
+  --accent-subtler: var(--td-brand-color-1);
+  --accent-foreground: var(--td-text-color-anti);
+
+  /* Semantic colors */
+  --success: var(--td-success-color);
+  --success-subtle: var(--td-success-color-1);
+  --warning: var(--td-warning-color);
+  --warning-subtle: var(--td-warning-color-1);
+  --error: var(--td-error-color);
+  --error-subtle: var(--td-error-color-1);
+  --info: var(--td-brand-color-5);
+  --info-subtle: var(--td-brand-color-1);
+
+  /* Borders */
+  --border: var(--td-component-border);
+  --border-subtle: var(--td-component-stroke);
+
+  /* Inputs */
+  --input-bg: var(--td-bg-color-component);
+
+  /* Shadows */
+  --shadow-float: var(--td-shadow-1);
+  --shadow-float-lg: var(--td-shadow-2);
+  --shadow-glow: var(--td-shadow-3);
+
+  /* Fonts */
+  --font-sans: var(--td-font-family);
+  /* font-mono stays same */
+
+  /* Border radius */
+  --radius-lg: var(--td-radius-large);
+  --radius-md: var(--td-radius-medium);
+  --radius-sm: var(--td-radius-default);
+  --radius-lg-val: var(--td-radius-large);
+  --radius-md-val: var(--td-radius-medium);
+  --radius-sm-val: var(--td-radius-default);
+
+  /* Color scheme for native elements */
+  color-scheme: dark;
+}
+
+/* =============================================================
+ * TDesign Avatar anti-color global fixup
+ * Ensures colored avatar initials are always readable on
+ * brand/warning/error/success-colored backgrounds.
+ * Per M02 Avatar rule: when setting background, MUST ensure
+ *   color: var(--td-text-color-anti)
+ * This global CSS is the recommended primary defense.
+ * ============================================================= */
+.t-avatar,
+.t-avatar .t-avatar__inner,
+.t-avatar .t-icon {
+  color: var(--td-text-color-anti);
+}
+
+.t-tag--dark,
+.t-tag--dark .t-icon {
+  color: var(--td-text-color-anti);
+}
+
+/* === Tailwind @theme block — mapped to TDesign tokens === */
+@theme {
+  --color-background: var(--td-bg-color-page);
+  --color-surface: var(--td-bg-color-secondarycontainer);
+  --color-base: var(--td-bg-color-container);
+  --color-card: var(--td-bg-color-container);
+  --color-foreground: var(--td-text-color-primary);
+  --color-hover: var(--td-bg-color-container-hover);
+
+  --color-primary: var(--td-brand-color);
+  --color-primary-foreground: var(--td-text-color-anti);
+
+  --color-secondary: var(--td-text-color-secondary);
+  --color-secondary-foreground: var(--td-bg-color-container);
+
+  --color-muted: var(--td-bg-color-secondarycontainer);
+  --color-muted-foreground: var(--td-text-color-placeholder);
+
+  --color-accent: var(--td-brand-color);
+  --color-accent-dim: var(--td-brand-color-light);
+  --color-accent-foreground: var(--td-text-color-anti);
+
+  --color-destructive: var(--td-error-color);
+  --color-destructive-foreground: var(--td-text-color-anti);
+  --color-success: var(--td-success-color);
+  --color-success-foreground: var(--td-text-color-anti);
+  --color-warning: var(--td-warning-color);
+  --color-warning-foreground: var(--td-text-color-anti);
+  --color-info: var(--td-brand-color-5);
+
+  --color-border: var(--td-component-border);
+  --color-input: var(--td-bg-color-component);
+  --color-ring: var(--td-brand-color);
+
+  --radius-lg: var(--td-radius-large);
+  --radius-md: var(--td-radius-medium);
+  --radius-sm: var(--td-radius-default);
+
+  --font-sans: var(--td-font-family);
+  --font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Menlo", monospace;
+
+  --shadow-float: var(--td-shadow-1);
+  --shadow-float-lg: var(--td-shadow-2);
+  --shadow-glow: var(--td-shadow-3);
+}
+
+/* === Smooth theme transition === */
+html, body, * {
+  transition: background-color var(--transition-slow),
+              color var(--transition-slow),
+              border-color var(--transition-slow),
+              box-shadow var(--transition-slow);
+}
+
+/* === Base Reset === */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--td-font-family);
+  background-color: var(--td-bg-color-page);
+  color: var(--td-text-color-primary);
+  line-height: 1.5;
+  min-height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* === Scrollbar === */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--td-scrollbar-color);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--td-scrollbar-hover-color);
+}
+
+/* =============================================================
+ * Reusable utility classes (migrated to TDesign tokens)
+ * These provide common patterns used across the app.
+ * Over time, replace with TDesign component equivalents.
+ * ============================================================= */
+
+/* Card with subtle elevation */
+.card-float {
+  background: var(--td-bg-color-container);
+  border-radius: var(--td-radius-large);
+  box-shadow: var(--td-shadow-1);
+}
+
+.card-float:hover {
+  box-shadow: var(--td-shadow-2);
+}
+
+/* Tree item (file explorer, model list) */
+.tree-item {
+  padding: 6px 8px;
+  border-radius: var(--td-radius-default);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.tree-item:hover {
+  background: var(--td-bg-color-container-hover);
+}
+
+.tree-item.active {
+  background: var(--td-brand-color-light);
+  color: var(--td-brand-color);
+}
+
+/* IDE toolbar button */
+.toolbar-btn {
+  background: none;
+  border: none;
+  color: var(--td-text-color-secondary);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: var(--td-radius-default);
+  font-size: var(--td-font-size-body-medium);
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.toolbar-btn:hover {
+  background: var(--td-bg-color-container-hover);
+  color: var(--td-text-color-primary);
+}
+
+.toolbar-btn.active {
+  color: var(--td-brand-color);
+}
+
+/* Panel section header */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px 6px;
+  font-size: var(--td-font-size-body-small);
+  font-weight: 600;
+  color: var(--td-text-color-placeholder);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+/* Input field */
+.input-field {
+  width: 100%;
+  background: var(--td-bg-color-component);
+  border: 1px solid var(--td-component-border);
+  border-radius: var(--td-radius-default);
+  padding: 6px 10px;
+  color: var(--td-text-color-primary);
+  font-size: var(--td-font-size-body-medium);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.input-field:focus {
+  border-color: var(--td-brand-color);
+}
+
+/* Primary button */
+.btn-primary {
+  background: var(--td-brand-color);
+  color: var(--td-text-color-anti);
+  border: none;
+  border-radius: var(--td-radius-default);
+  padding: 6px 14px;
+  font-size: var(--td-font-size-body-small);
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+}
+
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Ghost/outline button */
+.btn-ghost {
+  background: none;
+  border: 1px solid var(--td-component-border);
+  border-radius: var(--td-radius-default);
+  color: var(--td-text-color-secondary);
+  padding: 6px 14px;
+  font-size: var(--td-font-size-body-small);
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.btn-ghost:hover {
+  background: var(--td-bg-color-container-hover);
+  color: var(--td-text-color-primary);
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: var(--td-font-size-body-small);
+  font-weight: 600;
+}
+
+.badge-success {
+  background: var(--td-success-color);
+  color: var(--td-text-color-anti);
+}
+
+.badge-warning {
+  background: var(--td-warning-color);
+  color: var(--td-text-color-anti);
+}
+
+.badge-error {
+  background: var(--td-error-color);
+  color: var(--td-text-color-anti);
+}
+
+/* Dialog overlay */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--td-mask-active);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+
+.dialog-card {
+  width: 360px;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-border);
+  border-radius: var(--td-radius-large);
+  padding: 24px;
+  box-shadow: var(--td-shadow-2);
+}
+
+/* Icon button (small, square) */
+.icon-btn {
+  background: none;
+  border: none;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+  font-size: var(--td-font-size-body-small);
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.icon-btn:hover {
+  color: var(--td-text-color-primary);
+  background: var(--td-bg-color-container-hover);
+}
+
+/* Text utilities */
+.text-xs-mono {
+  font-family: "JetBrains Mono", "Fira Code", "SF Mono", "Menlo", monospace;
+  font-size: var(--td-font-size-body-small);
+}

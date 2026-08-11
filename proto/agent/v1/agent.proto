@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "github.com/agenticdata/proto/agent/v1;agentv1";
+
+import "common/v1/common.proto";
+
+// AgentService handles AI conversation sessions and agent orchestration.
+// Maps to the "AI Conversation" bounded context in domain model.
+service AgentService {
+  // CreateSession initiates a new ChatSession for a user within a project.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // SendMessage sends a user ChatMessage and streams back AgentEvents.
+  rpc SendMessage(SendMessageRequest) returns (stream AgentEvent);
+
+  // CancelRun cancels an ongoing agent execution within a session.
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+
+  // RespondAction confirms or rejects an AgentAction proposed by the agent.
+  rpc RespondAction(RespondActionRequest) returns (stream AgentEvent);
+
+  // GetSession retrieves ChatSession metadata.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+
+  // ListSessions lists ChatSessions for a user, optionally filtered by project.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+}
+
+// --- Request/Response Messages ---
+
+message CreateSessionRequest {
+  string user_id = 1;
+  string project_id = 2;
+  string title = 3;  // optional initial title
+}
+
+message CreateSessionResponse {
+  string session_id = 1;
+}
+
+message SendMessageRequest {
+  string session_id = 1;
+  string content = 2;
+  // Optional context hints from client
+  repeated ContextHint context_hints = 3;
+}
+
+message ContextHint {
+  string type = 1;   // "file_open", "file_change", "selection"
+  string value = 2;  // file path or selected text
+}
+
+message CancelRunRequest {
+  string session_id = 1;
+}
+
+message CancelRunResponse {
+  bool success = 1;
+}
+
+message RespondActionRequest {
+  string session_id = 1;
+  string action_id = 2;
+  bool approved = 3;
+  string feedback = 4;  // optional rejection reason
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message GetSessionResponse {
+  ChatSessionInfo session = 1;
+}
+
+message ListSessionsRequest {
+  string user_id = 1;
+  string project_id = 2;  // optional filter
+  common.v1.PaginationRequest pagination = 3;
+}
+
+message ListSessionsResponse {
+  repeated ChatSessionInfo sessions = 1;
+  common.v1.PaginationResponse pagination = 2;
+}
+
+// --- Domain Entities ---
+
+// ChatSessionInfo represents the ChatSession aggregate root.
+message ChatSessionInfo {
+  string session_id = 1;
+  string user_id = 2;
+  string project_id = 3;
+  string title = 4;
+  string status = 5;       // "active", "summarizing", "archived"
+  int32 message_count = 6;
+  common.v1.Timestamp last_message_at = 7;
+  common.v1.Timestamp created_at = 8;
+}
+
+// AgentEvent is the server-to-client streaming event envelope.
+// Maps to ACP (Agent Client Protocol) message types.
+message AgentEvent {
+  string session_id = 1;
+  // Event type following ACP spec:
+  // "agent.thinking", "agent.text_delta", "agent.text_done",
+  // "agent.tool_call_start", "agent.tool_call_result",
+  // "agent.artifact", "agent.action_request",
+  // "agent.handoff", "agent.error", "agent.done"
+  string event_type = 2;
+  // JSON-encoded event-specific payload
+  string payload_json = 3;
+}

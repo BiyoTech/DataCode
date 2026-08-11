@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg
+
+# Node / frontend
+node_modules/
+frontend/dist/
+*.local
+
+# Local data & secrets
+.data/
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.codebuddy/
+.data/
+*~
+
+# Build artifacts
+gen/
+*.log
+
+# Stray pip output
+=*
+scripts/0.*
