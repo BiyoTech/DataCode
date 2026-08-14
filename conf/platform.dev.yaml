@@ -1,4 +1,4 @@
-# Platform dev overrides.
+    # Platform dev overrides.
 #
 # Loaded on top of platform.yaml when AGENTICDATA_ENV=dev.
 # Deep merge: values here override the base file.
