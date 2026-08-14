@@ -9,6 +9,7 @@ import { useI18n } from 'vue-i18n'
 import { useModelsStore } from '@/stores/models'
 import { useWorkspaceStore } from '@/stores/workspace'
 import api from '@/utils/api'
+import { extractApiMessage } from '@/utils/notifyError'
 
 const { t } = useI18n()
 const modelsStore = useModelsStore()
@@ -40,7 +41,7 @@ async function fetchRenderedSql() {
     })
     renderedSql.value = data.sql || ''
   } catch (e: any) {
-    error.value = e?.response?.data?.error || e?.message || 'Failed to render SQL'
+    error.value = extractApiMessage(e, 'Failed to render SQL')
   } finally {
     loading.value = false
   }

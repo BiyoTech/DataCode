@@ -7,6 +7,7 @@ import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useWorkspaceStore } from '@/stores/workspace'
 import type { CreateGitCredentialRequest } from '@/types/git-credentials'
+import { notifyError } from '@/utils/notifyError'
 import GitCredentialCard from './GitCredentialCard.vue'
 import AddGitCredentialModal from './AddGitCredentialModal.vue'
 
@@ -21,8 +22,14 @@ onMounted(() => {
 })
 
 async function handleAddCredential(req: CreateGitCredentialRequest) {
-  await workspaceStore.createGitCredential(req)
-  showAddModal.value = false
+  try {
+    await workspaceStore.createGitCredential(req)
+    showAddModal.value = false
+  } catch (e) {
+    // Keep the modal open so the user can correct the input (duplicate host,
+    // rejected auth type, ...) instead of losing what they typed.
+    notifyError(e, t('settings.gitAddCredential'))
+  }
 }
 
 function handleEdit(credentialId: string) {

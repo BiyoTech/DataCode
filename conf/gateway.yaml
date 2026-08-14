@@ -1,18 +1,28 @@
 # Gateway Service Configuration
+#
+# Service-specific settings only. Service topology, logging, and auth DB path
+# are sourced from conf/platform.yaml.
 server:
   http_port: 8000
-
-# Upstream service endpoints
-services:
-  agent_service_url: "http://localhost:8001"
-  sqlmesh_service_url: "http://localhost:8002"   # Also serves workspace/file/git APIs
-  ontology_service_url: "http://localhost:8003"
-  dagster_service_url: "http://localhost:8004"
 
 # CORS
 cors:
   frontend_origin: "http://localhost:5173"
 
-# Logging
-logging:
-  level: "debug"
+# Authentication (JWT signing secret comes from env GW_JWT_SECRET only)
+auth:
+  access_token_ttl_minutes: 120
+  refresh_token_ttl_hours: 168
+  pre_auth_token_ttl_minutes: 5
+  login_max_attempts: 5
+  login_lockout_minutes: 5
+  bcrypt_cost: 10
+  # db_path comes from platform.yaml: database.services.gateway_auth.sqlite_path
+  # To override: GW_AUTH_DB_PATH env var
+
+# ── Shared config (from platform.yaml) ──────────────────────────────────
+# services:  → platform.yaml → services.{agent,sqlmesh,ontology,dagster}
+# logging:   → platform.yaml → logging.level
+#
+# To override per-service, use env vars:
+#   GW_AGENT_SERVICE_URL, GW_SQLMESH_SERVICE_URL, etc.

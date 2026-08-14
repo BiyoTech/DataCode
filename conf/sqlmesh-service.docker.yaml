@@ -1,21 +1,8 @@
-# SQLMesh Service — Docker infrastructure example (PostgreSQL)
+# SQLMesh Service — Docker overrides.
+#
+# Only service-specific overrides. Database, workspace, and logging come from
+# platform.docker.yaml (set AGENTICDATA_ENV=docker).
 server:
   grpc_port: 50052
   rest_port: 8002
   host: "0.0.0.0"
-
-workspace:
-  base_path: "~/.agenticdata/workspaces"
-
-database:
-  type: "postgresql"
-  host: "localhost"
-  port: 5432
-  name: "agenticdata"
-  username: "agenticdata"
-  password: "agenticdata_dev"
-  pool_size: 5
-  pool_overflow: 10
-
-logging:
-  level: "info"

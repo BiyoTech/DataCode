@@ -1,112 +1,203 @@
-"""Workspace management endpoints."""
+"""Workspace management endpoints.
 
-from fastapi import APIRouter, HTTPException
+A workspace is a tenant-level shared unit. Identity and authorization come
+exclusively from the gateway through headers it fully controls (see
+``src.api.deps.CallerContext``): the gateway resolves the caller's roles from the
+RBAC tables, decides the request and forwards the outcome. Request bodies and
+query strings are therefore never an authorization source here.
 
+No local filesystem path is ever accepted or returned by the list endpoint - the
+working copy path is only produced by ``POST /{workspace_id}/open``.
+"""
+
+import typing as t
+
+from fastapi import APIRouter, Depends, Query
+
+from src.api.deps import Caller, CallerContext, require_permission
 from src.api.models.requests import (
     BindGitRepoRequest,
     CreateWorkspaceRequest,
+    OpenWorkspaceRequest,
     SyncWorkspaceRequest,
 )
 from src.utils.logging import get_logger
+from src.workspace.manager import WorkspaceView, get_workspace_manager
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["workspace"])
 
+# Permission codes shared with the gateway catalog. They are asserted here as
+# defence in depth: the gateway already denied the request when they are absent.
+PERM_WORKSPACE_CREATE = "tenant:workspace:create"
+PERM_WORKSPACE_READ = "workspace:read"
+PERM_WORKSPACE_GIT_BIND = "workspace:git:bind"
+PERM_WORKSPACE_GIT_PUSH = "workspace:git:push"
+PERM_WORKSPACE_MEMBER_WRITE = "workspace:member:write"
+PERM_WORKSPACE_DELETE = "workspace:delete"
+
+
+def _serialize(ws: WorkspaceView) -> t.Dict[str, t.Any]:
+    """Serialize a workspace read model for the gateway.
+
+    ``openable`` / ``open_blocked_reason`` are authoritative: the UI must not
+    re-derive them from ``git_repo_url``. ``role`` and ``permissions`` are filled
+    in by the gateway, which owns the role bindings.
+    """
+    return {
+        "workspace_id": ws.workspace_id,
+        "name": ws.name,
+        "dialect": ws.dialect,
+        "git_repo_url": ws.git_repo_url,
+        "git_branch": ws.git_branch,
+        "status": ws.status,
+        "role": ws.role,
+        "is_owner": ws.is_owner,
+        "openable": ws.openable,
+        "open_blocked_reason": ws.open_blocked_reason,
+        "created_at": ws.created_at.isoformat(),
+        "last_active_at": ws.last_active_at.isoformat(),
+    }
+
 
 @router.post("")
-async def create_workspace(req: CreateWorkspaceRequest):
-    """Create a new workspace (SQLMesh project directory)."""
-    from src.workspace.manager import get_workspace_manager
-
-    mgr = get_workspace_manager()
-    ws = await mgr.create(
-        user_id=req.user_id,
+async def create_workspace(
+    req: CreateWorkspaceRequest,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_CREATE)),
+):
+    """Create a workspace owned by the caller inside their tenant."""
+    ws = await get_workspace_manager().create(
+        tenant_id=caller.tenant_id,
+        owner_user_id=caller.user_id,
         name=req.name,
         dialect=req.dialect,
         git_repo_url=req.git_repo_url,
     )
-    return {
-        "workspace_id": ws.workspace_id,
-        "name": ws.name,
-        "path": ws.local_path,
-        "git_repo_url": ws.git_repo_url,
-        "created_at": ws.created_at.isoformat(),
-    }
+    return _serialize(ws)
 
 
 @router.get("")
-async def list_workspaces(user_id: str):
-    """List workspaces for a user."""
-    from src.workspace.manager import get_workspace_manager
+async def list_workspaces(
+    caller: Caller,
+    workspace_ids: str = Query(
+        default="",
+        description="Comma-separated workspace ids the caller is allowed to see.",
+    ),
+):
+    """List the workspaces named by ``workspace_ids`` inside the caller's tenant.
 
-    mgr = get_workspace_manager()
-    workspaces = await mgr.list_workspaces(user_id)
+    The gateway resolved the identifiers from the caller's role bindings, so an
+    empty list is a legitimate answer and never a lookup over all workspaces.
+    """
+    ids = [value.strip() for value in workspace_ids.split(",") if value.strip()]
+    if not ids:
+        return {"workspaces": []}
+
+    workspaces = await get_workspace_manager().list_for_ids(
+        caller.tenant_id, caller.user_id, ids
+    )
+    return {"workspaces": [_serialize(ws) for ws in workspaces]}
+
+
+@router.post("/{workspace_id}/open")
+async def open_workspace(
+    workspace_id: str,
+    req: OpenWorkspaceRequest,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_READ)),
+):
+    """Materialize the caller's private working copy and return its path.
+
+    Clones on first open, otherwise fetches and checks out the branch. Returns
+    409 ``GIT_REPO_NOT_BOUND`` when the workspace has no Git repository yet.
+    """
+    opened = await get_workspace_manager().open(
+        workspace_id=workspace_id,
+        tenant_id=caller.tenant_id,
+        user_id=caller.user_id,
+        branch=req.branch,
+    )
     return {
-        "workspaces": [
-            {
-                "workspace_id": ws.workspace_id,
-                "name": ws.name,
-                "path": ws.local_path,
-                "status": ws.status,
-                "git_repo_url": ws.git_repo_url,
-                "created_at": ws.created_at.isoformat(),
-            }
-            for ws in workspaces
-        ]
+        "workspace_id": opened.workspace_id,
+        "workspace_path": opened.workspace_path,
+        "branch": opened.branch,
     }
 
 
-@router.post("/bind-git")
-async def bind_git_repo(req: BindGitRepoRequest):
-    """Bind a remote Git repository to an existing workspace."""
-    from src.workspace.manager import get_workspace_manager
-
-    mgr = get_workspace_manager()
-    success = await mgr.bind_git_repo(
-        workspace_id=req.workspace_id,
-        git_repo_url=req.git_repo_url,
-        user_id=req.user_id,
+@router.get("/{workspace_id}/remote-branches")
+async def list_remote_branches(
+    workspace_id: str,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_READ)),
+):
+    """List remote branches available for the workspace repository."""
+    branches = await get_workspace_manager().remote_branches(
+        workspace_id=workspace_id,
+        tenant_id=caller.tenant_id,
+        user_id=caller.user_id,
     )
-    if not success:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return {"success": True, "workspace_id": req.workspace_id, "git_repo_url": req.git_repo_url}
+    return {"workspace_id": workspace_id, "branches": branches}
+
+
+@router.post("/bind-git")
+async def bind_git_repo(
+    req: BindGitRepoRequest,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_GIT_BIND)),
+):
+    """Bind a remote Git repository to a workspace and push the current code."""
+    url = await get_workspace_manager().bind_git_repo(
+        workspace_id=req.workspace_id,
+        tenant_id=caller.tenant_id,
+        user_id=caller.user_id,
+        git_repo_url=req.git_repo_url,
+    )
+    return {"success": True, "workspace_id": req.workspace_id, "git_repo_url": url}
 
 
 @router.post("/sync")
-async def sync_workspace(req: SyncWorkspaceRequest):
-    """Commit and push workspace changes to remote Git."""
-    from src.workspace.manager import get_workspace_manager
-
-    mgr = get_workspace_manager()
-    success = await mgr.sync_to_remote(
+async def sync_workspace(
+    req: SyncWorkspaceRequest,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_GIT_PUSH)),
+):
+    """Commit and push the caller's working copy to the remote repository."""
+    await get_workspace_manager().sync_to_remote(
         workspace_id=req.workspace_id,
+        tenant_id=caller.tenant_id,
+        user_id=caller.user_id,
         message=req.message,
     )
-    if not success:
-        raise HTTPException(status_code=400, detail="Sync failed (no remote bound or push error)")
     return {"success": True}
 
 
-@router.post("/{workspace_id}/ensure-local")
-async def ensure_workspace_local(workspace_id: str):
-    """Ensure workspace exists locally (clone from Git if needed)."""
-    from src.workspace.manager import get_workspace_manager
+@router.delete("/{workspace_id}/members/{member_user_id}")
+async def cleanup_member_working_copy(
+    workspace_id: str,
+    member_user_id: str,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_MEMBER_WRITE)),
+):
+    """Drop a revoked member's working copy.
 
-    mgr = get_workspace_manager()
-    local_path = await mgr.ensure_local(workspace_id)
-    if not local_path:
-        raise HTTPException(status_code=404, detail="Workspace not recoverable")
-    return {"workspace_id": workspace_id, "local_path": local_path}
+    Access revocation itself is performed by the gateway, which owns the role
+    bindings; this endpoint only removes the disposable checkout on disk.
+    """
+    removed = await get_workspace_manager().cleanup_member_copy(
+        workspace_id=workspace_id,
+        tenant_id=caller.tenant_id,
+        target_user_id=member_user_id,
+    )
+    return {"success": True, "workspace_id": workspace_id, "copy_removed": removed}
 
 
 @router.delete("/{workspace_id}")
-async def delete_workspace(workspace_id: str, delete_remote: bool = False):
-    """Delete a workspace (soft-delete)."""
-    from src.workspace.manager import get_workspace_manager
-
-    mgr = get_workspace_manager()
-    success = await mgr.delete(workspace_id, delete_remote=delete_remote)
-    if not success:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+async def delete_workspace(
+    workspace_id: str,
+    delete_remote: bool = False,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_DELETE)),
+):
+    """Soft-delete a workspace and remove every local working copy."""
+    await get_workspace_manager().delete(
+        workspace_id=workspace_id,
+        tenant_id=caller.tenant_id,
+        user_id=caller.user_id,
+        delete_remote=delete_remote,
+    )
     return {"success": True}

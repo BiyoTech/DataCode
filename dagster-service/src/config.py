@@ -3,13 +3,19 @@
 Loads from YAML file (conf/dagster-service.yaml) with environment variable
 overrides. Priority: env vars > YAML file > defaults.
 
+Shared cross-cutting config (workspace, sqlmesh service URL, logging) is
+sourced from ``conf/platform.yaml`` via
+:mod:`agenticdata_common.config.platform`.
+
 Key design insight (see package docstring): the Code Location gRPC server is
 ALWAYS local because it loads user Python code from ``asset-dag/``. Only the
 DagsterInstance (daemon + webserver + metadata DB) can be remote.
 """
 
+import os
 from pathlib import Path
 
+from agenticdata_common.config.platform import platform_config
 from agenticdata_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
 from pydantic_settings import BaseSettings
 
@@ -51,24 +57,52 @@ class Settings(BaseSettings):
     process_start_timeout: int = 30       # seconds to wait for a subprocess to become healthy
     process_stop_timeout: int = 5         # seconds to wait for graceful SIGTERM before SIGKILL
 
-    # Workspace storage — must match sqlmesh-service base path.
-    workspace_base_path: str = "~/.agenticdata/workspaces"
-
-    # SQLMesh service URL (for the SQLMesh -> Dagster bridge).
-    sqlmesh_service_url: str = "http://localhost:8002"
+    # SQLMesh request timeout (for the SQLMesh -> Dagster bridge).
     sqlmesh_request_timeout: float = 10.0
-
-    # Logging.
-    log_level: str = "INFO"
 
     model_config = {"env_prefix": "DAGSTER_SERVICE_"}
 
     def __init__(self, **kwargs):
-        # Load YAML first, then let env vars override via pydantic-settings.
+        # Load service-specific YAML first, then let env vars override.
         yaml_data = _load_yaml_config("dagster-service.yaml")
         yaml_flat = _flatten_yaml(yaml_data)
         merged = {**yaml_flat, **kwargs}
         super().__init__(**merged)
+
+    # ── Shared platform config (read-only) ────────────────────────────
+
+    @property
+    def platform(self):
+        """Cached :class:`PlatformConfig` from platform.yaml."""
+        return platform_config()
+
+    # ── Workspace (from platform) ─────────────────────────────────────
+
+    @property
+    def workspace_base_path(self) -> str:
+        env_val = os.getenv("DAGSTER_SERVICE_WORKSPACE_BASE_PATH")
+        if env_val:
+            return env_val
+        return self.platform.workspace_base_path
+
+    # ── SQLMesh service URL (from platform topology) ──────────────────
+
+    @property
+    def sqlmesh_service_url(self) -> str:
+        """SQLMesh service URL from platform topology (env override wins)."""
+        env_val = os.getenv("DAGSTER_SERVICE_SQLMESH_SERVICE_URL")
+        if env_val:
+            return env_val
+        return self.platform.services.url("sqlmesh", "rest_url")
+
+    # ── Logging (from platform) ────────────────────────────────────────
+
+    @property
+    def log_level(self) -> str:
+        env_val = os.getenv("DAGSTER_SERVICE_LOG_LEVEL")
+        if env_val:
+            return env_val
+        return self.platform.log_level.upper()
 
     @property
     def is_remote(self) -> bool:
@@ -82,7 +116,12 @@ class Settings(BaseSettings):
 
 
 def _flatten_yaml(data: dict) -> dict:
-    """Flatten nested YAML config to match pydantic field names."""
+    """Flatten service-specific YAML keys to pydantic field names.
+
+    Only dagster-service-specific fields are mapped here. Workspace,
+    sqlmesh service URL, and logging are sourced from platform.yaml
+    (see :class:`Settings` properties).
+    """
     mapping = {
         "server.rest_port": "rest_port",
         "server.host": "host",
@@ -99,10 +138,7 @@ def _flatten_yaml(data: dict) -> dict:
         "dagster.remote_token": "dagster_remote_token",
         "dagster.process_start_timeout": "process_start_timeout",
         "dagster.process_stop_timeout": "process_stop_timeout",
-        "workspace.base_path": "workspace_base_path",
-        "sqlmesh.service_url": "sqlmesh_service_url",
         "sqlmesh.request_timeout": "sqlmesh_request_timeout",
-        "logging.level": "log_level",
     }
     return flatten_yaml_mapping(data, mapping)
 

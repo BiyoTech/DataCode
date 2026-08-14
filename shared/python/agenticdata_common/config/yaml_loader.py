@@ -10,20 +10,31 @@ import yaml
 
 
 def find_config_file(filename: str, *, package_file: Path) -> Optional[Path]:
-    """Resolve YAML config file path relative to repo conf/ directory."""
+    """Resolve YAML config file path relative to repo conf/ directory.
+
+    Search order:
+    1. ``$CONFIG_PATH/<filename>`` (when the env var is set)
+    2. Walk up from ``package_file``'s directory until a ``conf/`` sibling is found
+    3. ``./conf/<filename>`` relative to the current working directory
+    """
     if env_path := os.getenv("CONFIG_PATH"):
         p = Path(env_path) / filename
         if p.exists():
             return p
 
-    project_root = package_file.resolve().parent.parent.parent
-    candidates = [
-        project_root / "conf" / filename,
-        Path("conf") / filename,
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
+    # Walk up from the package file's directory to find a ``conf/`` directory.
+    # This handles packages at different depths (e.g. shared/python/pkg/mod.py
+    # needs 5 levels up, while service/src/config.py needs 3).
+    start = package_file.resolve().parent
+    for ancestor in [start, *start.parents]:
+        candidate = ancestor / "conf" / filename
+        if candidate.exists():
+            return candidate
+
+    # Fallback: relative to CWD.
+    p = Path("conf") / filename
+    if p.exists():
+        return p
     return None
 
 

@@ -6,11 +6,42 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { useWorkspaceStore } from '@/stores/workspace'
 import api from '@/utils/api'
+import { getSession } from '@/utils/authSession'
+import { i18n } from '@/i18n'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
+
+/**
+ * Owner of the current session. The gateway re-validates and overwrites this
+ * value from the access token, so it is only a convenience for the payload.
+ */
+function currentUserId(): string {
+  return getSession()?.user.userId ?? ''
+}
+
+/**
+ * Report a failed Git operation: keep the parsed reason on the store for
+ * inline rendering and raise a toast so the user never has to read the logs.
+ * Remote rejections are localized from the backend's reason code, so the
+ * message names the exact credential setting to fix.
+ */
+function reportGitError(error: unknown, fallbackKey: string): string {
+  const fallback = i18n.global.t(fallbackKey) as string
+  const message = extractApiMessage(error, fallback)
+  notifyError(error, fallback)
+  return message
+}
 
 export interface FileChange {
   path: string
-  status: 'M' | 'A' | 'D' | 'R'
+  /**
+   * Raw Git porcelain letter: `M` modified, `A` added, `D` deleted,
+   * `R` renamed, `C` copied, `T` type-changed, `?` untracked, `U` conflict.
+   * Mapped to colours/badges by `@/utils/gitDecoration`.
+   */
+  status: string
   staged: boolean
+  /** Source path of a rename/copy, empty otherwise. */
+  originalPath?: string
 }
 
 export interface BranchInfo {
@@ -54,6 +85,26 @@ export const useGitStore = defineStore('git', () => {
 
   // Branches
   const branches = ref<BranchInfo[]>([])
+
+  /** Local branches, current one first. */
+  const localBranches = computed(() =>
+    branches.value.filter((b) => !b.is_remote)
+  )
+
+  /** Remote-tracking branches (``origin/...``), excluding the symbolic HEAD. */
+  const remoteBranches = computed(() =>
+    branches.value.filter((b) => b.is_remote && !b.name.endsWith('/HEAD'))
+  )
+
+  /** Local branch names, used to tell which remote branches are not local yet. */
+  const localBranchNames = computed(
+    () => new Set(localBranches.value.map((b) => b.name))
+  )
+
+  /** Whether a remote ref (``origin/dev``) already has a local counterpart. */
+  function hasLocalCounterpart(remoteRef: string): boolean {
+    return localBranchNames.value.has(remoteRef.split('/').slice(1).join('/'))
+  }
 
   // Commit history (for selected branch) + selected commit's changed files
   const commits = ref<CommitInfo[]>([])
@@ -130,9 +181,10 @@ export const useGitStore = defineStore('git', () => {
         path: c.path,
         status: c.status,
         staged: c.staged,
+        originalPath: c.original_path || '',
       }))
-    } catch (e: any) {
-      error.value = e.message || 'Failed to fetch Git status'
+    } catch (e) {
+      error.value = extractApiMessage(e, i18n.global.t('git.statusFailed') as string)
     }
   }
 
@@ -150,8 +202,8 @@ export const useGitStore = defineStore('git', () => {
       isInitialized.value = true
       panelState.value = 'detail'
       await fetchStatus()
-    } catch (e: any) {
-      error.value = e.message || 'Failed to initialize Git'
+    } catch (e) {
+      error.value = reportGitError(e, 'git.initFailed')
     } finally {
       isLoading.value = false
     }
@@ -169,7 +221,7 @@ export const useGitStore = defineStore('git', () => {
     try {
       const { data } = await api.post('/git/publish', {
         workspace_path: ws.path,
-        user_id: 'user-admin-001',
+        user_id: currentUserId(),
         provider,
         repo_name: repoName,
         is_private: isPrivate,
@@ -180,8 +232,8 @@ export const useGitStore = defineStore('git', () => {
         panelState.value = 'detail'
         await fetchStatus()
       }
-    } catch (e: any) {
-      error.value = e.message || 'Failed to publish'
+    } catch (e) {
+      error.value = reportGitError(e, 'git.publishFailed')
     } finally {
       isLoading.value = false
     }
@@ -227,49 +279,180 @@ export const useGitStore = defineStore('git', () => {
       await api.post('/git/commit', { workspace_path: ws.path, message: msg })
       commitMessage.value = ''
       await fetchStatus()
-    } catch (e: any) {
-      error.value = e.message || 'Commit failed'
+    } catch (e) {
+      error.value = reportGitError(e, 'git.commitFailed')
     } finally {
       isLoading.value = false
     }
   }
 
   /**
-   * Push to remote.
+   * Push to remote. Defaults to the checked-out branch; pass ``branch`` to
+   * publish another local branch without switching to it first.
    */
-  async function push(): Promise<void> {
+  async function push(branch?: string): Promise<void> {
     const workspaceStore = useWorkspaceStore()
     const ws = workspaceStore.currentWorkspace
     if (!ws) return
 
     isLoading.value = true
     try {
-      await api.post('/git/push', { workspace_path: ws.path, user_id: 'user-admin-001' })
-      await fetchStatus()
-    } catch (e: any) {
-      error.value = e.message || 'Push failed'
+      await api.post('/git/push', {
+        workspace_path: ws.path,
+        user_id: currentUserId(),
+        branch: branch || '',
+      })
+      await refreshRepoState()
+    } catch (e) {
+      error.value = reportGitError(e, 'git.pushFailed')
     } finally {
       isLoading.value = false
     }
   }
 
   /**
-   * Pull from remote.
+   * Pull from remote into the checked-out branch (or ``branch`` when given).
    */
-  async function pull(): Promise<void> {
+  async function pull(branch?: string): Promise<void> {
     const workspaceStore = useWorkspaceStore()
     const ws = workspaceStore.currentWorkspace
     if (!ws) return
 
     isLoading.value = true
     try {
-      await api.post('/git/pull', { workspace_path: ws.path, user_id: 'user-admin-001' })
-      await fetchStatus()
-    } catch (e: any) {
-      error.value = e.message || 'Pull failed'
+      await api.post('/git/pull', {
+        workspace_path: ws.path,
+        user_id: currentUserId(),
+        branch: branch || '',
+      })
+      await refreshRepoState()
+    } catch (e) {
+      error.value = reportGitError(e, 'git.pullFailed')
     } finally {
       isLoading.value = false
     }
+  }
+
+  /**
+   * Update remote-tracking refs. Cheap and non-destructive: it only refreshes
+   * what the remote looks like, so ahead/behind and the remote branch list stop
+   * being stale without touching the working tree.
+   */
+  async function fetchFromRemote(): Promise<void> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return
+
+    isLoading.value = true
+    try {
+      await api.post('/git/fetch', {
+        workspace_path: ws.path,
+        user_id: currentUserId(),
+      })
+      await refreshRepoState()
+    } catch (e) {
+      error.value = reportGitError(e, 'git.fetchFailed')
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  /**
+   * Materialize a remote branch locally, tracking its upstream.
+   * ``remoteRef`` is the full remote name, e.g. "origin/dev".
+   */
+  async function checkoutRemoteBranch(remoteRef: string): Promise<void> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return
+
+    const localName = remoteRef.split('/').slice(1).join('/')
+    if (!localName) return
+
+    isLoading.value = true
+    try {
+      await api.post('/git/checkout', {
+        workspace_path: ws.path,
+        branch: localName,
+        create: true,
+        start_point: remoteRef,
+        track: true,
+      })
+      currentBranch.value = localName
+      await refreshRepoState()
+      await fetchCommits(localName)
+    } catch (e) {
+      error.value = reportGitError(e, 'git.checkoutFailed')
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  /**
+   * Delete a local branch. Without ``force`` Git refuses to drop unmerged work.
+   */
+  async function deleteBranch(branch: string, force = false): Promise<void> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return
+
+    isLoading.value = true
+    try {
+      await api.post('/git/branch/delete', {
+        workspace_path: ws.path,
+        branch,
+        force,
+      })
+      await refreshRepoState()
+    } catch (e) {
+      error.value = reportGitError(e, 'git.deleteBranchFailed')
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  /**
+   * Move the current branch back to ``commitHash``.
+   * ``hard`` discards working-tree changes, so callers must confirm it first.
+   */
+  async function resetTo(
+    commitHash: string,
+    mode: 'soft' | 'mixed' | 'hard' = 'mixed'
+  ): Promise<void> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return
+
+    isLoading.value = true
+    try {
+      await api.post('/git/reset', {
+        workspace_path: ws.path,
+        commit_hash: commitHash,
+        mode,
+      })
+      await refreshRepoState()
+      await fetchCommits(currentBranch.value)
+    } catch (e) {
+      error.value = reportGitError(e, 'git.resetFailed')
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  /** Stage every change in the working tree. */
+  async function stageAll(): Promise<void> {
+    await stageFiles([])
+  }
+
+  /** Remove every change from the index. */
+  async function unstageAll(): Promise<void> {
+    await unstageFiles([])
+  }
+
+  /** Reload the state that any branch-level operation can invalidate. */
+  async function refreshRepoState(): Promise<void> {
+    await fetchStatus()
+    await fetchBranches()
   }
 
   /**
@@ -295,11 +478,18 @@ export const useGitStore = defineStore('git', () => {
     const ws = workspaceStore.currentWorkspace
     if (!ws) return
 
-    await api.post('/git/checkout', { workspace_path: ws.path, branch, create })
-    currentBranch.value = branch
-    await fetchStatus()
-    // Refresh commit history for the newly checked-out branch
-    await fetchCommits(branch)
+    isLoading.value = true
+    try {
+      await api.post('/git/checkout', { workspace_path: ws.path, branch, create })
+      currentBranch.value = branch
+      await refreshRepoState()
+      // Refresh commit history for the newly checked-out branch
+      await fetchCommits(branch)
+    } catch (e) {
+      error.value = reportGitError(e, 'git.checkoutFailed')
+    } finally {
+      isLoading.value = false
+    }
   }
 
   /**
@@ -411,6 +601,8 @@ export const useGitStore = defineStore('git', () => {
     changes,
     isClean,
     branches,
+    localBranches,
+    remoteBranches,
     commitMessage,
     commits,
     isLoadingCommits,
@@ -424,11 +616,19 @@ export const useGitStore = defineStore('git', () => {
     publish,
     stageFiles,
     unstageFiles,
+    stageAll,
+    unstageAll,
     commit,
     push,
     pull,
+    fetchFromRemote,
     fetchBranches,
     checkout,
+    checkoutRemoteBranch,
+    deleteBranch,
+    resetTo,
+    hasLocalCounterpart,
+    refreshRepoState,
     fetchCommits,
     selectCommit,
     fetchCommitFileDiff,

@@ -6,6 +6,7 @@
 import { ref, onUnmounted } from 'vue'
 import type { ConnectionState, ACPEvent } from '@/types/agent'
 import { notifyError } from '@/utils/notifyError'
+import { getAccessToken, refreshSession } from '@/utils/authSession'
 
 export interface UseSSEOptions {
   /** Called on every parsed ACP event */
@@ -45,6 +46,16 @@ export function useSSE(options: UseSSEOptions): UseSSEReturn {
     onStateChange?.(state)
   }
 
+  /** Headers for the event stream request, including bearer credentials. */
+  function _streamHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { Accept: 'text/event-stream' }
+    const token = getAccessToken()
+    if (token) {
+      headers.Authorization = `Bearer ${token}`
+    }
+    return headers
+  }
+
   function connect(sessionId: string) {
     intentionalClose = false
     reconnectAttempts = 0
@@ -64,11 +75,34 @@ export function useSSE(options: UseSSEOptions): UseSSEReturn {
     const url = `/api/v1/sessions/${currentSessionId}/events`
 
     try {
-      const response = await fetch(url, {
+      // The stream is opened with fetch (not EventSource) so the bearer token
+      // can be attached; an expired token is refreshed once before retrying.
+      let response = await fetch(url, {
         method: 'GET',
-        headers: { 'Accept': 'text/event-stream' },
+        headers: _streamHeaders(),
         signal: abortController.signal,
       })
+
+      if (response.status === 401) {
+        const renewed = await refreshSession()
+        if (renewed) {
+          response = await fetch(url, {
+            method: 'GET',
+            headers: _streamHeaders(),
+            signal: abortController.signal,
+          })
+        }
+      }
+
+      // Authorization failures are terminal: retrying cannot grant a
+      // permission, so stop and state exactly what is missing instead of
+      // looping silently in the background.
+      if (response.status === 403) {
+        const body = await response.json().catch(() => null)
+        notifyError({ response: { status: 403, data: body } })
+        setConnectionState('disconnected')
+        return
+      }
 
       if (!response.ok) {
         throw new Error(`SSE connect failed: ${response.status} ${response.statusText}`)

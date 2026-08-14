@@ -1,19 +1,8 @@
-# Agent Service — Docker infrastructure example (PostgreSQL)
+# Agent Service — Docker overrides.
+#
+# Only service-specific overrides. Database, sqlmesh service URL, and logging
+# come from platform.docker.yaml (set AGENTICDATA_ENV=docker).
 server:
   ws_port: 8001
   grpc_port: 50051
   host: "0.0.0.0"
-
-services:
-  sqlmesh_service_url: "http://localhost:8002"
-
-database:
-  type: "postgresql"
-  host: "localhost"
-  port: 5432
-  name: "agenticdata"
-  username: "agenticdata"
-  password: "agenticdata_dev"
-
-logging:
-  level: "info"

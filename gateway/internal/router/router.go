@@ -2,11 +2,11 @@
 //
 // Route registration follows a three-layer strategy:
 //  1. Validated routes  — declared as data in handler.*ValidatedRoutes tables,
-//                         registered via handler.MakeValidatedProxy.
+//     registered via handler.MakeValidatedProxy.
 //  2. Special handlers  — routes that need body injection or SSE streaming.
 //  3. Catch-all proxy   — handler.GenericProxy transparently forwards
-//                         everything else, so new backend endpoints are
-//                         automatically available without gateway code changes.
+//     everything else, so new backend endpoints are
+//     automatically available without gateway code changes.
 package router
 
 import (
@@ -15,13 +15,21 @@ import (
 	"github.com/go-chi/cors"
 	"go.uber.org/zap"
 
+	"github.com/agenticdata/gateway/internal/auth"
 	"github.com/agenticdata/gateway/internal/config"
 	"github.com/agenticdata/gateway/internal/handler"
 	"github.com/agenticdata/gateway/internal/middleware"
+	"github.com/agenticdata/gateway/internal/rbac"
 )
 
 // Setup creates and configures the Chi router with all API routes.
-func Setup(cfg *config.Config, logger *zap.Logger) *chi.Mux {
+// authService owns identity verification; every non-public route requires a
+// valid access token. rbacService owns authorization: it is enforced once,
+// globally, by the Authorize middleware.
+func Setup(
+	cfg *config.Config, logger *zap.Logger,
+	authService *auth.Service, rbacService *rbac.Service,
+) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -29,7 +37,6 @@ func Setup(cfg *config.Config, logger *zap.Logger) *chi.Mux {
 	r.Use(chimiddleware.RealIP)
 	r.Use(middleware.RequestLogger(logger))
 	r.Use(chimiddleware.Recoverer)
-	r.Use(middleware.DefaultUser)
 
 	// CORS configuration for frontend
 	r.Use(cors.Handler(cors.Options{
@@ -40,6 +47,24 @@ func Setup(cfg *config.Config, logger *zap.Logger) *chi.Mux {
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+
+	// Authentication — must run after CORS so preflight requests still work.
+	// It publishes the verified identity and overwrites downstream identity
+	// headers, making client-supplied values unusable.
+	r.Use(middleware.JWTAuth(authService.Issuer(), logger))
+
+	// Replace any user_id carried in bodies/query strings with the verified
+	// identity, so proxied services cannot be tricked by a forged owner.
+	r.Use(middleware.SanitizeIdentity(logger))
+
+	// Authorization — a single enforcement point for the whole platform. It
+	// runs before route matching, so the transparent catch-all proxies are
+	// covered as well; the required permission per route is declared in
+	// rbac.MatchRoute.
+	r.Use(middleware.Authorize(rbacService, logger))
+
+	authHandler := handler.NewAuthHandler(authService, rbacService, logger)
+	rbacHandler := handler.NewRBACHandler(rbacService, logger)
 
 	// Health check (optional deep upstream probe via ?deep=1)
 	r.Get("/health", handler.HealthCheck(cfg, logger))
@@ -69,8 +94,47 @@ func Setup(cfg *config.Config, logger *zap.Logger) *chi.Mux {
 
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
+		// -----------------------------------------------------------------
+		// Authentication (gateway-owned, no proxy)
+		// -----------------------------------------------------------------
+		r.Route("/auth", func(r chi.Router) {
+			// Public — reachable without an access token (see JWTAuth
+			// whitelist); select-tenant additionally accepts a pre-auth token.
+			r.Post("/register", authHandler.Register)
+			r.Post("/login", authHandler.Login)
+			r.Post("/select-tenant", authHandler.SelectTenant)
+			r.Post("/refresh", authHandler.Refresh)
+
+			// Authenticated
+			r.Post("/logout", authHandler.Logout)
+			r.Post("/change-password", authHandler.ChangePassword)
+			r.Get("/memberships", authHandler.ListMemberships)
+
+			// Minimal tenant directory for workspace-owner member pickers.
+			// Any authenticated tenant member may read it.
+			r.Get("/tenant-members", authHandler.ListTenantMemberCandidates)
+
+			// Tenant member management — guarded by the tenant:member:*
+			// permissions declared in the route map.
+			r.Get("/members", authHandler.ListMembers)
+			r.Post("/members", authHandler.AddMember)
+		})
+
 		// Local handler (no proxy)
-		r.Get("/me", handler.GetCurrentUser)
+		r.Get("/me", authHandler.CurrentUser)
+
+		// -----------------------------------------------------------------
+		// Role management (gateway-owned, no proxy)
+		// -----------------------------------------------------------------
+		r.Route("/rbac", func(r chi.Router) {
+			// The permission catalog is read-only: it is declared in code and
+			// synchronized into the database on startup.
+			r.Get("/permissions", rbacHandler.ListPermissions)
+			r.Get("/roles", rbacHandler.ListRoles)
+			r.Post("/roles", rbacHandler.CreateRole)
+			r.Put("/roles/{roleID}", rbacHandler.UpdateRole)
+			r.Delete("/roles/{roleID}", rbacHandler.DeleteRole)
+		})
 
 		// -----------------------------------------------------------------
 		// Agent Service — sessions, chat, SSE
@@ -128,15 +192,24 @@ func Setup(cfg *config.Config, logger *zap.Logger) *chi.Mux {
 		// Workspace management (SQLMesh Service, identity path)
 		// -----------------------------------------------------------------
 		r.Route("/workspaces", func(r chi.Router) {
-			// Special handlers — user_id injection into body
-			r.Post("/", handler.CreateWorkspace(cfg, logger))
-			r.Get("/", handler.ListWorkspaces(cfg, logger))
+			// Special handlers — identity injection (user_id + tenant_id)
+			r.Post("/", handler.CreateWorkspace(cfg, rbacService, logger))
+			r.Get("/", handler.ListWorkspaces(cfg, rbacService, logger))
 			r.Post("/bind-git", handler.BindGitRepo(cfg, logger))
+			r.Post("/sync", handler.SyncWorkspace(cfg, logger))
 
-			// Pure passthrough — sync, ensure-local, delete
-			r.Post("/sync", handler.GenericProxy(sqlmeshIdentity, logger))
-			r.Post("/{workspaceID}/ensure-local", handler.GenericProxy(sqlmeshIdentity, logger))
-			r.Delete("/{workspaceID}", handler.GenericProxy(sqlmeshIdentity, logger))
+			// Open a workspace: clone/fetch the caller's own working copy.
+			r.Post("/{workspaceID}/open", handler.OpenWorkspace(cfg, logger))
+			r.Get("/{workspaceID}/remote-branches", handler.ListWorkspaceRemoteBranches(cfg, logger))
+
+			// Membership management — owned by the gateway, which holds the
+			// role bindings; authorization is enforced by the route map.
+			r.Get("/{workspaceID}/members", handler.ListWorkspaceMembers(authService, rbacService, logger))
+			r.Post("/{workspaceID}/members", handler.AddWorkspaceMember(authService, rbacService, logger))
+			r.Delete("/{workspaceID}/members/{memberUserID}",
+				handler.RemoveWorkspaceMember(cfg, rbacService, logger))
+
+			r.Delete("/{workspaceID}", handler.DeleteWorkspace(cfg, rbacService, logger))
 		})
 
 		// -----------------------------------------------------------------

@@ -7,7 +7,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import api from '@/utils/api'
-import { notifyError } from '@/utils/notifyError'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useEnvironmentStore } from '@/stores/environment'
 import { useGatewayStore } from '@/stores/gateway'
@@ -46,6 +46,11 @@ async function safePost<T, E>(
     return { data, error: null }
   } catch (err: any) {
     const payload = err?.response?.data
+    // Authorization denials do not describe a plan problem: replace the body
+    // with the localized permission message so the panel states what is missing.
+    if (err?.response?.status === 403) {
+      return { data: null, error: { message: extractApiMessage(err) } as E }
+    }
     return {
       data: null,
       error: (payload && typeof payload === 'object' ? payload : { message: err?.message }) as E,

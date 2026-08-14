@@ -19,7 +19,9 @@ function openPublish() {
 
 async function doPublish() {
   if (!repoName.value.trim()) return
-  const provider = workspaceStore.gitCredential?.provider || 'gitea'
+  // Fall back to GitHub: it is the provider every credential form defaults to,
+  // and unlike a self-hosted provider it needs no server URL to be usable.
+  const provider = workspaceStore.gitCredential?.provider || 'github'
   await gitStore.publish(repoName.value.trim(), provider, isPrivate.value)
   showPublishForm.value = false
 }

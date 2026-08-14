@@ -34,6 +34,10 @@ class ErrorCode(str, Enum):
     MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
     WORKSPACE_NOT_FOUND = "WORKSPACE_NOT_FOUND"
     WORKSPACE_PATH_INVALID = "WORKSPACE_PATH_INVALID"
+    GIT_REPO_NOT_BOUND = "GIT_REPO_NOT_BOUND"
+    GIT_REPO_URL_INVALID = "GIT_REPO_URL_INVALID"
+    GIT_OPERATION_FAILED = "GIT_OPERATION_FAILED"
+    GIT_REMOTE_ACCESS_DENIED = "GIT_REMOTE_ACCESS_DENIED"
     INVALID_REQUEST = "INVALID_REQUEST"
     TIMEOUT = "TIMEOUT"
     CONFLICT = "CONFLICT"
@@ -188,6 +192,111 @@ class WorkspacePathInvalidError(ServiceError):
         )
 
 
+class GitRepoNotBoundError(ServiceError):
+    """Raised when a workspace cannot be opened because no Git repo is bound.
+
+    Git is the only durable carrier of workspace code, so a workspace without a
+    remote cannot be materialized on another member's machine. The owner must
+    bind a repository and push first.
+    """
+
+    def __init__(self, workspace_id: str):
+        super().__init__(
+            code=ErrorCode.GIT_REPO_NOT_BOUND,
+            message=(
+                f"Workspace {workspace_id} has no Git repository bound. "
+                f"Ask the workspace owner to push the code to Git first."
+            ),
+            status_code=409,
+        )
+
+
+class GitRepoUrlInvalidError(ServiceError):
+    """Raised when a supplied Git remote URL is rejected by validation."""
+
+    def __init__(self, reason: str):
+        super().__init__(
+            code=ErrorCode.GIT_REPO_URL_INVALID,
+            message=f"Invalid Git repository URL: {reason}",
+            status_code=400,
+        )
+
+
+class GitOperationError(ServiceError):
+    """Raised when a Git command required to fulfil the request failed."""
+
+    def __init__(self, operation: str, detail: str = ""):
+        super().__init__(
+            code=ErrorCode.GIT_OPERATION_FAILED,
+            message=f"Git operation failed: {operation}",
+            detail=detail,
+            status_code=502,
+        )
+
+
+# English fallback sentences for every remote-access reason. The frontend
+# localizes from ``git_error_reason``; these strings are what CLI users and the
+# server logs see, so they must stay actionable on their own.
+_GIT_REASON_MESSAGES: dict = {
+    "credential_missing": (
+        "No Git credential is configured for {host}. "
+        "Add a credential for that host in Settings and retry."
+    ),
+    "invalid_credential": (
+        "The Git credential for {host} was rejected. "
+        "The token is invalid, expired or revoked."
+    ),
+    "no_write_access": (
+        "The Git credential for {host} has no write access to this repository. "
+        "Grant the token write access to repository contents and make sure its "
+        "resource owner is the account or organization that owns the repository."
+    ),
+    "repo_not_found": (
+        "The repository was not found on {host}, or the credential cannot access it."
+    ),
+    "non_fast_forward": (
+        "The remote branch has commits your local branch does not. "
+        "Pull first, then push again."
+    ),
+    "branch_not_found": "The requested branch does not exist on {host}.",
+    "host_unreachable": "{host} could not be reached from the server.",
+    "unknown": "Git {operation} against {host} failed.",
+}
+
+
+class GitRemoteAccessError(ServiceError):
+    """A remote Git operation was rejected by the provider.
+
+    Carries a stable ``git_error_reason`` (see
+    :class:`src.workspace.git_ops.GitRemoteReason`) so the frontend renders a
+    localized, actionable sentence instead of raw git stderr. Mapped to 422
+    rather than 403 on purpose: 403 is reserved for platform authorization
+    failures, which the frontend localizes through a different path.
+    """
+
+    def __init__(
+        self,
+        operation: str,
+        reason: str,
+        host: str = "",
+        detail: str = "",
+    ):
+        template = _GIT_REASON_MESSAGES.get(reason, _GIT_REASON_MESSAGES["unknown"])
+        display_host = host or "the Git server"
+        super().__init__(
+            code=ErrorCode.GIT_REMOTE_ACCESS_DENIED,
+            message=template.format(host=display_host, operation=operation),
+            detail={
+                "git_error_reason": reason,
+                "git_operation": operation,
+                "git_remote_host": host,
+                # Redacted git stderr; useful for support, never a secret.
+                "git_detail": detail,
+            },
+            status_code=422,
+        )
+
+
 class ConflictError(ServiceError):
     def __init__(self, message: str):
         super().__init__(
@@ -197,11 +306,32 @@ class ConflictError(ServiceError):
         )
 
 
+class InvalidRequestError(ServiceError):
+    """Raised when request data fails business validation (HTTP 400)."""
+
+    def __init__(self, message: str, detail: Optional[str] = None):
+        super().__init__(
+            code=ErrorCode.INVALID_REQUEST,
+            message=message,
+            detail=detail,
+            status_code=400,
+        )
+
+
 class PermissionDeniedError(ServiceError):
-    def __init__(self, message: str):
+    """The caller is not allowed to perform the requested operation.
+
+    ``permission`` names the capability the gateway evaluated, so the message is
+    actionable ("ask an administrator for X") instead of an opaque 403.
+    """
+
+    def __init__(self, message: str, permission: Optional[str] = None):
+        if permission:
+            message = f'{message} (required permission: "{permission}")'
         super().__init__(
             code=ErrorCode.PERMISSION_DENIED,
             message=message,
+            detail=permission,
             status_code=403,
         )
 

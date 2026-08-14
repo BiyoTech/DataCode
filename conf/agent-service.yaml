@@ -1,4 +1,8 @@
 # Agent Service Configuration
+#
+# Service-specific settings only. Database, sqlmesh service URL, and logging
+# are sourced from conf/platform.yaml.
+
 server:
   ws_port: 8001
   grpc_port: 50051
@@ -19,33 +23,15 @@ llm:
     - id: "databricks-gpt-5-4"
       name: "databricks-gpt-5-4"
       provider: "openai"
-      api_key: "dapid7c5e2e3d0a61e1734e2d706c7b05f51"   # Override via env AGENT_SERVICE_LLM_MODELS__0__API_KEY
-      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"              # Optional custom endpoint
+      api_key: ""                           # Set via env AGENT_SERVICE_LLM_MODELS__0__API_KEY
+      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"
       max_tokens: 8192
     - id: "databricks-gpt-5-1"
       name: "databricks-gpt-5-1"
       provider: "openai"
-      api_key: "dapid7c5e2e3d0a61e1734e2d706c7b05f51"   # Override via env AGENT_SERVICE_LLM_MODELS__1__API_KEY
+      api_key: ""                           # Set via env AGENT_SERVICE_LLM_MODELS__1__API_KEY
       base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"
       max_tokens: 4096
-
-# Upstream service endpoints
-services:
-  sqlmesh_service_url: "http://localhost:8002"
-  workspace_service_url: "localhost:50053"
-
-# Database for chat history & session persistence
-# Default: embedded SQLite (zero external dependencies, perfect for demo/dev).
-# Users can switch to MySQL/PostgreSQL via product settings UI later.
-database:
-  type: "sqlite"                 # "sqlite" (default) | "postgresql" | "mysql"
-  sqlite_path: ".data/agenticdata.db"
-  # host/port/name/username/password used when type=postgresql or mysql:
-  host: "localhost"
-  port: 5432
-  name: "agenticdata"
-  username: ""
-  password: ""
 
 # Agent behavior
 agent:
@@ -62,6 +48,11 @@ agent:
       temperature: 0.8
       max_tokens: 2000
 
-# Logging
-logging:
-  level: "debug"
+# ── Shared config (from platform.yaml) ──────────────────────────────────
+# database:             → platform.yaml → database.services.agent (SQLite)
+#                         (password: env DB_PASSWORD)
+# services.sqlmesh:     → platform.yaml → services.sqlmesh.rest_url
+# logging:              → platform.yaml → logging.level
+#
+# To override per-service, use env vars:
+#   AGENT_SERVICE_DATABASE_TYPE, AGENT_SERVICE_SQLMESH_SERVICE_URL, etc.

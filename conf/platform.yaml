@@ -1,0 +1,90 @@
+# Platform-level shared configuration.
+#
+# This file is the single source of truth for cross-cutting concerns shared
+# by all services: database, workspace storage, service topology, logging.
+# Each service ALSO reads its own <service>.yaml for service-specific settings.
+#
+# Environment overrides: set AGENTICDATA_ENV=dev to load platform.dev.yaml on
+# top of this file (deep merge, env-specific wins).
+#
+# Secrets are NEVER stored here — see the `security` section below for the
+# list of env vars each service expects.
+
+# ── Database ──────────────────────────────────────────────────────────
+# Default database for all services. Individual services may override via
+# the `services` sub-map (e.g. gateway auth uses its own SQLite).
+#
+# Password is env-only: set DB_PASSWORD.
+database:
+  type: "mysql"                         # "sqlite" | "mysql" | "postgresql"
+  host: "localhost"
+  port: 3306
+  name: "agenticdata"
+  username: "root"
+  # password: env-only (DB_PASSWORD)
+  pool_size: 5
+  pool_overflow: 10
+
+  # Per-service database routing.
+  #
+  # gateway_auth: When omitted, Gateway auth uses the base database above
+  #   (MySQL/PostgreSQL). To use a separate SQLite file for auth instead,
+  #   uncomment the gateway_auth entry below. This is useful for
+  #   zero-dependency dev mode.
+  #
+  # agent: When omitted, agent-service uses the base database above.
+  #   Uncomment to use a separate SQLite file for zero-dependency dev mode.
+  #services:
+    # gateway_auth:
+    #   type: "sqlite"
+    #   sqlite_path: ".data/gateway.db"
+    # agent:
+    #   type: "sqlite"
+    #   sqlite_path: ".data/agenticdata.db"
+
+# ── Workspace Storage ──────────────────────────────────────────────────
+# Base directory for all workspace data. Must be consistent across
+# sqlmesh-service, dagster-service, and ontology-service.
+workspace:
+  base_path: "~/.agenticdata/workspaces"
+
+# ── Service Topology ──────────────────────────────────────────────────
+# Single source of truth for inter-service URLs. Each service reads its
+# own entry plus the URLs of its dependencies.
+services:
+  gateway:
+    http_url: "http://localhost:8000"
+  agent:
+    ws_url: "ws://localhost:8001"
+    grpc_url: "localhost:50051"
+    rest_url: "http://localhost:8001"
+  sqlmesh:
+    rest_url: "http://localhost:8002"
+    grpc_url: "localhost:50052"
+  ontology:
+    rest_url: "http://localhost:8003"
+  dagster:
+    rest_url: "http://localhost:8004"
+    graphql_url: "http://localhost:3001/graphql"
+
+# ── Logging ───────────────────────────────────────────────────────────
+# Shared log settings. Individual services may still override via their
+# own YAML or env vars.
+logging:
+  level: "info"
+  format: "json"                        # "json" | "text"
+
+# ── Security (documentation only — values are env-only) ──────────────
+# This section documents which env vars each service requires.
+# DO NOT put actual secret values here.
+security:
+  # Gateway JWT signing secret (Gateway only)
+  gateway_jwt_secret: "env:GW_JWT_SECRET"
+  # Database password (all DB-backed services)
+  db_password: "env:DB_PASSWORD"
+  # Dagster remote token (dagster-service, remote mode only)
+  dagster_remote_token: "env:DAGSTER_SERVICE_DAGSTER_REMOTE_TOKEN"
+  # Token encryption secret (sqlmesh-service)
+  token_encryption_secret: "env:SQLMESH_SERVICE_TOKEN_ENCRYPTION_SECRET"
+  # LLM API keys (agent-service) — per-model or global fallback
+  # See agent-service.yaml for the full env var naming scheme.

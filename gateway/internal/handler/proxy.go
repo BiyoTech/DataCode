@@ -43,11 +43,56 @@ var sseClient = &http.Client{
 	},
 }
 
+// forwardedHeaders are the identity and capability headers produced by the
+// gateway middleware chain. They are the only authorization input downstream
+// services are allowed to trust, so they must accompany every proxied request.
+var forwardedHeaders = []string{
+	"X-User-ID",
+	"X-Tenant-ID",
+	"X-Username",
+	"X-Tenant-Role",
+	"X-Workspace-ID",
+	"X-Workspace-Role",
+	"X-Granted-Permissions",
+}
+
+// forwardIdentity copies the gateway-controlled identity and capability headers
+// onto an upstream request.
+func forwardIdentity(dst *http.Request, src *http.Request) {
+	if src == nil || dst == nil {
+		return
+	}
+	for _, header := range forwardedHeaders {
+		if value := src.Header.Get(header); value != "" {
+			dst.Header.Set(header, value)
+		}
+	}
+}
+
+// relayResponse copies status and headers of an upstream reply to the client.
+func relayResponse(w http.ResponseWriter, resp *http.Response) {
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
 // proxyGet forwards a GET request to the target service and writes the response.
-func proxyGet(w http.ResponseWriter, _ *http.Request, baseURL, path string, logger *zap.Logger) {
+func proxyGet(w http.ResponseWriter, r *http.Request, baseURL, path string, logger *zap.Logger) {
 	targetURL := baseURL + path
 
-	resp, err := clientForPath(path).Get(targetURL)
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	if err != nil {
+		logger.Error("proxy_get_build_failed", zap.String("url", targetURL), zap.Error(err))
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	forwardIdentity(req, r)
+
+	resp, err := clientForPath(path).Do(req)
 	if err != nil {
 		logger.Error("proxy_get_failed", zap.String("url", targetURL), zap.Error(err))
 		http.Error(w, `{"error":"upstream service unavailable"}`, http.StatusBadGateway)
@@ -55,15 +100,7 @@ func proxyGet(w http.ResponseWriter, _ *http.Request, baseURL, path string, logg
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
-	for k, v := range resp.Header {
-		for _, val := range v {
-			w.Header().Add(k, val)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	relayResponse(w, resp)
 }
 
 // proxyPost forwards a POST request with body to the target service.
@@ -72,12 +109,16 @@ func proxyGet(w http.ResponseWriter, _ *http.Request, baseURL, path string, logg
 func proxyPost(w http.ResponseWriter, r *http.Request, baseURL, path string, body []byte, logger *zap.Logger) {
 	targetURL := baseURL + path
 
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/json"
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		logger.Error("proxy_post_build_failed", zap.String("url", targetURL), zap.Error(err))
+		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+		return
 	}
+	req.Header.Set("Content-Type", contentTypeOf(r))
+	forwardIdentity(req, r)
 
-	resp, err := clientForPath(path).Post(targetURL, contentType, bytes.NewReader(body))
+	resp, err := clientForPath(path).Do(req)
 	if err != nil {
 		logger.Error("proxy_post_failed", zap.String("url", targetURL), zap.Error(err))
 		http.Error(w, `{"error":"upstream service unavailable"}`, http.StatusBadGateway)
@@ -85,15 +126,18 @@ func proxyPost(w http.ResponseWriter, r *http.Request, baseURL, path string, bod
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
-	for k, v := range resp.Header {
-		for _, val := range v {
-			w.Header().Add(k, val)
-		}
-	}
+	relayResponse(w, resp)
+}
 
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+// contentTypeOf returns the inbound content type, defaulting to JSON.
+func contentTypeOf(r *http.Request) string {
+	if r == nil {
+		return "application/json"
+	}
+	if contentType := r.Header.Get("Content-Type"); contentType != "" {
+		return contentType
+	}
+	return "application/json"
 }
 
 // proxyPut forwards a PUT request with body to the target service.
@@ -112,6 +156,7 @@ func proxyPut(w http.ResponseWriter, r *http.Request, baseURL, path string, body
 		contentType = "application/json"
 	}
 	req.Header.Set("Content-Type", contentType)
+	forwardIdentity(req, r)
 
 	resp, err := clientForPath(path).Do(req)
 	if err != nil {
@@ -152,6 +197,7 @@ func proxyPatch(w http.ResponseWriter, r *http.Request, baseURL, path string, bo
 		contentType = "application/json"
 	}
 	req.Header.Set("Content-Type", contentType)
+	forwardIdentity(req, r)
 
 	resp, err := clientForPath(path).Do(req)
 	if err != nil {
@@ -173,7 +219,7 @@ func proxyPatch(w http.ResponseWriter, r *http.Request, baseURL, path string, bo
 
 // proxySSE forwards a GET request as a Server-Sent Events stream.
 // It streams the response body directly to the client without buffering.
-func proxySSE(w http.ResponseWriter, _ *http.Request, baseURL, path string, logger *zap.Logger) {
+func proxySSE(w http.ResponseWriter, r *http.Request, baseURL, path string, logger *zap.Logger) {
 	targetURL := baseURL + path
 
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
@@ -183,6 +229,7 @@ func proxySSE(w http.ResponseWriter, _ *http.Request, baseURL, path string, logg
 		return
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	forwardIdentity(req, r)
 
 	resp, err := sseClient.Do(req)
 	if err != nil {
@@ -237,6 +284,7 @@ func proxySSEWithContext(w http.ResponseWriter, r *http.Request, baseURL, path s
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
+	forwardIdentity(req, r)
 
 	resp, err := sseClient.Do(req)
 	if err != nil {
@@ -273,7 +321,7 @@ func proxySSEWithContext(w http.ResponseWriter, r *http.Request, baseURL, path s
 }
 
 // proxyDelete forwards a DELETE request to the target service.
-func proxyDelete(w http.ResponseWriter, _ *http.Request, baseURL, path string, logger *zap.Logger) {
+func proxyDelete(w http.ResponseWriter, r *http.Request, baseURL, path string, logger *zap.Logger) {
 	targetURL := baseURL + path
 
 	req, err := http.NewRequest(http.MethodDelete, targetURL, nil)
@@ -282,6 +330,7 @@ func proxyDelete(w http.ResponseWriter, _ *http.Request, baseURL, path string, l
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 		return
 	}
+	forwardIdentity(req, r)
 
 	resp, err := clientForPath(path).Do(req)
 	if err != nil {
@@ -300,4 +349,82 @@ func proxyDelete(w http.ResponseWriter, _ *http.Request, baseURL, path string, l
 
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// ---------------------------------------------------------------------------
+// Buffered upstream calls
+// ---------------------------------------------------------------------------
+
+// upstreamResponse is a fully buffered upstream reply. It is used when the
+// gateway must act on the outcome before answering the client — for example to
+// record the owner role binding only after a workspace was really created.
+type upstreamResponse struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+// OK reports whether the upstream call succeeded.
+func (u *upstreamResponse) OK() bool {
+	return u.StatusCode >= 200 && u.StatusCode < 300
+}
+
+// callUpstream performs a request against a backend service and buffers the
+// whole reply. Bodies handled this way are small JSON documents.
+func callUpstream(
+	r *http.Request, method, baseURL, path string, body []byte, logger *zap.Logger,
+) (*upstreamResponse, error) {
+	targetURL := baseURL + path
+
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, targetURL, reader)
+	if err != nil {
+		logger.Error("upstream_build_failed", zap.String("url", targetURL), zap.Error(err))
+		return nil, err
+	}
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", contentType)
+	}
+	forwardIdentity(req, r)
+
+	resp, err := clientForPath(path).Do(req)
+	if err != nil {
+		logger.Error("upstream_call_failed",
+			zap.String("method", method), zap.String("url", targetURL), zap.Error(err))
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error("upstream_read_failed", zap.String("url", targetURL), zap.Error(err))
+		return nil, err
+	}
+	return &upstreamResponse{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header.Clone(),
+		Body:       payload,
+	}, nil
+}
+
+// writeUpstream relays a buffered upstream reply to the client unchanged.
+func writeUpstream(w http.ResponseWriter, resp *upstreamResponse) {
+	for key, values := range resp.Header {
+		// Content-Length is recomputed by the writer.
+		if key == "Content-Length" {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	w.Write(resp.Body)
 }
