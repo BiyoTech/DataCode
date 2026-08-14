@@ -38,7 +38,7 @@ WORKSPACE_GITIGNORE = f"""# AgenticData workspace — generated at creation time
 
 # Platform error archive
 /errors/
-
+/logs/
 # SQLMesh project ({SQL_WAREHOUSE_DIR}/)
 /{SQL_WAREHOUSE_DIR}/.cache/
 /{SQL_WAREHOUSE_DIR}/logs/
