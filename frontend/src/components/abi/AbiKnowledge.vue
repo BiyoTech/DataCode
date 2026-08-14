@@ -9,6 +9,7 @@
 import { ref, h, onMounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
+import { extractApiMessage } from '@/utils/notifyError'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import type { KnowledgeDocument, KnowledgeContentResponse } from '@/types/knowledge'
 
@@ -139,7 +140,7 @@ function openCreateDialog() {
         await store.createDocument(tVal, content.value)
         MessagePlugin.success(t('abi.knowledge.createSuccess'))
       } catch (e: any) {
-        MessagePlugin.error(e?.message || t('abi.knowledge.createFailed'))
+        MessagePlugin.error(extractApiMessage(e, t('abi.knowledge.createFailed')))
       }
     },
   })
@@ -162,7 +163,7 @@ async function onFileSelected(e: Event) {
     await store.uploadFile(file)
     MessagePlugin.success(t('abi.knowledge.uploadSuccess'))
   } catch (err: any) {
-    MessagePlugin.error(err?.message || t('abi.knowledge.uploadFailed'))
+    MessagePlugin.error(extractApiMessage(err, t('abi.knowledge.uploadFailed')))
   } finally {
     // Reset so the same file can be uploaded again
     input.value = ''
@@ -182,7 +183,7 @@ async function openPreview(doc: KnowledgeDocument) {
     const data = await store.readDocumentContent(doc.id)
     previewContent.value = data
   } catch (e: any) {
-    MessagePlugin.error(e?.message || 'Failed to load content')
+    MessagePlugin.error(extractApiMessage(e, 'Failed to load content'))
   } finally {
     loadingContent.value = false
   }
@@ -209,7 +210,7 @@ function deleteDocument(doc: KnowledgeDocument) {
         }
         MessagePlugin.success(t('common.deleted'))
       } catch (e: any) {
-        MessagePlugin.error(e?.message || 'Delete failed')
+        MessagePlugin.error(extractApiMessage(e, 'Delete failed'))
       }
     },
   })

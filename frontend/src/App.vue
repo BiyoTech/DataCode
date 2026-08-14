@@ -1,11 +1,4 @@
-<script setup lang="ts">
-import { useAuthStore } from '@/stores/auth'
-import LoginView from '@/views/LoginView.vue'
-
-const authStore = useAuthStore()
-</script>
-
 <template>
-  <LoginView v-if="!authStore.isAuthenticated" />
-  <RouterView v-else />
+  <!-- Authentication is enforced by the router guard. -->
+  <RouterView />
 </template>

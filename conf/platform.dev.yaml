@@ -1,0 +1,17 @@
+# Platform dev overrides.
+#
+# Loaded on top of platform.yaml when AGENTICDATA_ENV=dev.
+# Deep merge: values here override the base file.
+
+# Dev: use MySQL locally with debug logging
+database:
+  type: "mysql"
+  host: "localhost"
+  port: 3306
+  name: "agenticdata"
+  username: "root"
+  # password: env-only (DB_PASSWORD)
+
+logging:
+  level: "debug"
+  format: "text"

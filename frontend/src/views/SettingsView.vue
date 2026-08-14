@@ -18,11 +18,20 @@ import {
   COMMON_TIMEZONES,
 } from '@/utils/timezone'
 import GitCredentialsList from '@/components/settings/GitCredentialsList.vue'
+import AccountSecurity from '@/components/settings/AccountSecurity.vue'
+import MemberManagement from '@/components/settings/MemberManagement.vue'
+import RoleManagement from '@/components/settings/RoleManagement.vue'
+import { usePermission } from '@/composables/usePermission'
+import { useAuthStore } from '@/stores/auth'
+import { useRbacStore } from '@/stores/rbac'
 
 const { t, locale } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const themeStore = useThemeStore()
+const authStore = useAuthStore()
+const rbacStore = useRbacStore()
+const { can } = usePermission()
 
 const initialSection = computed(() => {
   const section = route.query.section
@@ -37,7 +46,11 @@ interface NavSection {
   items: { id: string; labelKey: string }[]
 }
 
-const navSections: NavSection[] = [
+/**
+ * Navigation is derived from the caller's permissions, which the gateway
+ * resolves from the RBAC tables (the API enforces them as well).
+ */
+const navSections = computed<NavSection[]>(() => [
   {
     id: 'workspace',
     icon: '⚙',
@@ -49,22 +62,49 @@ const navSections: NavSection[] = [
     ],
   },
   {
+    id: 'organization',
+    icon: '🏢',
+    titleKey: 'settings.navOrganization',
+    items: [
+      ...(can('tenant:member:read') ? [{ id: 'member-management', labelKey: 'members.title' }] : []),
+      ...(can('tenant:role:read') ? [{ id: 'role-management', labelKey: 'rbac.title' }] : []),
+    ],
+  },
+  {
     id: 'user',
     icon: '👤',
     titleKey: 'settings.navUser',
     items: [
       { id: 'profile', labelKey: 'settings.profile' },
+      { id: 'account-security', labelKey: 'account.title' },
       { id: 'preferences', labelKey: 'settings.preferences' },
       { id: 'git-credentials', labelKey: 'settings.gitCredentials' },
       { id: 'notifications', labelKey: 'settings.notifications' },
     ],
   },
-]
+])
 
 const activeItem = ref(initialSection.value)
 
 watch(initialSection, (section) => {
   activeItem.value = section
+})
+
+/** Localized role of the active tenant identity. */
+/**
+ * Label of the active tenant role. Built-in codes are localized; a custom role
+ * is shown with the display name the organization gave it (resolved by /me).
+ */
+const currentRoleLabel = computed(() => {
+  const labels: Record<string, string> = {
+    admin: 'account.roleAdmin',
+    developer: 'account.roleDeveloper',
+    viewer: 'account.roleViewer',
+  }
+  const role = authStore.user?.role
+  if (!role) return ''
+  const key = labels[role]
+  return key ? t(key) : rbacStore.tenantRoleName || role
 })
 
 function goBack() {
@@ -123,7 +163,12 @@ function changeTheme(mode: ThemeMode) {
       </div>
 
       <div class="nav-sections">
-        <div v-for="section in navSections" :key="section.id" class="nav-section">
+        <div
+          v-for="section in navSections"
+          v-show="section.items.length"
+          :key="section.id"
+          class="nav-section"
+        >
           <div class="nav-section-title">
             <span class="nav-section-icon">{{ section.icon }}</span>
             <span>{{ t(section.titleKey) }}</span>
@@ -239,32 +284,56 @@ function changeTheme(mode: ThemeMode) {
         <div class="settings-card">
           <div class="setting-row">
             <div class="setting-info">
-              <span class="setting-label">Display Name</span>
-              <span class="setting-hint">Your display name shown across the platform.</span>
+              <span class="setting-label">{{ t('login.username') }}</span>
+              <span class="setting-hint">{{ t('settings.usernameHint') }}</span>
             </div>
-            <span class="setting-value">admin</span>
+            <span class="setting-value">{{ authStore.user?.username }}</span>
           </div>
 
           <div class="setting-divider" />
 
           <div class="setting-row">
             <div class="setting-info">
-              <span class="setting-label">Email</span>
-              <span class="setting-hint">Your email address.</span>
+              <span class="setting-label">{{ t('account.organization') }}</span>
+              <span class="setting-hint">{{ t('settings.organizationHint') }}</span>
             </div>
-            <span class="setting-value">admin@agenticdata.local</span>
+            <span class="setting-value">{{ authStore.user?.tenantName }}</span>
           </div>
 
           <div class="setting-divider" />
 
           <div class="setting-row">
             <div class="setting-info">
-              <span class="setting-label">Role</span>
-              <span class="setting-hint">Your current access level.</span>
+              <span class="setting-label">{{ t('account.role') }}</span>
+              <span class="setting-hint">{{ t('settings.roleHint') }}</span>
             </div>
-            <span class="role-badge">admin</span>
+            <span class="role-badge">{{ currentRoleLabel }}</span>
           </div>
         </div>
+      </div>
+
+      <!-- Account security (password change) -->
+      <div v-else-if="activeItem === 'account-security'" class="content-page">
+        <h3 class="page-title">{{ t('account.title') }}</h3>
+        <p class="page-desc">{{ t('account.description') }}</p>
+
+        <AccountSecurity />
+      </div>
+
+      <!-- Tenant member management -->
+      <div v-else-if="activeItem === 'member-management'" class="content-page">
+        <h3 class="page-title">{{ t('members.title') }}</h3>
+        <p class="page-desc">{{ t('members.description') }}</p>
+
+        <MemberManagement />
+      </div>
+
+      <!-- Role and permission management -->
+      <div v-else-if="activeItem === 'role-management'" class="content-page">
+        <h3 class="page-title">{{ t('rbac.title') }}</h3>
+        <p class="page-desc">{{ t('rbac.description') }}</p>
+
+        <RoleManagement />
       </div>
 
       <!-- Git Credentials -->

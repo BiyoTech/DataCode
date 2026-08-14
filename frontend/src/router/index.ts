@@ -1,8 +1,17 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
+import { getSession } from '@/utils/authSession'
+import { setUnauthenticatedHandler } from '@/utils/api'
+
 const router = createRouter({
   history: createWebHistory(),
   routes: [
+    {
+      path: '/login',
+      name: 'login',
+      component: () => import('@/views/LoginView.vue'),
+      meta: { public: true },
+    },
     {
       path: '/',
       component: () => import('@/layouts/AppShell.vue'),
@@ -48,6 +57,34 @@ const router = createRouter({
       ],
     },
   ],
+})
+
+/**
+ * Authentication guard. Routes are protected by default; only routes flagged
+ * `meta.public` are reachable without a session. The original target is kept
+ * in `redirect` so the user lands where they intended after signing in.
+ */
+router.beforeEach((to) => {
+  const isAuthenticated = getSession() !== null
+
+  if (!to.meta.public && !isAuthenticated) {
+    return { name: 'login', query: to.fullPath === '/' ? {} : { redirect: to.fullPath } }
+  }
+  if (to.name === 'login' && isAuthenticated) {
+    return { path: '/' }
+  }
+  return true
+})
+
+// Send the user back to the login page when a session cannot be refreshed.
+setUnauthenticatedHandler(() => {
+  const current = router.currentRoute.value
+  if (current.name === 'login') return
+
+  router.replace({
+    name: 'login',
+    query: current.fullPath === '/' ? {} : { redirect: current.fullPath },
+  })
 })
 
 export default router

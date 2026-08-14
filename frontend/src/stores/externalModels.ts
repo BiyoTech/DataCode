@@ -6,7 +6,7 @@ import { ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useWorkspaceStore } from './workspace'
 import api from '@/utils/api'
-import { notifyError } from '@/utils/notifyError'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
 
 export interface GatewayInfo {
   name: string
@@ -159,8 +159,7 @@ export const useExternalModelsStore = defineStore('externalModels', () => {
       importResult.value = data
       return data
     } catch (e: any) {
-      const msg = e.response?.data?.detail?.detail || e.response?.data?.detail || e.message
-      importError.value = String(msg)
+      importError.value = extractApiMessage(e, 'Import external models failed')
       notifyError(e, 'Import external models failed')
       throw e
     } finally {

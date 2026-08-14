@@ -9,9 +9,11 @@
  */
 import { computed, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useGitStore, type CommitFile } from '@/stores/git'
+import { useGitStore, type CommitFile, type CommitInfo } from '@/stores/git'
 import { useFileStore } from '@/stores/files'
 import { formatLocalTime } from '@/utils/timezone'
+import { baseName, kindOfStatus, letterOfStatus } from '@/utils/gitDecoration'
+import IconButton from '@/components/common/IconButton.vue'
 
 const { t } = useI18n()
 const gitStore = useGitStore()
@@ -29,28 +31,18 @@ const syncLabel = computed(() => {
   return parts.length > 0 ? parts.join(' ') : ''
 })
 
+/** One-letter badge and colour class, shared with the file tree decoration. */
 function statusIcon(status: string): string {
-  switch (status) {
-    case 'M': return 'M'
-    case 'A': return 'A'
-    case 'D': return 'D'
-    case 'R': return 'R'
-    default: return '?'
-  }
+  return letterOfStatus(status)
 }
 
 function statusClass(status: string): string {
-  switch (status) {
-    case 'M': return 'status-modified'
-    case 'A': return 'status-added'
-    case 'D': return 'status-deleted'
-    case 'R': return 'status-renamed'
-    default: return 'status-unknown'
-  }
+  const kind = kindOfStatus(status)
+  return kind ? `git-${kind}` : 'git-unknown'
 }
 
 function fileName(path: string): string {
-  return path.split('/').pop() || path
+  return baseName(path) || path
 }
 
 /** Format a commit date (ISO 8601 from backend) into the user's local time. */
@@ -155,7 +147,48 @@ async function handleCreateBranch() {
 }
 
 async function handleSwitchBranch(branchName: string) {
+  if (branchName === gitStore.currentBranch) return
   await gitStore.checkout(branchName)
+}
+
+// ---- Branch-level Git operations ----
+
+/** Local name a remote ref maps to: "origin/dev" → "dev". */
+function localNameOf(remoteRef: string): string {
+  return remoteRef.split('/').slice(1).join('/')
+}
+
+/** Delete confirmation target; null when the dialog is closed. */
+const deleteTarget = ref<string | null>(null)
+const forceDelete = ref(false)
+
+function openDeleteBranch(branchName: string) {
+  deleteTarget.value = branchName
+  forceDelete.value = false
+}
+
+async function confirmDeleteBranch() {
+  const branchName = deleteTarget.value
+  if (!branchName) return
+  deleteTarget.value = null
+  await gitStore.deleteBranch(branchName, forceDelete.value)
+}
+
+/** Reset dialog state. `hard` is destructive, so it is never the default. */
+const resetTarget = ref<CommitInfo | null>(null)
+const resetMode = ref<'soft' | 'mixed' | 'hard'>('mixed')
+
+function openReset(commit: CommitInfo) {
+  resetTarget.value = commit
+  resetMode.value = 'mixed'
+}
+
+async function confirmReset() {
+  const target = resetTarget.value
+  if (!target) return
+  const mode = resetMode.value
+  resetTarget.value = null
+  await gitStore.resetTo(target.hash, mode)
 }
 
 function handleSelectCommit(hash: string) {
@@ -197,37 +230,119 @@ onMounted(async () => {
     <!-- Left: Branches panel -->
     <div class="branches-pane">
       <div class="pane-header">
-        <span class="pane-title">{{ gitStore.currentBranch }}</span>
+        <span class="pane-title" :title="gitStore.currentBranch">{{ gitStore.currentBranch }}</span>
         <span v-if="syncLabel" class="sync-badge">{{ syncLabel }}</span>
+        <div class="pane-actions">
+          <IconButton
+            class="pane-action"
+            :label="t('git.fetch')"
+            :disabled="gitStore.isLoading"
+            @click="gitStore.fetchFromRemote()"
+          ><t-icon name="download" size="14px" /></IconButton>
+          <IconButton
+            class="pane-action"
+            :label="t('git.pullCurrent')"
+            :disabled="gitStore.isLoading"
+            @click="gitStore.pull()"
+          ><t-icon name="arrow-down" size="14px" /></IconButton>
+          <IconButton
+            class="pane-action"
+            :label="t('git.pushCurrent')"
+            :disabled="gitStore.isLoading"
+            @click="gitStore.push()"
+          ><t-icon name="arrow-up" size="14px" /></IconButton>
+        </div>
+      </div>
+
+      <!-- Working-tree quick actions: keeps the panel self-sufficient so
+           staging does not require switching to the sidebar. -->
+      <div class="worktree-bar">
+        <span class="worktree-label">
+          {{
+            gitStore.isClean
+              ? t('git.noUncommitted')
+              : t('git.uncommittedCount', { count: gitStore.changes.length })
+          }}
+        </span>
+        <div class="worktree-actions">
+          <IconButton
+            class="pane-action"
+            :label="t('git.stageAll')"
+            :disabled="gitStore.isClean || gitStore.isLoading"
+            @click="gitStore.stageAll()"
+          ><t-icon name="add" size="14px" /></IconButton>
+          <IconButton
+            class="pane-action"
+            :label="t('git.unstageAll')"
+            :disabled="gitStore.isClean || gitStore.isLoading"
+            @click="gitStore.unstageAll()"
+          ><t-icon name="minus" size="14px" /></IconButton>
+        </div>
       </div>
 
       <!-- Branch tree -->
       <div class="branch-tree">
         <!-- Local branches -->
         <div class="branch-section">
-          <div class="branch-section-title">Local</div>
+          <div class="branch-section-title">{{ t('git.localBranches') }}</div>
           <div
-            v-for="branch in gitStore.branches.filter(b => !b.is_remote)"
+            v-for="branch in gitStore.localBranches"
             :key="branch.name"
             class="branch-node"
             :class="{ current: branch.name === gitStore.currentBranch }"
+            :title="t('git.switchBranch')"
             @click="handleSwitchBranch(branch.name)"
           >
             <span class="branch-leaf">🌿</span>
             <span class="branch-label">{{ branch.name }}</span>
+            <div class="branch-actions">
+              <IconButton
+                class="pane-action"
+                :label="t('git.pushBranch')"
+                :disabled="gitStore.isLoading"
+                @click.stop="gitStore.push(branch.name)"
+              ><t-icon name="arrow-up" size="13px" /></IconButton>
+              <IconButton
+                v-if="branch.name !== gitStore.currentBranch"
+                class="pane-action danger"
+                :label="t('git.deleteBranch')"
+                :disabled="gitStore.isLoading"
+                @click.stop="openDeleteBranch(branch.name)"
+              ><t-icon name="delete" size="13px" /></IconButton>
+            </div>
           </div>
         </div>
 
         <!-- Remote branches -->
         <div class="branch-section">
-          <div class="branch-section-title">Remote</div>
+          <div class="branch-section-title">{{ t('git.remoteBranches') }}</div>
           <div
-            v-for="branch in gitStore.branches.filter(b => b.is_remote)"
+            v-for="branch in gitStore.remoteBranches"
             :key="branch.name"
             class="branch-node remote"
+            :class="{ linked: gitStore.hasLocalCounterpart(branch.name) }"
+            :title="
+              gitStore.hasLocalCounterpart(branch.name)
+                ? t('git.alreadyLocal')
+                : t('git.checkoutRemote')
+            "
+            @click="
+              gitStore.hasLocalCounterpart(branch.name)
+                ? handleSwitchBranch(localNameOf(branch.name))
+                : gitStore.checkoutRemoteBranch(branch.name)
+            "
           >
             <span class="branch-leaf">☁</span>
             <span class="branch-label">{{ branch.name }}</span>
+            <div class="branch-actions">
+              <IconButton
+                v-if="!gitStore.hasLocalCounterpart(branch.name)"
+                class="pane-action"
+                :label="t('git.checkoutRemote')"
+                :disabled="gitStore.isLoading"
+                @click.stop="gitStore.checkoutRemoteBranch(branch.name)"
+              ><t-icon name="download" size="13px" /></IconButton>
+            </div>
           </div>
         </div>
       </div>
@@ -264,7 +379,15 @@ onMounted(async () => {
             :class="{ active: c.hash === gitStore.selectedCommitHash }"
             @click="handleSelectCommit(c.hash)"
           >
-            <span class="commit-msg" :title="c.message">{{ c.message }}</span>
+            <div class="commit-row">
+              <span class="commit-msg" :title="c.message">{{ c.message }}</span>
+              <IconButton
+                class="pane-action commit-action"
+                :label="t('git.resetToCommit')"
+                :disabled="gitStore.isLoading"
+                @click.stop="openReset(c)"
+              ><t-icon name="rollback" size="13px" /></IconButton>
+            </div>
             <span class="commit-meta">
               <span class="commit-author">{{ c.author_name }}</span>
               <span class="commit-hash">{{ c.short_hash }}</span>
@@ -311,6 +434,81 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <!-- Reset dialog: mode must be chosen explicitly because `hard` is
+         irreversible for uncommitted work. -->
+    <Teleport to="body">
+      <div v-if="resetTarget" class="dialog-overlay" @click.self="resetTarget = null">
+        <div class="dialog">
+          <h4 class="dialog-title">{{ t('git.resetTitle') }}</h4>
+          <p class="dialog-text">
+            {{
+              t('git.resetTargetHint', {
+                branch: gitStore.currentBranch,
+                commit: resetTarget.short_hash,
+              })
+            }}
+          </p>
+          <p class="dialog-commit">{{ resetTarget.message }}</p>
+
+          <label class="dialog-option">
+            <input type="radio" v-model="resetMode" value="soft" />
+            <span>{{ t('git.resetModeSoft') }}</span>
+          </label>
+          <label class="dialog-option">
+            <input type="radio" v-model="resetMode" value="mixed" />
+            <span>{{ t('git.resetModeMixed') }}</span>
+          </label>
+          <label class="dialog-option">
+            <input type="radio" v-model="resetMode" value="hard" />
+            <span>{{ t('git.resetModeHard') }}</span>
+          </label>
+
+          <p v-if="resetMode === 'hard'" class="dialog-warning">
+            {{ t('git.resetHardWarning') }}
+          </p>
+
+          <div class="dialog-actions">
+            <button class="btn-cancel" @click="resetTarget = null">
+              {{ t('common.cancel') }}
+            </button>
+            <button
+              class="btn-primary"
+              :class="{ danger: resetMode === 'hard' }"
+              @click="confirmReset"
+            >
+              {{ t('git.confirmReset') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Delete branch dialog -->
+    <Teleport to="body">
+      <div v-if="deleteTarget" class="dialog-overlay" @click.self="deleteTarget = null">
+        <div class="dialog">
+          <h4 class="dialog-title">
+            {{ t('git.confirmDeleteBranch', { branch: deleteTarget }) }}
+          </h4>
+          <p class="dialog-text">{{ t('git.forceDeleteBranchHint') }}</p>
+
+          <label class="dialog-option">
+            <input type="checkbox" v-model="forceDelete" />
+            <span>{{ t('git.forceDelete') }}</span>
+          </label>
+
+          <div class="dialog-actions">
+            <button class="btn-cancel" @click="deleteTarget = null">
+              {{ t('common.cancel') }}
+            </button>
+            <button class="btn-primary danger" @click="confirmDeleteBranch">
+              {{ t('common.delete') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -327,8 +525,8 @@ onMounted(async () => {
 
 /* === Left: Branches pane === */
 .branches-pane {
-  flex: 0 0 180px;
-  min-width: 160px;
+  flex: 0 0 228px;
+  min-width: 200px;
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -339,12 +537,19 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
+  padding: 6px 6px 6px 10px;
   border-bottom: 1px solid var(--border);
   font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
   background: var(--bg-surface);
+}
+
+.pane-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sync-badge {
@@ -353,6 +558,50 @@ onMounted(async () => {
   color: var(--accent);
   padding: 1px 5px;
   border-radius: 8px;
+}
+
+/* Header / row action buttons — revealed on hover to keep rows quiet. */
+.pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.pane-action {
+  color: var(--text-muted);
+}
+
+.pane-action:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.pane-action.danger:hover:not(:disabled) {
+  color: var(--error);
+}
+
+/* Working-tree quick actions */
+.worktree-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.worktree-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worktree-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
 }
 
 .branch-tree {
@@ -378,7 +627,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 5px;
-  padding: 3px 10px 3px 16px;
+  padding: 3px 6px 3px 16px;
   font-size: 12px;
   color: var(--text-secondary);
   cursor: pointer;
@@ -396,7 +645,11 @@ onMounted(async () => {
 
 .branch-node.remote {
   color: var(--text-muted);
-  cursor: default;
+}
+
+/* A remote branch that already exists locally: switching, not fetching. */
+.branch-node.remote.linked {
+  color: var(--text-secondary);
 }
 
 .branch-leaf {
@@ -407,6 +660,19 @@ onMounted(async () => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Row actions stay hidden until hover so the list reads as a branch list. */
+.branch-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  opacity: 0;
+}
+
+.branch-node:hover .branch-actions {
+  opacity: 1;
 }
 
 .create-branch {
@@ -529,6 +795,15 @@ onMounted(async () => {
 .status-renamed { color: var(--accent); }
 .status-unknown { color: var(--text-muted); }
 
+/* Git decoration colours, shared with the file tree and the changes list. */
+.git-untracked { color: var(--git-untracked); }
+.git-added { color: var(--git-added); }
+.git-modified { color: var(--git-modified); }
+.git-renamed { color: var(--git-renamed); }
+.git-deleted { color: var(--git-deleted); }
+.git-conflict { color: var(--git-conflict); font-weight: 600; }
+.git-unknown { color: var(--text-muted); }
+
 .change-file {
   color: var(--text-primary);
   white-space: nowrap;
@@ -601,6 +876,136 @@ onMounted(async () => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.commit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.commit-row .commit-msg {
+  flex: 1;
+  min-width: 0;
+}
+
+.commit-action {
+  opacity: 0;
+  flex-shrink: 0;
+}
+
+.commit-item:hover .commit-action {
+  opacity: 1;
+}
+
+/* === Dialogs (reset / delete branch) === */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 380px;
+  max-width: 90vw;
+  padding: 20px 22px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-float-lg);
+}
+
+.dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dialog-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.dialog-commit {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 6px 8px;
+  background: var(--bg-surface);
+  border-radius: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.dialog-option input {
+  accent-color: var(--accent);
+}
+
+.dialog-warning {
+  font-size: 12px;
+  color: var(--error);
+  background: var(--error-subtle);
+  padding: 6px 8px;
+  border-radius: 4px;
+  line-height: 1.5;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.btn-cancel {
+  padding: 7px 14px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn-cancel:hover {
+  border-color: var(--text-muted);
+}
+
+.btn-primary {
+  padding: 7px 14px;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.1);
+}
+
+.btn-primary.danger {
+  background: var(--error);
 }
 
 .commit-meta {

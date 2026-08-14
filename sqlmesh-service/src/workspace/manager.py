@@ -1,579 +1,640 @@
 """Workspace lifecycle management.
 
-Orchestrates workspace operations across three layers:
-- Database (metadata persistence)
-- Git (remote code persistence)
-- Disk (local working copy)
+A workspace is a TENANT-level shared development unit:
 
-Handles creation, activation, sync, and recovery of user workspaces.
-Each Workspace is a SQLMesh project directory on disk, optionally backed by Git.
+- **Database** is the single source of truth for its existence and metadata.
+- **Git** is the only durable carrier of workspace code.
+- **Disk** holds a disposable per-user working copy, derived at runtime from
+  ``{base}/{tenant_id}/{workspace_id}/{user_id}`` (see :mod:`src.workspace.paths`).
+
+Authorization is NOT performed here. The gateway owns the role bindings and is
+the platform's single authorization center; by the time a request reaches this
+module the caller's permissions have already been checked and are carried in
+:class:`src.api.deps.CallerContext`. This module therefore only enforces tenant
+scoping (a workspace of another tenant is reported as missing) and the domain
+invariants that do not depend on roles.
 """
 
+import asyncio
 import os
+import re
+import shutil
 import typing as t
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime
 
 from src.config import settings
+from src.utils.errors import (
+    ConflictError,
+    GitRemoteAccessError,
+    GitRepoNotBoundError,
+    InvalidRequestError,
+    WorkspaceNotFoundError,
+)
 from src.utils.logging import get_logger
+from src.workspace import paths as ws_paths
+from src.workspace.models import WorkspaceModel
+
+if t.TYPE_CHECKING:  # pragma: no cover - typing only
+    from src.workspace.git_credentials import ResolvedGitAuth
+    from src.workspace.git_ops import GitCommandResult
 
 logger = get_logger(__name__)
 
+# Conservative Git branch name: rejects option-looking values (leading "-")
+# and anything outside a safe ref character set.
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 
-@dataclass
-class WorkspaceMetadata:
-    """Workspace state and metadata."""
+# Reason codes returned to the frontend when a workspace cannot be opened.
+BLOCK_REASON_NO_GIT_REPO = "no_git_repo"
+
+
+@dataclass(frozen=True)
+class WorkspaceView:
+    """Read model handed to the API layer.
+
+    ``openable`` / ``open_blocked_reason`` are computed server-side on purpose:
+    the frontend must not re-derive access rules from raw fields.
+
+    ``role`` is echoed from the caller context for convenience; the gateway
+    overwrites it (together with the effective permissions) in the response it
+    returns to the client, so it stays the only authority on roles.
+    """
+
     workspace_id: str
-    user_id: str
+    tenant_id: str
+    owner_user_id: str
     name: str
-    local_path: str
-    dialect: str = "duckdb"
-    git_repo_url: str = ""
-    git_branch: str = "main"
-    status: str = "active"  # active / archived / deleted
-    last_active_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    dialect: str
+    git_repo_url: str
+    git_branch: str
+    status: str
+    role: str
+    is_owner: bool
+    openable: bool
+    open_blocked_reason: str
+    created_at: datetime
+    last_active_at: datetime
+
+
+@dataclass(frozen=True)
+class OpenedWorkspace:
+    """Result of materializing a workspace working copy for one user."""
+
+    workspace_id: str
+    workspace_path: str
+    branch: str
 
 
 class WorkspaceManager:
-    """Manages workspace lifecycle across DB, Git, and local filesystem.
+    """Manages workspace lifecycle across DB, Git and the local filesystem."""
 
-    Storage layout: {base_path}/{user_id}/{workspace_name}/
-
-    Source of truth:
-    - Disk is authoritative for *existence*: any directory with a config.yaml
-      is a workspace. Listings reconcile disk with the DB so a directory is
-      never hidden just because the DB lacks a record.
-    - DB is a metadata/recovery layer: Git binding, status, timestamps, and
-      (for ephemeral-disk deployments) enough info to re-clone a workspace
-      whose local copy is absent. It degrades gracefully when unavailable.
-    """
-
-    def __init__(self):
-        # Expand ~ to actual home directory path
+    def __init__(self) -> None:
+        # Expand ~ to the actual home directory path.
         self._base_path = os.path.expanduser(settings.workspace_base_path)
-        self._workspaces: t.Dict[str, WorkspaceMetadata] = {}
         os.makedirs(self._base_path, exist_ok=True)
-        # Disk scan as fallback (works without DB for local dev)
-        self._discover_existing_workspaces()
-        logger.info(
-            "workspace_manager_initialized",
-            base_path=self._base_path,
-            discovered=len(self._workspaces),
-        )
+        logger.info("workspace_manager_initialized", base_path=self._base_path)
 
-    # ---- Public API ----
+    @property
+    def base_path(self) -> str:
+        """Root directory holding every tenant's working copies."""
+        return self._base_path
+
+    # ---- Public API: lifecycle ----
 
     async def create(
         self,
-        user_id: str,
+        tenant_id: str,
+        owner_user_id: str,
         name: str,
         dialect: str = "duckdb",
         git_repo_url: str = "",
-    ) -> WorkspaceMetadata:
-        """Create a new workspace.
+    ) -> WorkspaceView:
+        """Create a workspace owned by ``owner_user_id`` inside ``tenant_id``.
 
-        Steps:
-        1. Create local directory + SQLMesh scaffold
-        2. Init local Git repository
-        3. Persist metadata to DB
-        4. If git_repo_url provided, set up remote
-
-        Args:
-            user_id: Owner user ID.
-            name: Workspace display name.
-            dialect: SQL engine type.
-            git_repo_url: Optional remote Git repo URL to bind.
-
-        Returns:
-            WorkspaceMetadata for the created workspace.
+        Order of operations is chosen so a failure never leaves a half-created
+        workspace: the local scaffold is built first and rolled back if the
+        (authoritative) database insert fails.
         """
-        dir_name = name.replace(" ", "_").lower()
-        local_path = os.path.join(self._base_path, user_id, dir_name)
-        workspace_id = f"ws-{user_id}-{dir_name}"
+        from src.workspace.git_ops import GitOperations, validate_git_repo_url_async
 
-        # Return existing if already created
-        if workspace_id in self._workspaces:
-            ws = self._workspaces[workspace_id]
-            ws.last_active_at = datetime.now(timezone.utc)
-            ws.status = "active"
-            return ws
+        ws_paths.validate_segment(tenant_id, field="tenant_id")
+        ws_paths.validate_segment(owner_user_id, field="user_id")
+        slug = ws_paths.slugify(name)
+        workspace_id = ws_paths.build_workspace_id(tenant_id, slug)
 
-        # Step 1: Create directory with SQLMesh project scaffold
-        os.makedirs(local_path, exist_ok=True)
-        self._scaffold_project(local_path, name, dialect)
+        repo = self._repository()
+        if await repo.get_by_id(workspace_id) is not None:
+            raise ConflictError(f"Workspace already exists: {workspace_id}")
 
-        # Step 2: Init local Git
-        from src.workspace.git_ops import GitOperations
-        GitOperations.init(local_path)
-
-        # Step 3: Build metadata
-        ws = WorkspaceMetadata(
-            workspace_id=workspace_id,
-            user_id=user_id,
-            name=name,
-            local_path=local_path,
-            dialect=dialect,
-            git_repo_url=git_repo_url,
-        )
-        self._workspaces[workspace_id] = ws
-
-        # Step 4: Persist to DB (best-effort, non-blocking for local dev)
-        await self._persist_to_db(ws)
-
-        # Step 5: If remote Git URL provided, set up remote
         if git_repo_url:
-            await self._setup_remote_git(ws)
+            git_repo_url = await validate_git_repo_url_async(git_repo_url)
+
+        local_path = self.user_path(tenant_id, workspace_id, owner_user_id)
+        os.makedirs(local_path, exist_ok=True)
+        await asyncio.to_thread(self._scaffold_project, local_path, name, dialect)
+        await asyncio.to_thread(GitOperations.init, local_path)
+
+        model = WorkspaceModel(
+            id=workspace_id,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            name=name,
+            dialect=dialect,
+            git_repo_url=git_repo_url or None,
+            git_branch="main",
+            status="active",
+        )
+        try:
+            await repo.create(model)
+        except Exception:
+            # The DB is authoritative; drop the orphan scaffold so a retry is clean.
+            shutil.rmtree(local_path, ignore_errors=True)
+            logger.error(
+                "workspace_create_rolled_back",
+                workspace_id=workspace_id,
+                tenant_id=tenant_id,
+            )
+            raise
+
+        if git_repo_url:
+            push_result = await self._push_initial_code(
+                local_path=local_path,
+                git_repo_url=git_repo_url,
+                branch="main",
+                user_id=owner_user_id,
+            )
+            if not push_result.ok:
+                # Non-fatal: the workspace exists and the owner keeps a local
+                # copy, but members cannot clone until the push succeeds.
+                logger.error(
+                    "workspace_initial_push_failed",
+                    workspace_id=workspace_id,
+                    tenant_id=tenant_id,
+                    reason=push_result.reason,
+                )
 
         logger.info(
             "workspace_created",
             workspace_id=workspace_id,
-            local_path=local_path,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
             dialect=dialect,
             has_git_remote=bool(git_repo_url),
         )
-        return ws
+        return self._build_view(model, role="", requester_user_id=owner_user_id,
+                                local_path=local_path)
 
-    def create_sync(
-        self,
-        user_id: str,
-        name: str,
-        dialect: str = "duckdb",
-    ) -> WorkspaceMetadata:
-        """Synchronous create (no DB/Git remote).
+    async def list_for_ids(
+        self, tenant_id: str, user_id: str, workspace_ids: t.Sequence[str]
+    ) -> t.List[WorkspaceView]:
+        """List the active workspaces named by ``workspace_ids``.
 
-        Used by sync endpoints. For new code, prefer async create().
+        The gateway resolved the identifiers from the caller's role bindings, so
+        this is a metadata lookup restricted to the caller's tenant.
         """
-        dir_name = name.replace(" ", "_").lower()
-        local_path = os.path.join(self._base_path, user_id, dir_name)
-        workspace_id = f"ws-{user_id}-{dir_name}"
+        ws_paths.validate_segment(tenant_id, field="tenant_id")
+        ws_paths.validate_segment(user_id, field="user_id")
 
-        if workspace_id in self._workspaces:
-            ws = self._workspaces[workspace_id]
-            ws.last_active_at = datetime.now(timezone.utc)
-            ws.status = "active"
-            return ws
+        repo = self._repository()
+        models = await repo.list_by_ids(tenant_id, workspace_ids)
 
-        os.makedirs(local_path, exist_ok=True)
-        self._scaffold_project(local_path, name, dialect)
+        views: t.List[WorkspaceView] = []
+        for model in models:
+            local_path = self.user_path(tenant_id, model.id, user_id)
+            views.append(
+                self._build_view(
+                    model, role="", requester_user_id=user_id, local_path=local_path
+                )
+            )
 
-        ws = WorkspaceMetadata(
+        logger.info(
+            "workspaces_listed",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            count=len(views),
+        )
+        return views
+
+    async def open(
+        self,
+        workspace_id: str,
+        tenant_id: str,
+        user_id: str,
+        branch: str = "",
+    ) -> OpenedWorkspace:
+        """Materialize the caller's working copy and return its path.
+
+        Clones on first open, otherwise fetches and checks out the requested
+        branch. Each member gets an isolated directory so concurrent work on the
+        same workspace never collides.
+        """
+        from src.workspace.git_ops import clone_async, fetch_and_checkout_async
+
+        model = await self._require_workspace(workspace_id, tenant_id)
+        local_path = self.user_path(tenant_id, workspace_id, user_id)
+        git_repo_url = model.git_repo_url or ""
+
+        if not git_repo_url:
+            # Bootstrap window: the owner still holds the only copy of the code
+            # and must be able to enter the workspace to bind Git and push.
+            if model.owner_user_id == user_id and os.path.isdir(local_path):
+                await self._touch_last_active(workspace_id)
+                logger.info(
+                    "workspace_opened_without_git",
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                )
+                return OpenedWorkspace(workspace_id, local_path, model.git_branch)
+            logger.warning(
+                "workspace_open_blocked_no_git_repo",
+                workspace_id=workspace_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            raise GitRepoNotBoundError(workspace_id)
+
+        target_branch = self._validate_branch(branch or model.git_branch)
+        resolved = await self._resolve_git_auth(user_id, git_repo_url)
+
+        if os.path.isdir(os.path.join(local_path, ".git")):
+            result = await fetch_and_checkout_async(
+                local_path, target_branch, resolved.auth
+            )
+            if not result.ok:
+                raise GitRemoteAccessError(
+                    "fetch", result.reason, resolved.host, result.detail
+                )
+        else:
+            # A stale non-git directory would make clone fail; clear it first.
+            if os.path.isdir(local_path):
+                shutil.rmtree(local_path, ignore_errors=True)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            result = await clone_async(
+                git_repo_url, local_path, target_branch, resolved.auth
+            )
+            if not result.ok:
+                raise GitRemoteAccessError(
+                    "clone", result.reason, resolved.host, result.detail
+                )
+
+        await self._touch_last_active(workspace_id)
+        logger.info(
+            "workspace_opened",
+            workspace_id=workspace_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            branch=target_branch,
+        )
+        return OpenedWorkspace(workspace_id, local_path, target_branch)
+
+    async def remote_branches(
+        self, workspace_id: str, tenant_id: str, user_id: str
+    ) -> t.List[str]:
+        """List remote branches available for the workspace repository."""
+        from src.workspace.git_ops import ls_remote_branches_async
+
+        model = await self._require_workspace(workspace_id, tenant_id)
+        if not model.git_repo_url:
+            return []
+
+        resolved = await self._resolve_git_auth(user_id, model.git_repo_url)
+        branches = await ls_remote_branches_async(model.git_repo_url, resolved.auth)
+        logger.info(
+            "workspace_remote_branches_listed",
             workspace_id=workspace_id,
             user_id=user_id,
-            name=name,
-            local_path=local_path,
-            dialect=dialect,
+            count=len(branches),
         )
-        self._workspaces[workspace_id] = ws
+        return branches
 
-        logger.info("workspace_created", workspace_id=workspace_id, local_path=local_path, dialect=dialect)
-        return ws
+    async def bind_git_repo(
+        self,
+        workspace_id: str,
+        tenant_id: str,
+        user_id: str,
+        git_repo_url: str,
+    ) -> str:
+        """Bind a remote repository to the workspace and push the current code.
 
-    def get(self, workspace_id: str) -> t.Optional[WorkspaceMetadata]:
-        """Get workspace metadata by ID."""
-        return self._workspaces.get(workspace_id)
-
-    def get_path(self, workspace_id: str) -> t.Optional[str]:
-        """Get the filesystem path for a workspace."""
-        ws = self._workspaces.get(workspace_id)
-        return ws.local_path if ws else None
-
-    async def list_workspaces(self, user_id: str) -> t.List[WorkspaceMetadata]:
-        """List workspaces for a user, reconciling disk with the DB.
-
-        Disk is the source of truth for existence: every workspace directory on
-        disk is included, so a directory is never hidden just because it is
-        missing from the DB. The DB supplements this with metadata (Git binding,
-        status, timestamps) and enables recovery of workspaces whose local copy
-        is absent — e.g. a fresh Pod with ephemeral disk — which are re-cloned
-        lazily on access via ``ensure_local``.
-
-        Reconciliation per call:
-        - disk ∩ db  → DB metadata, but trust disk for local_path/dialect
-        - disk only  → include and back-fill into the DB (make it recoverable)
-        - db only    → include (recoverable; local copy re-cloned on access)
-        Soft-deleted DB records are excluded (``list_by_user`` filters status).
+        Binding decides where every member pulls the code from, so it is gated
+        by the ``workspace:git:bind`` permission at the gateway.
         """
-        disk = self._scan_disk_workspaces(user_id)
+        from src.workspace.git_ops import extract_git_host, validate_git_repo_url_async
 
-        # Refresh the in-memory cache from disk (source of truth for presence).
-        for workspace_id, ws in disk.items():
-            cached = self._workspaces.get(workspace_id)
-            if cached is None:
-                self._workspaces[workspace_id] = ws
-            else:
-                cached.local_path = ws.local_path
-                if cached.dialect in ("", "duckdb") and ws.dialect:
-                    cached.dialect = ws.dialect
+        model = await self._require_workspace(workspace_id, tenant_id)
+        normalized_url = await validate_git_repo_url_async(git_repo_url)
 
-        db_workspaces = await self._list_from_db(user_id)
-        if db_workspaces is None:
-            # DB unavailable → disk is the only truth.
-            return list(disk.values())
-
-        merged: t.Dict[str, WorkspaceMetadata] = {
-            ws.workspace_id: ws for ws in db_workspaces
-        }
-        for workspace_id, ws in disk.items():
-            existing = merged.get(workspace_id)
-            if existing is not None:
-                # Trust disk for the local working copy details.
-                existing.local_path = ws.local_path
-                if existing.dialect in ("", "duckdb") and ws.dialect:
-                    existing.dialect = ws.dialect
-            else:
-                # On disk but not in DB → surface it and back-fill for recovery.
-                merged[workspace_id] = ws
-                await self._persist_to_db(ws)
-                logger.info("workspace_backfilled_to_db", workspace_id=workspace_id)
-
-        return list(merged.values())
-
-    def list_workspaces_sync(self, user_id: str) -> t.List[WorkspaceMetadata]:
-        """Synchronous list (backward-compatible, in-memory only)."""
-        return [ws for ws in self._workspaces.values() if ws.user_id == user_id]
-
-    async def ensure_local(self, workspace_id: str) -> t.Optional[str]:
-        """Ensure workspace exists on local disk. Clone from Git if needed.
-
-        Used for Pod recovery: DB has metadata → clone from remote Git.
-        Returns local_path or None if not recoverable.
-        """
-        ws = self._workspaces.get(workspace_id)
-        if ws and os.path.exists(ws.local_path):
-            return ws.local_path
-
-        # Try to recover from DB
-        ws_db = await self._get_from_db(workspace_id)
-        if not ws_db:
-            return None
-
-        if ws_db.git_repo_url and not os.path.exists(ws_db.local_path):
-            # Clone from remote Git
-            token = await self._get_user_token(ws_db.user_id)
-            from src.workspace.git_ops import GitOperations
-            success = GitOperations.clone(
-                repo_url=ws_db.git_repo_url,
-                local_path=ws_db.local_path,
-                branch=ws_db.git_branch,
-                token=token,
+        local_path = self.user_path(tenant_id, workspace_id, user_id)
+        if not os.path.isdir(local_path):
+            raise ConflictError(
+                "Local working copy is missing; open the workspace before binding Git"
             )
-            if not success:
-                logger.error("workspace_recovery_failed", workspace_id=workspace_id)
-                return None
 
-        self._workspaces[workspace_id] = ws_db
-        logger.info("workspace_recovered", workspace_id=workspace_id)
-        return ws_db.local_path
+        push_result = await self._push_initial_code(
+            local_path=local_path,
+            git_repo_url=normalized_url,
+            branch=model.git_branch,
+            user_id=user_id,
+        )
+        if not push_result.ok:
+            raise GitRemoteAccessError(
+                "bind",
+                push_result.reason,
+                extract_git_host(normalized_url),
+                push_result.detail,
+            )
 
-    async def sync_to_remote(self, workspace_id: str, message: str = "Auto-save") -> bool:
-        """Commit and push local changes to remote Git.
+        repo = self._repository()
+        await repo.update_git_repo(workspace_id, normalized_url)
+        logger.info(
+            "workspace_git_bound",
+            workspace_id=workspace_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        return normalized_url
 
-        Args:
-            workspace_id: Workspace ID.
-            message: Commit message.
+    async def sync_to_remote(
+        self,
+        workspace_id: str,
+        tenant_id: str,
+        user_id: str,
+        message: str = "Auto-save",
+    ) -> bool:
+        """Commit and push the caller's working copy to the remote repository.
 
-        Returns:
-            True if sync successful.
+        Gated by the ``workspace:git:push`` permission at the gateway.
         """
-        ws = self._workspaces.get(workspace_id)
-        if not ws or not ws.git_repo_url:
-            return False
+        from src.workspace.git_ops import GitOperations, push_async
 
-        from src.workspace.git_ops import GitOperations
+        model = await self._require_workspace(workspace_id, tenant_id)
+        if not model.git_repo_url:
+            raise GitRepoNotBoundError(workspace_id)
 
-        # Commit all local changes
-        commit_hash = GitOperations.commit_all(ws.local_path, message)
+        local_path = self.user_path(tenant_id, workspace_id, user_id)
+        if not os.path.isdir(local_path):
+            raise ConflictError("Local working copy is missing; open the workspace first")
+
+        commit_hash = await asyncio.to_thread(
+            GitOperations.commit_all, local_path, message
+        )
         if not commit_hash:
-            return True  # No changes to sync
+            logger.info(
+                "workspace_sync_no_changes", workspace_id=workspace_id, user_id=user_id
+            )
+            return True
 
-        # Push to remote
-        return GitOperations.push(ws.local_path, branch=ws.git_branch)
+        resolved = await self._resolve_git_auth(user_id, model.git_repo_url)
+        push_result = await push_async(
+            local_path, model.git_branch, "origin", resolved.auth
+        )
+        if not push_result.ok:
+            raise GitRemoteAccessError(
+                "push", push_result.reason, resolved.host, push_result.detail
+            )
 
-    async def bind_git_repo(self, workspace_id: str, git_repo_url: str, user_id: str) -> bool:
-        """Bind an existing Git repository to a workspace.
-
-        Sets up remote and pushes existing code to the repo.
-        """
-        ws = self._workspaces.get(workspace_id)
-        if not ws:
-            return False
-
-        token = await self._get_user_token(user_id)
-        from src.workspace.git_ops import GitOperations
-
-        # Add remote
-        GitOperations.add_remote(ws.local_path, git_repo_url, token=token)
-
-        # Push existing code
-        GitOperations.push(ws.local_path, branch=ws.git_branch)
-
-        # Update metadata
-        ws.git_repo_url = git_repo_url
-        await self._update_git_repo_in_db(workspace_id, git_repo_url)
-
-        logger.info("workspace_git_bound", workspace_id=workspace_id, repo_url=git_repo_url)
+        logger.info(
+            "workspace_synced",
+            workspace_id=workspace_id,
+            user_id=user_id,
+            branch=model.git_branch,
+        )
         return True
 
-    async def delete(self, workspace_id: str, delete_remote: bool = False) -> bool:
-        """Delete a workspace.
+    async def delete(
+        self,
+        workspace_id: str,
+        tenant_id: str,
+        user_id: str,
+        delete_remote: bool = False,
+    ) -> bool:
+        """Soft-delete a workspace and drop every local working copy.
 
-        Removes the local directory (so a disk scan won't resurrect it), marks
-        the record deleted in DB, and optionally removes the remote Git repo.
-        Because disk is the source of truth for existence, an explicit delete
-        MUST clear the on-disk directory — otherwise the next ``list`` would
-        rediscover and re-create it.
+        Gated by the ``workspace:delete`` permission at the gateway, which also
+        purges the role bindings once this call succeeds. All members' copies
+        under the shared root are removed so no cached SQLMesh context keeps
+        pointing at a deleted workspace.
         """
-        ws = self._workspaces.pop(workspace_id, None)
-        if ws is None:
-            # Not cached (e.g. cross-Pod): resolve metadata from the DB so we
-            # can still clean up the local directory and soft-delete the record.
-            ws = await self._get_from_db(workspace_id)
-        if ws is None:
-            return False
+        model = await self._require_workspace(workspace_id, tenant_id)
 
-        # Remove the local working copy so it is not rediscovered on next scan.
-        if ws.local_path and os.path.isdir(ws.local_path):
-            import shutil
-
+        shared_root = ws_paths.workspace_shared_root(
+            self._base_path, tenant_id, workspace_id
+        )
+        if os.path.isdir(shared_root):
             try:
-                shutil.rmtree(ws.local_path)
-                logger.info("workspace_dir_removed", workspace_id=workspace_id, path=ws.local_path)
+                await asyncio.to_thread(shutil.rmtree, shared_root)
+                logger.info(
+                    "workspace_local_copies_removed",
+                    workspace_id=workspace_id,
+                    path=shared_root,
+                )
             except OSError as e:
                 logger.warning(
-                    "workspace_dir_remove_failed",
+                    "workspace_local_copies_remove_failed",
                     workspace_id=workspace_id,
-                    path=ws.local_path,
+                    path=shared_root,
                     error=str(e),
                 )
 
-        # Mark deleted in DB
-        await self._delete_in_db(workspace_id)
+        repo = self._repository()
+        await repo.delete(workspace_id)
 
-        # Optionally delete remote Git repo
-        if delete_remote and ws.git_repo_url:
-            token = await self._get_user_token(ws.user_id)
+        if delete_remote and model.git_repo_url:
             from src.workspace.git_ops import GitOperations
+
+            token = await self._get_user_token(user_id)
             await GitOperations.delete_remote_repo(
-                name=ws.name,
-                token=token,
-                owner=ws.user_id,
+                name=model.name, token=token, owner=model.owner_user_id
             )
 
-        logger.info("workspace_deleted", workspace_id=workspace_id)
+        logger.info(
+            "workspace_deleted",
+            workspace_id=workspace_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
         return True
 
-    def activate(self, workspace_id: str) -> bool:
-        """Mark workspace as active (restore from hibernation)."""
-        ws = self._workspaces.get(workspace_id)
-        if not ws:
+    # ---- Public API: working-copy housekeeping ----
+
+    async def cleanup_member_copy(
+        self, workspace_id: str, tenant_id: str, target_user_id: str
+    ) -> bool:
+        """Drop a revoked member's working copy.
+
+        Access revocation itself happens in the gateway; this only removes the
+        disposable checkout so the code stops being readable on disk. The owner's
+        copy is never touched.
+        """
+        model = await self._require_workspace(workspace_id, tenant_id)
+        ws_paths.validate_segment(target_user_id, field="target_user_id")
+
+        if target_user_id == model.owner_user_id:
+            raise ConflictError("The workspace owner's working copy cannot be removed")
+
+        member_path = self.user_path(tenant_id, workspace_id, target_user_id)
+        if not os.path.isdir(member_path):
             return False
-        ws.status = "active"
-        ws.last_active_at = datetime.now(timezone.utc)
+
+        await asyncio.to_thread(shutil.rmtree, member_path, ignore_errors=True)
+        logger.info(
+            "workspace_member_copy_removed",
+            workspace_id=workspace_id,
+            member_user_id=target_user_id,
+        )
         return True
 
-    # ---- Private: DB operations (best-effort) ----
+    # ---- Public API: path derivation ----
 
-    async def _persist_to_db(self, ws: WorkspaceMetadata) -> None:
-        """Persist workspace metadata to DB. Gracefully skip if DB unavailable."""
-        try:
-            from src.workspace.repository import WorkspaceRepository
-            from src.workspace.models import WorkspaceModel
+    def user_path(self, tenant_id: str, workspace_id: str, user_id: str) -> str:
+        """Derive the caller's working-copy path (never read from the DB)."""
+        return ws_paths.user_workspace_path(
+            self._base_path, tenant_id, workspace_id, user_id
+        )
 
-            repo = WorkspaceRepository()
-            model = WorkspaceModel(
-                id=ws.workspace_id,
-                user_id=ws.user_id,
-                name=ws.name,
-                dialect=ws.dialect,
-                git_repo_url=ws.git_repo_url or None,
-                git_branch=ws.git_branch,
-                status=ws.status,
-                local_path=ws.local_path,
-            )
-            await repo.create(model)
-        except Exception as e:
-            logger.warning("db_persist_skipped", error=str(e))
+    # ---- Private: lookup helpers ----
 
-    async def _list_from_db(self, user_id: str) -> t.Optional[t.List[WorkspaceMetadata]]:
-        """List workspaces from DB with timeout. Returns None if DB unavailable."""
-        import asyncio
+    @staticmethod
+    def _repository() -> t.Any:
+        """Instantiate the workspace repository (imported lazily)."""
+        from src.workspace.repository import WorkspaceRepository
 
-        try:
-            async with asyncio.timeout(8):  # 8s timeout for DB query
-                from src.workspace.repository import WorkspaceRepository
+        return WorkspaceRepository()
 
-                repo = WorkspaceRepository()
-                models = await repo.list_by_user(user_id)
-                return [
-                    WorkspaceMetadata(
-                        workspace_id=m.id,
-                        user_id=m.user_id,
-                        name=m.name,
-                        local_path=m.local_path,
-                        dialect=m.dialect,
-                        git_repo_url=m.git_repo_url or "",
-                        git_branch=m.git_branch,
-                        status=m.status,
-                        last_active_at=m.last_active_at,
-                        created_at=m.created_at,
-                    )
-                    for m in models
-                ]
-        except asyncio.TimeoutError:
-            logger.warning("db_list_timeout", user_id=user_id)
-            return None
-        except Exception as e:
-            logger.warning("db_list_fallback", error=str(e))
-            return None
+    async def _require_workspace(
+        self, workspace_id: str, tenant_id: str
+    ) -> WorkspaceModel:
+        """Resolve a workspace inside a tenant, or raise 404.
 
-    async def _get_from_db(self, workspace_id: str) -> t.Optional[WorkspaceMetadata]:
-        """Get workspace from DB by ID."""
-        try:
-            from src.workspace.repository import WorkspaceRepository
-
-            repo = WorkspaceRepository()
-            m = await repo.get_by_id(workspace_id)
-            if not m:
-                return None
-            return WorkspaceMetadata(
-                workspace_id=m.id,
-                user_id=m.user_id,
-                name=m.name,
-                local_path=m.local_path,
-                dialect=m.dialect,
-                git_repo_url=m.git_repo_url or "",
-                git_branch=m.git_branch,
-                status=m.status,
-                last_active_at=m.last_active_at,
-                created_at=m.created_at,
-            )
-        except Exception as e:
-            logger.warning("db_get_failed", error=str(e))
-            return None
-
-    async def _update_git_repo_in_db(self, workspace_id: str, git_repo_url: str) -> None:
-        """Update Git repo URL in DB."""
-        try:
-            from src.workspace.repository import WorkspaceRepository
-
-            repo = WorkspaceRepository()
-            await repo.update_git_repo(workspace_id, git_repo_url)
-        except Exception as e:
-            logger.warning("db_update_git_failed", error=str(e))
-
-    async def _delete_in_db(self, workspace_id: str) -> None:
-        """Soft-delete in DB."""
-        try:
-            from src.workspace.repository import WorkspaceRepository
-
-            repo = WorkspaceRepository()
-            await repo.delete(workspace_id)
-        except Exception as e:
-            logger.warning("db_delete_failed", error=str(e))
-
-    async def _get_user_token(self, user_id: str) -> str:
-        """Get user's Git token from DB."""
-        try:
-            from src.workspace.repository import UserGitCredentialRepository
-
-            repo = UserGitCredentialRepository()
-            cred = await repo.get_by_user(user_id)
-            return cred.token if cred else ""
-        except Exception as e:
-            logger.warning("db_get_token_failed", error=str(e))
-            return ""
-
-    async def _setup_remote_git(self, ws: WorkspaceMetadata) -> None:
-        """Set up remote Git for a workspace."""
-        token = await self._get_user_token(ws.user_id)
-        if not token:
-            logger.warning("no_git_token_for_remote", user_id=ws.user_id)
-            return
-
-        from src.workspace.git_ops import GitOperations
-        GitOperations.add_remote(ws.local_path, ws.git_repo_url, token=token)
-        GitOperations.push(ws.local_path, branch=ws.git_branch)
-
-    # ---- Private: Disk scan (fallback for local dev) ----
-
-    def _read_dialect_from_config(self, config_path: Path) -> str:
-        """Best-effort read of a workspace's dialect from its config.yaml.
-
-        Falls back to the default_gateway connection type, then "duckdb".
+        A workspace of another tenant yields the same 404 as a non-existent one,
+        so identifiers cannot be enumerated across tenants. Whether the caller
+        may use it was already decided by the gateway.
         """
+        ws_paths.validate_segment(tenant_id, field="tenant_id")
+        ws_paths.validate_segment(workspace_id, field="workspace_id")
+
+        repo = self._repository()
+        model = await repo.get_in_tenant(workspace_id, tenant_id)
+        if model is None:
+            logger.warning(
+                "workspace_not_found",
+                workspace_id=workspace_id,
+                tenant_id=tenant_id,
+            )
+            raise WorkspaceNotFoundError(workspace_id)
+        return model
+
+    @staticmethod
+    def _validate_branch(branch: str) -> str:
+        """Validate a branch name before it is passed to the Git CLI."""
+        if not _BRANCH_RE.match(branch or ""):
+            raise InvalidRequestError(f"invalid Git branch name: {branch}")
+        return branch
+
+    # ---- Private: view assembly ----
+
+    def _build_view(
+        self,
+        model: WorkspaceModel,
+        role: str,
+        requester_user_id: str,
+        local_path: str,
+    ) -> WorkspaceView:
+        """Assemble the API read model, computing openability server-side."""
+        is_owner = model.owner_user_id == requester_user_id
+        git_repo_url = model.git_repo_url or ""
+        openable = bool(git_repo_url)
+        blocked_reason = ""
+
+        if not openable:
+            # Owner-only bootstrap: the freshly scaffolded copy is still local.
+            if is_owner and os.path.isdir(local_path):
+                openable = True
+            else:
+                blocked_reason = BLOCK_REASON_NO_GIT_REPO
+
+        return WorkspaceView(
+            workspace_id=model.id,
+            tenant_id=model.tenant_id,
+            owner_user_id=model.owner_user_id,
+            name=model.name,
+            dialect=model.dialect,
+            git_repo_url=git_repo_url,
+            git_branch=model.git_branch,
+            status=model.status,
+            role=role,
+            is_owner=is_owner,
+            openable=openable,
+            open_blocked_reason=blocked_reason,
+            created_at=model.created_at,
+            last_active_at=model.last_active_at,
+        )
+
+    # ---- Private: DB / Git helpers ----
+
+    async def _touch_last_active(self, workspace_id: str) -> None:
+        """Best-effort last-active bookkeeping (never fails the request)."""
         try:
-            import yaml
-
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            model_defaults = data.get("model_defaults") or {}
-            if isinstance(model_defaults, dict) and model_defaults.get("dialect"):
-                return str(model_defaults["dialect"])
-
-            default_gw = data.get("default_gateway")
-            gateways = data.get("gateways") or {}
-            gw = gateways.get(default_gw) if isinstance(gateways, dict) else None
-            if isinstance(gw, dict):
-                conn = gw.get("connection") or {}
-                if isinstance(conn, dict) and conn.get("type"):
-                    return str(conn["type"])
+            repo = self._repository()
+            await repo.update_last_active(workspace_id)
         except Exception as e:
-            logger.warning("read_dialect_failed", path=str(config_path), error=str(e))
-        return "duckdb"
+            logger.warning(
+                "workspace_touch_last_active_failed",
+                workspace_id=workspace_id,
+                error=str(e),
+            )
 
-    def _scan_disk_workspaces(
-        self, user_id: t.Optional[str] = None
-    ) -> t.Dict[str, WorkspaceMetadata]:
-        """Scan base_path for workspaces on disk (dirs containing config.yaml).
+    async def _resolve_git_auth(self, user_id: str, repo_url: str) -> "ResolvedGitAuth":
+        """Resolve the credential matching ``repo_url``'s host.
 
-        Disk is the source of truth for *locally present* workspaces. Returns a
-        fresh map keyed by workspace_id and does NOT mutate the in-memory cache,
-        so callers can reconcile it against the DB on demand.
-
-        Directory convention: {base_path}/{user_id}/{workspace_name}/
-        A directory is a workspace when it contains ``sql-warehouse/config.yaml``.
+        Returns a resolution whose ``auth`` may be None (no credential for that
+        host); read-only operations can still proceed anonymously, while write
+        operations must turn that into a ``credential_missing`` error.
         """
-        from src.workspace.layout import SQL_WAREHOUSE_DIR
+        from src.workspace.git_credentials import resolve_auth_for_url
 
-        found: t.Dict[str, WorkspaceMetadata] = {}
-        base = Path(self._base_path)
-        if not base.exists():
-            return found
+        return await resolve_auth_for_url(user_id, repo_url)
 
-        for user_dir in base.iterdir():
-            if not user_dir.is_dir():
-                continue
-            uid = user_dir.name
-            if user_id is not None and uid != user_id:
-                continue
+    async def _push_initial_code(
+        self, local_path: str, git_repo_url: str, branch: str, user_id: str
+    ) -> "GitCommandResult":
+        """Point the local copy at the remote and push the current branch.
 
-            for ws_dir in user_dir.iterdir():
-                if not ws_dir.is_dir():
-                    continue
-                config_path = ws_dir / SQL_WAREHOUSE_DIR / "config.yaml"
-                # Only treat directories with sql-warehouse/config.yaml as valid
-                # workspaces (the new dual-directory layout).
-                if not config_path.exists():
-                    continue
+        Verifies write access through the provider API BEFORE pushing so an
+        under-scoped token yields "the token has no write access" instead of an
+        opaque HTTP 403 from git.
+        """
+        from src.workspace.git_ops import (
+            GitCommandResult,
+            GitOperations,
+            GitRemoteReason,
+            check_remote_write_access,
+            push_async,
+        )
 
-                dir_name = ws_dir.name
-                workspace_id = f"ws-{uid}-{dir_name}"
-                found[workspace_id] = WorkspaceMetadata(
-                    workspace_id=workspace_id,
-                    user_id=uid,
-                    name=dir_name,
-                    local_path=str(ws_dir),
-                    dialect=self._read_dialect_from_config(config_path),
-                    status="active",
-                )
-        return found
+        resolved = await self._resolve_git_auth(user_id, git_repo_url)
+        if resolved.auth is None:
+            return GitCommandResult(
+                ok=False,
+                reason=GitRemoteReason.CREDENTIAL_MISSING,
+                detail=f"no credential configured for {resolved.host}",
+            )
 
-    def _discover_existing_workspaces(self) -> None:
-        """Warm the in-memory cache from disk at startup (non-destructive)."""
-        for workspace_id, ws in self._scan_disk_workspaces().items():
-            self._workspaces.setdefault(workspace_id, ws)
-        logger.info("workspaces_discovered", count=len(self._workspaces))
+        check = await check_remote_write_access(
+            git_repo_url, resolved.auth, resolved.server_url
+        )
+        if not check.ok:
+            logger.error(
+                "git_write_access_denied",
+                host=resolved.host,
+                reason=check.reason,
+                user_id=user_id,
+            )
+            return GitCommandResult(ok=False, reason=check.reason, detail=check.detail)
+
+        await asyncio.to_thread(GitOperations.add_remote, local_path, git_repo_url)
+        return await push_async(local_path, branch, "origin", resolved.auth)
 
     # ---- Private: Project scaffolding ----
 
@@ -585,13 +646,21 @@ class WorkspaceManager:
         - ``asset-dag/``     : the Dagster Data+AI pipeline project
 
         Git is initialized at the workspace ROOT so both projects are versioned
-        together.
+        together. The ``.gitignore`` is written HERE rather than after
+        ``git init`` so the very first commit already excludes runtime output
+        (caches, logs, the error archive) instead of tracking it and needing a
+        follow-up removal.
         """
-        from src.workspace.layout import ASSET_DAG_DIR, SQL_WAREHOUSE_DIR
+        from src.workspace.layout import (
+            ASSET_DAG_DIR,
+            SQL_WAREHOUSE_DIR,
+            ensure_gitignore,
+        )
 
         warehouse_path = os.path.join(path, SQL_WAREHOUSE_DIR)
         asset_dag_path = os.path.join(path, ASSET_DAG_DIR)
 
+        ensure_gitignore(path)
         self._scaffold_sqlmesh(warehouse_path, name, dialect)
         self._scaffold_asset_dag(asset_dag_path, name)
 

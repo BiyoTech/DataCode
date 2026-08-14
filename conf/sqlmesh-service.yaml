@@ -1,5 +1,8 @@
 # SQLMesh Service Configuration
 # Role: Task scheduler + Worker Pool Manager for SQLMesh operations.
+#
+# Service-specific settings only. Database, workspace, and logging are
+# sourced from conf/platform.yaml.
 server:
   grpc_port: 50052
   rest_port: 8002
@@ -19,27 +22,15 @@ sqlmesh:
   default_dialect: "duckdb"
   query_row_limit: 1000
 
-# Workspace storage
-workspace:
-  base_path: "~/.agenticdata/workspaces"   # Base directory for all workspaces
-
-# Database — default sqlite for zero-dependency dev
-database:
-  type: "sqlite"
-  sqlite_path: ".data/sqlmesh.db"
-  host: "localhost"
-  port: 5432
-  name: "agenticdata"
-  username: ""
-  password: ""
-  pool_size: 5
-  pool_overflow: 10
-
 # Concurrency control
 concurrency:
   workspace_write_lock_ttl: 600   # Workspace write lock timeout (seconds)
   environment_lock_ttl: 900       # Environment lock timeout (seconds)
 
-# Logging
-logging:
-  level: "debug"
+# ── Shared config (from platform.yaml) ──────────────────────────────────
+# database:      → platform.yaml → database (password: env DB_PASSWORD)
+# workspace:     → platform.yaml → workspace.base_path
+# logging:       → platform.yaml → logging.level
+#
+# To override per-service, use env vars:
+#   SQLMESH_SERVICE_DB_HOST, SQLMESH_SERVICE_DB_PORT, etc.

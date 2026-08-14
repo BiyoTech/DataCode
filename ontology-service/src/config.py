@@ -1,12 +1,19 @@
 """Ontology service configuration.
 
-Configuration is sourced from environment variables only (secrets/URLs are
-never hard-coded). All settings have sensible local-development defaults.
+Configuration is sourced from environment variables and the shared
+``conf/platform.yaml``. Secrets/URLs are never hard-coded.
+
+Shared cross-cutting config (sqlmesh service URL, workspace base path) is
+sourced from ``conf/platform.yaml`` via
+:mod:`agenticdata_common.config.platform`. Per-service env vars still take
+precedence over platform defaults.
 """
 
 from __future__ import annotations
 
 import os
+
+from agenticdata_common.config.platform import platform_config
 
 
 class Settings:
@@ -22,9 +29,13 @@ class Settings:
     """
 
     def __init__(self) -> None:
-        # Base URL of the sqlmesh-service (REST). Env-only, no secrets embedded.
-        self.sqlmesh_service_url: str = os.getenv(
-            "ONTOLOGY_SQLMESH_SERVICE_URL", "http://localhost:8002"
+        platform = platform_config()
+
+        # ── SQLMesh service URL (from platform topology, env override wins) ──
+        self.sqlmesh_service_url: str = (
+            os.getenv("ONTOLOGY_SQLMESH_SERVICE_URL")
+            or platform.services.url("sqlmesh", "rest_url")
+            or "http://localhost:8002"
         ).rstrip("/")
 
         # HTTP timeout for sqlmesh-service metadata calls, in seconds.
@@ -32,10 +43,10 @@ class Settings:
             os.getenv("ONTOLOGY_SQLMESH_REQUEST_TIMEOUT", "10")
         )
 
-        # Allowed workspace root — paths must resolve under this base.
+        # ── Workspace base path (from platform, env override wins) ──
         self.workspace_base_path: str = os.getenv(
             "ONTOLOGY_WORKSPACE_BASE_PATH",
-            os.path.expanduser("~/.agenticdata/workspaces"),
+            platform.workspace_base_path,
         )
 
 

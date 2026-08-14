@@ -4,7 +4,8 @@
 import { defineStore } from 'pinia'
 import { ref, computed, type Ref, type ComputedRef } from 'vue'
 import api from '@/utils/api'
-import { notifyError } from '@/utils/notifyError'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
+import { i18n } from '@/i18n'
 import { useSSE } from '@/composables/useSSE'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useAuthStore } from '@/stores/auth'
@@ -193,7 +194,8 @@ export function createChatStore(config: ChatStoreConfig) {
 
     async function createNewSession() {
       const authStore = useAuthStore()
-      const userId = authStore.user?.userId || 'user-admin-001'
+      // The gateway re-derives the owner from the access token.
+      const userId = authStore.user?.userId ?? ''
 
       try {
         disconnect()
@@ -224,8 +226,10 @@ export function createChatStore(config: ChatStoreConfig) {
 
         return data.session_id
       } catch (e: any) {
-        const msg = e?.response?.data?.detail || e?.message || 'Unknown error'
-        pushError(`Failed to create session: ${msg}`)
+        // Single parsing path: it localizes authorization denials and surfaces
+        // the backend root cause instead of "status code 4xx".
+        const prefix = i18n.global.t('chat.error.sessionFailed')
+        pushError(`${prefix}: ${extractApiMessage(e)}`)
       }
     }
 
@@ -308,7 +312,8 @@ export function createChatStore(config: ChatStoreConfig) {
 
     async function fetchSessions() {
       const authStore = useAuthStore()
-      const userId = authStore.user?.userId || 'user-admin-001'
+      // The gateway re-derives the owner from the access token.
+      const userId = authStore.user?.userId ?? ''
 
       try {
         const params: Record<string, string> = { user_id: userId }
@@ -418,10 +423,7 @@ export function createChatStore(config: ChatStoreConfig) {
           notifyError(e, 'A task is already running in this session. Please wait for it to finish.')
           return
         }
-        // FastAPI HTTPException uses `detail`; fall back to message text.
-        const msg =
-          e?.response?.data?.detail || e?.response?.data?.error || e?.message || 'Failed to send message'
-        pushError(msg)
+        pushError(extractApiMessage(e, 'Failed to send message'))
       }
     }
 

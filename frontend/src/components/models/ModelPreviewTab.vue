@@ -8,6 +8,7 @@ import { useI18n } from 'vue-i18n'
 import { useModelsStore } from '@/stores/models'
 import { useWorkspaceStore } from '@/stores/workspace'
 import api from '@/utils/api'
+import { extractApiMessage } from '@/utils/notifyError'
 
 const { t } = useI18n()
 const modelsStore = useModelsStore()
@@ -40,7 +41,7 @@ async function loadPreview() {
     rows.value = data.rows || []
     totalRows.value = data.total_rows || rows.value.length
   } catch (e: any) {
-    error.value = e?.response?.data?.error || e?.message || 'Failed to load preview'
+    error.value = extractApiMessage(e, 'Failed to load preview')
     columns.value = []
     rows.value = []
   } finally {

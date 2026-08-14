@@ -1,21 +1,56 @@
 /**
- * Workspace store - manages workspace creation, selection, listing, and Git binding.
- * Workspace = a SQLMesh project directory on disk, optionally backed by a remote Git repo.
- * All operations are backed by the backend API via Gateway.
+ * Workspace store - manages workspace listing, opening, membership and Git binding.
+ *
+ * A workspace is a TENANT-level shared unit whose only durable code carrier is
+ * Git. Each user gets a private local working copy, materialized on demand by
+ * `openWorkspace`. Therefore `path` is NOT returned by the list endpoint: it is
+ * filled in once the workspace has been opened, and a workspace only becomes
+ * `currentWorkspace` after a successful open — every consumer of
+ * `currentWorkspace.path` can rely on it being ready.
  */
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { useAuthStore } from '@/stores/auth'
 import api from '@/utils/api'
 import { notifyError } from '@/utils/notifyError'
+
+/** Reason codes returned by the backend when a workspace cannot be opened. */
+export type OpenBlockedReason = '' | 'no_git_repo'
 
 export interface WorkspaceInfo {
   id: string
   name: string
-  path: string          // Absolute path on disk
+  /**
+   * Local working-copy path of the CURRENT user. Empty until the workspace has
+   * been opened; guaranteed non-empty for `currentWorkspace`.
+   */
+  path: string
   status: string
+  dialect: string
   gitRepoUrl: string    // Remote Git repo URL (empty = no remote)
+  gitBranch: string     // Branch checked out / default branch
+  role: string          // Caller's role inside this workspace
+  isOwner: boolean
+  /**
+   * Effective permission codes of the caller inside this workspace, resolved by
+   * the gateway. Used for UI gating only; the backend re-checks every call.
+   */
+  permissions: string[]
+  openable: boolean     // Backend-computed; never re-derived in the UI
+  openBlockedReason: OpenBlockedReason
   createdAt: string     // UTC ISO 8601
+}
+
+export interface WorkspaceMember {
+  userId: string
+  username: string
+  role: string
+  isOwner: boolean
+  joinedAt: string      // UTC ISO 8601
+}
+
+export interface TenantMemberCandidate {
+  userId: string
+  username: string
 }
 
 import type { GitCredential, CreateGitCredentialRequest, UpdateGitCredentialRequest } from '@/types/git-credentials'
@@ -26,10 +61,30 @@ export interface GitCredentialInfo {
   serverUrl: string
 }
 
+/** Map an API workspace payload onto the store model. */
+function toWorkspaceInfo(ws: any, path = ''): WorkspaceInfo {
+  return {
+    id: ws.workspace_id,
+    name: ws.name,
+    path,
+    status: ws.status || 'active',
+    dialect: ws.dialect || 'duckdb',
+    gitRepoUrl: ws.git_repo_url || '',
+    gitBranch: ws.git_branch || 'main',
+    role: ws.role || '',
+    isOwner: Boolean(ws.is_owner),
+    permissions: Array.isArray(ws.permissions) ? ws.permissions : [],
+    openable: Boolean(ws.openable),
+    openBlockedReason: (ws.open_blocked_reason || '') as OpenBlockedReason,
+    createdAt: ws.created_at,
+  }
+}
+
 export const useWorkspaceStore = defineStore('workspace', () => {
   const workspaces = ref<WorkspaceInfo[]>([])
   const currentWorkspaceId = ref<string | null>(null)
   const isLoading = ref(false)
+  const isOpening = ref(false)
   const gitCredential = ref<GitCredentialInfo | null>(null)
 
   // Multi-credential state
@@ -42,9 +97,6 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   // Restore selected workspace ID from localStorage
   const storedId = localStorage.getItem('current_workspace_id')
-  if (storedId) {
-    currentWorkspaceId.value = storedId
-  }
 
   function _persistSelection() {
     if (currentWorkspaceId.value) {
@@ -55,37 +107,34 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Fetch workspaces from backend.
+   * Fetch workspaces the caller may access, then restore/auto-select one.
+   *
+   * A workspace is only selected after `openWorkspace` succeeds, so the local
+   * working copy always exists before any file/plan/git call uses its path.
    */
   async function fetchWorkspaces(): Promise<void> {
-    const authStore = useAuthStore()
-    const userId = authStore.user?.userId || 'user-admin-001'
-
     isLoading.value = true
     try {
-      const { data } = await api.get('/workspaces', { params: { user_id: userId } })
-      workspaces.value = (data.workspaces || []).map((ws: any) => ({
-        id: ws.workspace_id,
-        name: ws.name,
-        path: ws.path,
-        status: ws.status || 'active',
-        gitRepoUrl: ws.git_repo_url || '',
-        createdAt: ws.created_at,
-      }))
+      const { data } = await api.get('/workspaces')
+      const previousPaths = new Map(workspaces.value.map((ws) => [ws.id, ws.path]))
+      workspaces.value = (data.workspaces || []).map((ws: any) =>
+        toWorkspaceInfo(ws, previousPaths.get(ws.workspace_id) || '')
+      )
 
-      // Drop a stale persisted selection if the workspace no longer exists.
-      if (
-        currentWorkspaceId.value &&
-        !workspaces.value.some((ws) => ws.id === currentWorkspaceId.value)
-      ) {
-        currentWorkspaceId.value = workspaces.value[0]?.id || null
+      const desiredId =
+        (currentWorkspaceId.value ?? storedId) || null
+      const candidate =
+        workspaces.value.find((ws) => ws.id === desiredId && ws.openable) ||
+        workspaces.value.find((ws) => ws.openable) ||
+        null
+
+      if (!candidate) {
+        currentWorkspaceId.value = null
         _persistSelection()
+        return
       }
-
-      // Auto-select first if none selected
-      if (!currentWorkspaceId.value && workspaces.value.length > 0) {
-        currentWorkspaceId.value = workspaces.value[0].id
-        _persistSelection()
+      if (candidate.id !== currentWorkspaceId.value || !candidate.path) {
+        await openWorkspace(candidate.id)
       }
     } catch (e) {
       notifyError(e, 'Failed to fetch workspaces')
@@ -96,55 +145,72 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Create a new workspace via backend API.
+   * Materialize the caller's working copy (clone or fetch + checkout) and make
+   * the workspace current. Rejects locally when the backend already reported the
+   * workspace as not openable.
+   */
+  async function openWorkspace(workspaceId: string, branch = ''): Promise<WorkspaceInfo> {
+    const ws = workspaces.value.find((w) => w.id === workspaceId)
+    if (!ws) {
+      throw new Error(`Unknown workspace: ${workspaceId}`)
+    }
+
+    isOpening.value = true
+    try {
+      const { data } = await api.post(`/workspaces/${workspaceId}/open`, { branch })
+      ws.path = data.workspace_path
+      ws.gitBranch = data.branch || ws.gitBranch
+      currentWorkspaceId.value = ws.id
+      _persistSelection()
+      return ws
+    } finally {
+      isOpening.value = false
+    }
+  }
+
+  /** List remote branches so the user can pick one before opening. */
+  async function fetchRemoteBranches(workspaceId: string): Promise<string[]> {
+    const { data } = await api.get(`/workspaces/${workspaceId}/remote-branches`)
+    return data.branches || []
+  }
+
+  /**
+   * Create a new workspace. Ownership and tenant come from the verified
+   * identity injected by the gateway.
    */
   async function createWorkspace(
     name: string,
     dialect = 'duckdb',
     gitRepoUrl = ''
   ): Promise<WorkspaceInfo> {
-    const authStore = useAuthStore()
-    const userId = authStore.user?.userId || 'user-admin-001'
-
     const { data } = await api.post('/workspaces', {
-      user_id: userId,
       name,
       dialect,
       git_repo_url: gitRepoUrl,
     })
 
-    const ws: WorkspaceInfo = {
-      id: data.workspace_id,
-      name: data.name,
-      path: data.path,
-      status: 'active',
-      gitRepoUrl: data.git_repo_url || '',
-      createdAt: data.created_at,
-    }
-
+    const ws = toWorkspaceInfo(data)
     workspaces.value.push(ws)
-    currentWorkspaceId.value = ws.id
-    _persistSelection()
+    // The creator's local scaffold already exists; open it to obtain its path.
+    await openWorkspace(ws.id)
     return ws
   }
 
   /**
-   * Bind a remote Git repository to an existing workspace.
+   * Bind a remote Git repository to an existing workspace (owner only).
+   * Once bound, every member of the workspace can open it.
    */
   async function bindGitRepo(workspaceId: string, gitRepoUrl: string): Promise<void> {
-    const authStore = useAuthStore()
-    const userId = authStore.user?.userId || 'user-admin-001'
-
-    await api.post('/workspaces/bind-git', {
+    const { data } = await api.post('/workspaces/bind-git', {
       workspace_id: workspaceId,
-      user_id: userId,
       git_repo_url: gitRepoUrl,
     })
 
-    // Update local state
     const ws = workspaces.value.find((w) => w.id === workspaceId)
     if (ws) {
-      ws.gitRepoUrl = gitRepoUrl
+      ws.gitRepoUrl = data.git_repo_url || gitRepoUrl
+      ws.openable = true
+      ws.openBlockedReason = ''
     }
   }
 
@@ -159,25 +225,63 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Delete a workspace.
+   * Delete a workspace (owner only).
    */
   async function deleteWorkspace(workspaceId: string, deleteRemote = false): Promise<void> {
     await api.delete(`/workspaces/${workspaceId}`, {
       params: { delete_remote: deleteRemote },
     })
-    workspaces.value = workspaces.value.filter((ws) => ws.id !== workspaceId)
-    if (currentWorkspaceId.value === workspaceId) {
-      currentWorkspaceId.value = workspaces.value[0]?.id || null
-    }
-    _persistSelection()
+    removeWorkspace(workspaceId)
+  }
+
+  // ---- Membership (gateway-owned role bindings) ----
+
+  /** List the members authorized to use a workspace. */
+  async function listMembers(workspaceId: string): Promise<WorkspaceMember[]> {
+    const { data } = await api.get(`/workspaces/${workspaceId}/members`)
+    return (data.members || []).map((m: any) => ({
+      userId: m.userId,
+      username: m.username || m.userId,
+      role: m.role,
+      isOwner: Boolean(m.isOwner),
+      joinedAt: m.joinedAt || '',
+    }))
+  }
+
+  /** Grant a tenant member access to the workspace. */
+  async function addMember(
+    workspaceId: string,
+    targetUserId: string,
+    role: string
+  ): Promise<void> {
+    await api.post(`/workspaces/${workspaceId}/members`, {
+      target_user_id: targetUserId,
+      role,
+    })
+  }
+
+  /** Revoke a member's access to the workspace. */
+  async function removeMember(workspaceId: string, targetUserId: string): Promise<void> {
+    await api.delete(`/workspaces/${workspaceId}/members/${targetUserId}`)
+  }
+
+  /** Tenant directory used to populate the member picker. */
+  async function fetchTenantMemberCandidates(): Promise<TenantMemberCandidate[]> {
+    const { data } = await api.get('/auth/tenant-members')
+    return (data.candidates || []).map((c: any) => ({
+      userId: c.userId,
+      username: c.username,
+    }))
   }
 
   /**
-   * Switch to a workspace.
+   * Switch to a workspace by opening the caller's working copy first.
    */
-  function selectWorkspace(id: string) {
-    currentWorkspaceId.value = id
-    _persistSelection()
+  async function selectWorkspace(id: string, branch = ''): Promise<void> {
+    if (id === currentWorkspaceId.value && !branch && currentWorkspace.value?.path) {
+      return
+    }
+    await openWorkspace(id, branch)
   }
 
   /**
@@ -186,9 +290,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   function removeWorkspace(id: string) {
     workspaces.value = workspaces.value.filter((ws) => ws.id !== id)
     if (currentWorkspaceId.value === id) {
-      currentWorkspaceId.value = workspaces.value[0]?.id || null
+      currentWorkspaceId.value = null
+      _persistSelection()
     }
-    _persistSelection()
   }
 
   // ---- Git Credentials (Multi-credential) ----
@@ -270,7 +374,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     serverUrl = ''
   ): Promise<void> {
     await createGitCredential({
-      provider: provider as any,
+      provider,
       auth_type: 'pat',
       token,
       server_url: serverUrl,
@@ -282,14 +386,21 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     currentWorkspaceId,
     currentWorkspace,
     isLoading,
+    isOpening,
     gitCredential,
     gitCredentials,
     isLoadingCredentials,
     fetchWorkspaces,
+    openWorkspace,
+    fetchRemoteBranches,
     createWorkspace,
     bindGitRepo,
     syncToRemote,
     deleteWorkspace,
+    listMembers,
+    addMember,
+    removeMember,
+    fetchTenantMemberCandidates,
     selectWorkspace,
     removeWorkspace,
     fetchGitCredential,

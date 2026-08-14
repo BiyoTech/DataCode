@@ -2,6 +2,7 @@
 import { ref, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import { MessagePlugin } from 'tdesign-vue-next'
 import { useAuthStore } from '@/stores/auth'
 import { useHorizontalResize, useVerticalResize } from '@/composables/useResize'
 import { useWorkspaceLifecycle } from '@/composables/useWorkspaceLifecycle'
@@ -12,6 +13,9 @@ import WorkspaceSelector from '@/components/layout/WorkspaceSelector.vue'
 import Toolbar from '@/components/layout/Toolbar.vue'
 import SplitHandle from '@/components/common/SplitHandle.vue'
 import IconButton from '@/components/common/IconButton.vue'
+import IdentitySelect from '@/components/auth/IdentitySelect.vue'
+import { notifyError } from '@/utils/notifyError'
+import type { MembershipInfo } from '@/utils/authSession'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -55,8 +59,23 @@ function onBottomResize(delta: number) {
 }
 
 const showUserMenu = ref(false)
+const showIdentityDialog = ref(false)
+const memberships = ref<MembershipInfo[]>([])
+const isLoadingMemberships = ref(false)
+const switchingTenantId = ref('')
 const activeSidebarTab = ref<'files' | 'models' | 'diff'>('files')
 const activeBottomTab = ref<'git' | 'log'>('git')
+
+/** Localized label of the role held in the active tenant. */
+const roleLabel = computed(() => {
+  const labels: Record<string, string> = {
+    admin: 'account.roleAdmin',
+    developer: 'account.roleDeveloper',
+    viewer: 'account.roleViewer',
+  }
+  const role = authStore.user?.role
+  return role ? t(labels[role] ?? 'account.roleViewer') : ''
+})
 
 function toggleBottomPanel(tab: 'git' | 'log') {
   if (showBottom.value && activeBottomTab.value === tab) {
@@ -72,14 +91,56 @@ function openSettings() {
   router.push({ path: '/settings', query: { section: 'appearance' } })
 }
 
+function openAccountSecurity() {
+  showUserMenu.value = false
+  router.push({ path: '/settings', query: { section: 'account-security' } })
+}
+
 function openGitSettings() {
   showBottom.value = false
   router.push({ path: '/settings', query: { section: 'git-credentials' } })
 }
 
-function handleLogout() {
+/** Open the account switcher and load the available identities. */
+async function openIdentityDialog() {
   showUserMenu.value = false
-  authStore.logout()
+  showIdentityDialog.value = true
+  isLoadingMemberships.value = true
+  try {
+    memberships.value = await authStore.listMemberships()
+  } catch (error) {
+    notifyError(error)
+    showIdentityDialog.value = false
+  } finally {
+    isLoadingMemberships.value = false
+  }
+}
+
+/**
+ * Switch to another tenant identity. A full reload is the safest way to drop
+ * every store cached under the previous identity.
+ */
+async function handleSwitchIdentity(tenantId: string) {
+  if (tenantId === authStore.user?.tenantId) {
+    showIdentityDialog.value = false
+    return
+  }
+  switchingTenantId.value = tenantId
+  try {
+    await authStore.selectTenant(tenantId)
+    MessagePlugin.success(t('identity.switched'))
+    window.location.assign('/')
+  } catch (error) {
+    notifyError(error)
+  } finally {
+    switchingTenantId.value = ''
+  }
+}
+
+async function handleLogout() {
+  showUserMenu.value = false
+  await authStore.logout()
+  router.replace({ name: 'login' })
 }
 
 // Close bottom panel when navigating to settings.
@@ -117,10 +178,21 @@ watch(
           </IconButton>
           <div v-if="showUserMenu" class="user-dropdown">
             <div class="user-dropdown-header">
-              <span class="user-dropdown-name">admin</span>
-              <span class="user-dropdown-email">admin@agenticdata.local</span>
+              <span class="user-dropdown-name">
+                {{ authStore.user?.username }}
+                <span v-if="authStore.isAdmin" class="role-badge">{{ roleLabel }}</span>
+              </span>
+              <span class="user-dropdown-email">{{ authStore.user?.tenantName }}</span>
             </div>
             <div class="user-dropdown-divider" />
+            <button class="user-dropdown-item" @click="openIdentityDialog">
+              <t-icon name="swap" size="16px" />
+              <span>{{ t('identity.switch') }}</span>
+            </button>
+            <button class="user-dropdown-item" @click="openAccountSecurity">
+              <t-icon name="lock-on" size="16px" />
+              <span>{{ t('account.changePassword') }}</span>
+            </button>
             <button class="user-dropdown-item" @click="openSettings">
               <t-icon name="setting" size="16px" />
               <span>{{ t('common.settings') }}</span>
@@ -134,6 +206,26 @@ watch(
         </div>
       </template>
     </Toolbar>
+
+    <!-- Account switcher: re-selects the active tenant identity -->
+    <t-dialog
+      v-model:visible="showIdentityDialog"
+      :header="t('identity.switchTitle')"
+      :footer="false"
+      width="440px"
+      destroy-on-close
+    >
+      <p class="dialog-subtitle">{{ t('identity.switchSubtitle') }}</p>
+      <t-loading :loading="isLoadingMemberships" size="small">
+        <IdentitySelect
+          :memberships="memberships"
+          :active-tenant-id="authStore.user?.tenantId"
+          :pending-tenant-id="switchingTenantId"
+          :disabled="Boolean(switchingTenantId)"
+          @select="handleSwitchIdentity"
+        />
+      </t-loading>
+    </t-dialog>
 
     <div v-if="isFullPage" class="body-area">
       <RouterView />
@@ -353,6 +445,24 @@ watch(
   font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.role-badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-subtler);
+  color: var(--accent);
+}
+
+.dialog-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 16px;
 }
 
 .user-dropdown-email {

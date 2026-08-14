@@ -16,20 +16,39 @@ from src.api.models.requests import (
     CreateGitCredentialRequest,
     GitCheckoutRequest,
     GitCommitRequest,
+    GitDeleteBranchRequest,
+    GitFetchRequest,
     GitInitRequest,
     GitPublishRequest,
     GitPullRequest,
     GitPushRequest,
+    GitResetRequest,
     GitStageRequest,
     GitUnstageRequest,
     UpdateGitCredentialRequest,
 )
 from src.core.context_pool import get_context_pool
+from src.utils.errors import ConflictError, GitRemoteAccessError, InvalidRequestError
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/git", tags=["git"])
+
+# Providers for which account linking (OAuth) is reserved. Every other provider
+# is personal-access-token only.
+OAUTH_CAPABLE_PROVIDERS = ("github",)
+
+
+async def _resolve_remote_auth(user_id: str, workspace_path: str, remote: str):
+    """Resolve the credential that matches the workspace remote's host.
+
+    Returns ``(ResolvedGitAuth, remote_url)``; ``remote_url`` is empty when the
+    workspace has no such remote configured.
+    """
+    from src.workspace.git_credentials import resolve_auth_for_workspace
+
+    return await resolve_auth_for_workspace(user_id, workspace_path, remote)
 
 
 # --- Git Panel Operations ---
@@ -37,13 +56,19 @@ router = APIRouter(prefix="/api/v1/git", tags=["git"])
 @router.get("/status")
 async def git_status(workspace_path: WorkspacePath):
     """Get Git status including branch, changes, and ahead/behind counts."""
-    from src.workspace.git_ops import GitOperations, run_git_async
+    from src.workspace.git_ops import GitOperations, run_git_async, strip_url_credentials
 
-    status = await asyncio.to_thread(GitOperations.status, workspace_path)
+    changes = await asyncio.to_thread(GitOperations.list_changes, workspace_path)
+    branch = await asyncio.to_thread(GitOperations.current_branch, workspace_path)
 
-    # Enrich with remote info
+    # Enrich with remote info. The URL is stripped of any embedded credential
+    # before it leaves the service: it is rendered in the UI.
     remote_result = await run_git_async(workspace_path, ["remote", "get-url", "origin"])
-    remote_url = remote_result.stdout.strip() if remote_result.returncode == 0 else ""
+    remote_url = (
+        strip_url_credentials(remote_result.stdout.strip())
+        if remote_result.returncode == 0
+        else ""
+    )
 
     ahead, behind = 0, 0
     if remote_url:
@@ -53,30 +78,20 @@ async def git_status(workspace_path: WorkspacePath):
             if len(parts) == 2:
                 ahead, behind = int(parts[0]), int(parts[1])
 
-    # Build structured file changes with staged info
-    changes = []
-    porcelain = await run_git_async(workspace_path, ["status", "--porcelain"])
-    if porcelain.returncode == 0:
-        for line in porcelain.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            index_status = line[0]
-            worktree_status = line[1]
-            file_path = line[3:]
-
-            if index_status == "?" and worktree_status == "?":
-                changes.append({"path": file_path, "status": "A", "staged": False})
-            elif index_status != " " and index_status != "?":
-                changes.append({"path": file_path, "status": index_status, "staged": True})
-            elif worktree_status != " ":
-                changes.append({"path": file_path, "status": worktree_status, "staged": False})
-
     return {
-        "branch": status.get("branch", "main"),
+        "branch": branch or "main",
         "remote_url": remote_url,
         "ahead": ahead,
         "behind": behind,
-        "changes": changes,
+        "changes": [
+            {
+                "path": change.path,
+                "status": change.status,
+                "staged": change.staged,
+                "original_path": change.original_path,
+            }
+            for change in changes
+        ],
         "is_clean": len(changes) == 0,
     }
 
@@ -90,8 +105,16 @@ async def git_init_status(workspace_path: WorkspacePath):
 
 @router.post("/init")
 async def git_init(req: GitInitRequest):
-    """Initialize git in workspace."""
+    """Initialize git in workspace.
+
+    The default ignore rules are written first: ``GitOperations.init`` stages
+    everything for the initial commit, so without them the runtime output
+    (caches, logs, error archive) would be tracked from the very first commit.
+    """
     from src.workspace.git_ops import GitOperations
+    from src.workspace.layout import ensure_gitignore
+
+    await asyncio.to_thread(ensure_gitignore, req.workspace_path)
     success = await asyncio.to_thread(GitOperations.init, req.workspace_path)
     return {"success": success}
 
@@ -144,37 +167,57 @@ async def git_commit(req: GitCommitRequest):
 
 @router.post("/push")
 async def git_push(req: GitPushRequest):
-    """Push commits to remote."""
-    from src.workspace.git_ops import GitOperations, run_git_async
+    """Push commits to remote using the credential that matches the remote host."""
+    from src.workspace.git_ops import GitRemoteReason, extract_git_host, push_async, run_git_async
 
     branch = req.branch
     if not branch:
         br_result = await run_git_async(req.workspace_path, ["branch", "--show-current"])
         branch = br_result.stdout.strip() if br_result.returncode == 0 else "main"
 
-    success = await asyncio.to_thread(
-        GitOperations.push, req.workspace_path, branch=branch, remote=req.remote
+    resolved, remote_url = await _resolve_remote_auth(
+        req.user_id, req.workspace_path, req.remote
     )
-    if not success:
-        raise HTTPException(status_code=500, detail="Git push failed")
+    if not remote_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
+        )
+    if resolved.auth is None:
+        raise GitRemoteAccessError(
+            "push", GitRemoteReason.CREDENTIAL_MISSING, extract_git_host(remote_url)
+        )
+
+    result = await push_async(req.workspace_path, branch, req.remote, resolved.auth)
+    if not result.ok:
+        raise GitRemoteAccessError("push", result.reason, resolved.host, result.detail)
     return {"success": True, "message": f"Pushed to {req.remote}/{branch}"}
 
 
 @router.post("/pull")
 async def git_pull(req: GitPullRequest):
     """Pull from remote. INVALIDATES context (working tree changes)."""
-    from src.workspace.git_ops import GitOperations, run_git_async
+    from src.workspace.git_ops import pull_async, run_git_async
 
     branch = req.branch
     if not branch:
         br_result = await run_git_async(req.workspace_path, ["branch", "--show-current"])
         branch = br_result.stdout.strip() if br_result.returncode == 0 else "main"
 
-    success = await asyncio.to_thread(
-        GitOperations.pull, req.workspace_path, branch=branch, remote=req.remote
+    resolved, remote_url = await _resolve_remote_auth(
+        req.user_id, req.workspace_path, req.remote
     )
-    if not success:
-        raise HTTPException(status_code=500, detail="Git pull failed")
+    if not remote_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
+        )
+
+    # A public repository can be pulled without a credential, so a missing
+    # credential is not rejected up-front here (unlike push).
+    result = await pull_async(req.workspace_path, branch, req.remote, resolved.auth)
+    if not result.ok:
+        raise GitRemoteAccessError("pull", result.reason, resolved.host, result.detail)
 
     # CRITICAL: Invalidate context after pull (working tree changed)
     await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
@@ -182,22 +225,119 @@ async def git_pull(req: GitPullRequest):
     return {"success": True, "message": f"Pulled from {req.remote}/{branch}"}
 
 
+@router.post("/fetch")
+async def git_fetch(req: GitFetchRequest):
+    """Update remote-tracking refs. Read-only for the working tree."""
+    from src.workspace.git_ops import fetch_async
+
+    resolved, remote_url = await _resolve_remote_auth(
+        req.user_id, req.workspace_path, req.remote
+    )
+    if not remote_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
+        )
+
+    # A public repository can be fetched anonymously, so a missing credential is
+    # not rejected up-front.
+    result = await fetch_async(req.workspace_path, req.remote, req.prune, resolved.auth)
+    if not result.ok:
+        raise GitRemoteAccessError("fetch", result.reason, resolved.host, result.detail)
+    return {"success": True, "message": f"Fetched from {req.remote}"}
+
+
 @router.post("/checkout")
 async def git_checkout(req: GitCheckoutRequest):
-    """Checkout or create a branch. INVALIDATES context (working tree changes)."""
-    from src.workspace.git_ops import run_git_async
+    """Check out a branch, optionally creating it from a start point.
 
-    if req.create:
-        result = await run_git_async(req.workspace_path, ["checkout", "-b", req.branch])
-    else:
-        result = await run_git_async(req.workspace_path, ["checkout", req.branch])
+    Passing ``start_point`` + ``track`` (e.g. ``origin/dev``) materializes a
+    remote branch locally with upstream tracking configured, so later pull/push
+    need no arguments.
 
-    if result.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"Git checkout failed: {result.stderr}")
+    INVALIDATES context (working tree changes).
+    """
+    from src.workspace.git_ops import (
+        GitOperations,
+        is_valid_branch_name,
+        is_valid_start_point,
+    )
+
+    if not is_valid_branch_name(req.branch):
+        raise InvalidRequestError(f"Invalid branch name: {req.branch}")
+    if req.start_point and not is_valid_start_point(req.start_point):
+        raise InvalidRequestError(f"Invalid start point: {req.start_point}")
+
+    result = await asyncio.to_thread(
+        GitOperations.checkout,
+        req.workspace_path,
+        req.branch,
+        req.create,
+        req.start_point,
+        req.track,
+    )
+    if not result.ok:
+        raise HTTPException(status_code=409, detail=result.detail or "Git checkout failed")
 
     # CRITICAL: Invalidate context after branch switch
     await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
 
+    return {"success": True, "branch": req.branch}
+
+
+@router.post("/reset")
+async def git_reset(req: GitResetRequest):
+    """Move the current branch to an earlier commit.
+
+    ``hard`` also discards working-tree changes, so the frontend confirms that
+    mode explicitly before calling. INVALIDATES context for every mode that can
+    touch the index or the working tree.
+    """
+    from src.workspace.git_ops import RESET_MODES, GitOperations, is_valid_commit_hash
+
+    if not is_valid_commit_hash(req.commit_hash):
+        raise InvalidRequestError(f"Invalid commit hash: {req.commit_hash}")
+    if req.mode not in RESET_MODES:
+        raise InvalidRequestError(
+            f"Invalid reset mode: {req.mode}. Expected one of {', '.join(RESET_MODES)}."
+        )
+
+    result = await asyncio.to_thread(
+        GitOperations.reset, req.workspace_path, req.commit_hash, req.mode
+    )
+    if not result.ok:
+        raise HTTPException(status_code=409, detail=result.detail or "Git reset failed")
+
+    await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
+
+    return {
+        "success": True,
+        "commit_hash": req.commit_hash,
+        "mode": req.mode,
+    }
+
+
+@router.post("/branch/delete")
+async def git_delete_branch(req: GitDeleteBranchRequest):
+    """Delete a local branch. The checked-out branch cannot be deleted."""
+    from src.workspace.git_ops import GitOperations, is_valid_branch_name
+
+    if not is_valid_branch_name(req.branch):
+        raise InvalidRequestError(f"Invalid branch name: {req.branch}")
+
+    current = await asyncio.to_thread(GitOperations.current_branch, req.workspace_path)
+    if current == req.branch:
+        raise ConflictError(
+            f"Branch '{req.branch}' is checked out. Switch to another branch first."
+        )
+
+    result = await asyncio.to_thread(
+        GitOperations.delete_branch, req.workspace_path, req.branch, req.force
+    )
+    if not result.ok:
+        raise HTTPException(
+            status_code=409, detail=result.detail or "Git branch deletion failed"
+        )
     return {"success": True, "branch": req.branch}
 
 
@@ -305,19 +445,29 @@ async def git_commit_file_diff(workspace_path: WorkspacePath, commit_hash: str, 
 @router.post("/publish")
 async def git_publish(req: GitPublishRequest):
     """Initialize repo + create remote + push (full publish flow)."""
-    from src.workspace.git_ops import GitOperations
+    from src.workspace.git_ops import (
+        GitAuth,
+        GitOperations,
+        extract_git_host,
+        push_async,
+    )
     from src.workspace.repository import UserGitCredentialRepository
 
     cred_repo = UserGitCredentialRepository()
     try:
-        cred = await cred_repo.get_default(req.user_id)
+        # The credential must belong to the provider we are publishing to;
+        # the user's default credential may point at a different provider.
+        cred = await cred_repo.get_for_provider(req.user_id, req.provider)
     except Exception:
         cred = None
 
     if not cred:
         raise HTTPException(
             status_code=400,
-            detail="No Git credential found. Please configure Git access first.",
+            detail=(
+                f"No Git credential found for provider '{req.provider}'. "
+                f"Add one in Settings first."
+            ),
         )
 
     # Ensure local git is initialized
@@ -334,19 +484,26 @@ async def git_publish(req: GitPublishRequest):
     if not repo_info:
         raise HTTPException(status_code=500, detail="Failed to create remote repository")
 
-    # Add remote and push
+    auth = GitAuth(
+        token=cred.token, provider=cred.provider or "", username=cred.username or ""
+    )
     await asyncio.to_thread(
-        GitOperations.add_remote, req.workspace_path, repo_info.clone_url, cred.token
+        GitOperations.add_remote, req.workspace_path, repo_info.clone_url
     )
-    push_success = await asyncio.to_thread(
-        GitOperations.push, req.workspace_path, branch="main", remote="origin"
-    )
+    push_result = await push_async(req.workspace_path, "main", "origin", auth)
+    if not push_result.ok:
+        raise GitRemoteAccessError(
+            "publish",
+            push_result.reason,
+            extract_git_host(repo_info.clone_url),
+            push_result.detail,
+        )
 
     return {
-        "success": push_success,
+        "success": True,
         "remote_url": repo_info.clone_url,
         "html_url": repo_info.html_url,
-        "message": f"Published to {repo_info.html_url}" if push_success else "Push failed",
+        "message": f"Published to {repo_info.html_url}",
     }
 
 
@@ -355,6 +512,7 @@ async def git_publish(req: GitPublishRequest):
 @router.get("/credentials")
 async def list_git_credentials(user_id: str):
     """List all Git credentials for a user."""
+    from src.workspace.git_ops import credential_host
     from src.workspace.repository import UserGitCredentialRepository
 
     repo = UserGitCredentialRepository()
@@ -370,6 +528,9 @@ async def list_git_credentials(user_id: str):
                     "email": c.email or "",
                     "username": c.username or "",
                     "server_url": c.server_url or "",
+                    # Host the credential authenticates against. Remote
+                    # operations match on this, so the UI surfaces it too.
+                    "host": credential_host(c.provider, c.server_url or ""),
                     "is_default": c.is_default == 1,
                     "oauth_account": c.oauth_account or "",
                     "created_at": c.created_at.isoformat() if c.created_at else "",
@@ -384,32 +545,76 @@ async def list_git_credentials(user_id: str):
 
 @router.post("/credentials")
 async def create_git_credential(req: CreateGitCredentialRequest):
-    """Create a new Git credential (PAT or OAuth)."""
+    """Create a Git credential.
+
+    Only personal access tokens can be created here. Account linking (OAuth) is
+    reserved for GitHub and, until that flow is enabled, is rejected instead of
+    silently persisting a token-less row that would break every Git operation.
+
+    At most ONE credential per host is allowed: remote operations resolve the
+    credential by the remote's host, so two credentials for the same host would
+    make the choice ambiguous.
+    """
+    from src.workspace.git_ops import credential_host
     from src.workspace.repository import UserGitCredentialRepository
+
+    provider = (req.provider or "").strip().lower()
+    auth_type = (req.auth_type or "pat").strip().lower()
+    if not provider:
+        raise InvalidRequestError("Provider is required")
+
+    if auth_type == "oauth":
+        if provider not in OAUTH_CAPABLE_PROVIDERS:
+            raise InvalidRequestError(
+                f"Provider '{provider}' supports personal access tokens only"
+            )
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Linking a GitHub account is not available yet. "
+                "Use a personal access token for now."
+            ),
+        )
+    if auth_type != "pat":
+        raise InvalidRequestError(f"Unsupported auth_type: {auth_type}")
+
+    if not (req.token or "").strip():
+        raise InvalidRequestError("Token is required")
+    if not (req.server_url or "").strip():
+        raise InvalidRequestError("Server URL is required")
+
+    host = credential_host(provider, req.server_url)
+    if not host:
+        raise InvalidRequestError("Server URL must contain a valid host")
 
     repo = UserGitCredentialRepository()
     try:
-        if req.auth_type == "oauth":
-            has_existing = await repo.has_oauth(req.user_id, req.provider)
-            if has_existing:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"OAuth credential already exists for {req.provider}",
-                )
+        existing = await repo.get_for_host(req.user_id, host)
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A credential for {host} already exists "
+                    f"('{existing.nickname}'). Edit that one instead."
+                ),
+            )
 
         credential_id = str(uuid.uuid4())
-        nickname = req.nickname or f"{req.provider.capitalize()} ({req.auth_type.upper()})"
+        nickname = req.nickname or f"{provider.capitalize()} ({host})"
 
         cred = await repo.create(
             credential_id=credential_id,
             user_id=req.user_id,
-            provider=req.provider,
+            provider=provider,
             nickname=nickname,
-            auth_type=req.auth_type,
-            token=req.token,
+            auth_type=auth_type,
+            token=req.token.strip(),
             email=req.email,
             username=req.username,
-            server_url=req.server_url,
+            server_url=req.server_url.strip(),
+        )
+        logger.info(
+            "git_credential_created", credential_id=cred.id, provider=provider, host=host
         )
         return {
             "success": True,
@@ -432,20 +637,36 @@ async def create_git_credential(req: CreateGitCredentialRequest):
 @router.put("/credentials/{credential_id}")
 async def update_git_credential(credential_id: str, req: UpdateGitCredentialRequest):
     """Update an existing Git credential."""
+    from src.workspace.git_ops import credential_host
     from src.workspace.repository import UserGitCredentialRepository
 
     repo = UserGitCredentialRepository()
+    current = await repo.get_by_id(credential_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Credential not found")
+
     updates = {}
     if req.nickname:
         updates["nickname"] = req.nickname
     if req.token:
-        updates["token"] = req.token
+        updates["token"] = req.token.strip()
     if req.email:
         updates["email"] = req.email
     if req.username:
         updates["username"] = req.username
     if req.server_url:
-        updates["server_url"] = req.server_url
+        # Moving a credential to another host must not create a second
+        # credential for that host, which would make resolution ambiguous.
+        host = credential_host(current.provider, req.server_url)
+        if not host:
+            raise InvalidRequestError("Server URL must contain a valid host")
+        clash = await repo.get_for_host(current.user_id, host)
+        if clash is not None and clash.id != credential_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A credential for {host} already exists ('{clash.nickname}').",
+            )
+        updates["server_url"] = req.server_url.strip()
 
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")

@@ -258,7 +258,7 @@ export const useModelsStore = defineStore('models', () => {
    * folder layout under the workspace `models/` directory.
    *
    * Each model exposes `path` (absolute posix path of its source file, e.g.
-   * `.../workspaces/{user}/{workspace}/models/submodel/foo.sql`). We take the
+   * `.../{tenant}/{workspace}/{user}/models/submodel/foo.sql`). We take the
    * portion after the `models/` segment and split it by `/`: intermediate
    * segments become folder nodes, the last segment becomes a model leaf.
    */

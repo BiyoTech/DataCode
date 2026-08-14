@@ -1,10 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useWorkspaceStore } from '@/stores/workspace'
+import { useWorkspaceStore, type WorkspaceInfo } from '@/stores/workspace'
+import { usePermission } from '@/composables/usePermission'
+import { notifyError } from '@/utils/notifyError'
+import WorkspaceMembersDialog from './WorkspaceMembersDialog.vue'
 
 const { t } = useI18n()
 const workspaceStore = useWorkspaceStore()
+const { canInWorkspace } = usePermission()
 
 const showDropdown = ref(false)
 const showCreateDialog = ref(false)
@@ -12,6 +16,19 @@ const newWorkspaceName = ref('')
 const newWorkspaceDialect = ref('duckdb')
 const newWorkspaceGitUrl = ref('')
 const isCreating = ref(false)
+
+// Branch picker shown when a workspace has more than one remote branch.
+const branchPicker = ref<{ workspaceId: string; branches: string[]; selected: string } | null>(null)
+// Member management target (owner only).
+const membersTarget = ref<WorkspaceInfo | null>(null)
+// Git binding target and input.
+const gitBindTarget = ref<WorkspaceInfo | null>(null)
+const gitBindUrl = ref('')
+const isGitBinding = ref(false)
+// Deletion confirmation target.
+const deleteTarget = ref<WorkspaceInfo | null>(null)
+const deleteAlsoRemote = ref(false)
+const isDeleting = ref(false)
 
 // Supported SQL engine types
 const dialectOptions = [
@@ -33,13 +50,115 @@ function toggleDropdown() {
   showDropdown.value = !showDropdown.value
 }
 
-function selectWorkspace(id: string) {
-  if (id === workspaceStore.currentWorkspaceId) {
-    showDropdown.value = false
-    return
-  }
-  workspaceStore.selectWorkspace(id)
+/** Human-readable reason why a workspace cannot be opened. */
+function blockedTooltip(ws: WorkspaceInfo): string {
+  return ws.openBlockedReason === 'no_git_repo'
+    ? t('workspace.contactOwnerToPush')
+    : t('workspace.notOpenable')
+}
+
+/** Subtitle: the Git remote replaces the old local-path display. */
+function repoLabel(ws: WorkspaceInfo): string {
+  if (!ws.gitRepoUrl) return t('workspace.noGitRepo')
+  return `${ws.gitRepoUrl} · ${ws.gitBranch}`
+}
+
+/**
+ * Open a workspace. When several remote branches exist, ask which one to check
+ * out instead of silently defaulting.
+ */
+async function selectWorkspace(ws: WorkspaceInfo) {
+  if (!ws.openable) return
   showDropdown.value = false
+
+  if (ws.id === workspaceStore.currentWorkspaceId && ws.path) return
+
+  try {
+    if (ws.gitRepoUrl) {
+      const branches = await workspaceStore.fetchRemoteBranches(ws.id)
+      if (branches.length > 1) {
+        branchPicker.value = {
+          workspaceId: ws.id,
+          branches,
+          selected: branches.includes(ws.gitBranch) ? ws.gitBranch : branches[0],
+        }
+        return
+      }
+    }
+    await workspaceStore.selectWorkspace(ws.id)
+  } catch (e) {
+    notifyError(e, t('workspace.openFailed'))
+  }
+}
+
+async function confirmBranch() {
+  const picker = branchPicker.value
+  if (!picker) return
+  try {
+    await workspaceStore.selectWorkspace(picker.workspaceId, picker.selected)
+    branchPicker.value = null
+  } catch (e) {
+    notifyError(e, t('workspace.openFailed'))
+  }
+}
+
+function openMembersDialog(ws: WorkspaceInfo) {
+  showDropdown.value = false
+  membersTarget.value = ws
+}
+
+/** Whether the caller may bind a Git remote to this workspace. */
+function canBindGit(ws: WorkspaceInfo): boolean {
+  return canInWorkspace('workspace:git:bind', ws.id)
+}
+
+/** Whether the caller may delete this workspace. */
+function canDeleteWorkspace(ws: WorkspaceInfo): boolean {
+  return canInWorkspace('workspace:delete', ws.id)
+}
+
+function openGitBindDialog(ws: WorkspaceInfo) {
+  if (!canBindGit(ws)) return
+  showDropdown.value = false
+  gitBindTarget.value = ws
+  gitBindUrl.value = ws.gitRepoUrl || ''
+}
+
+async function confirmGitBind() {
+  const ws = gitBindTarget.value
+  const url = gitBindUrl.value.trim()
+  if (!ws || !url || isGitBinding.value) return
+  isGitBinding.value = true
+  try {
+    await workspaceStore.bindGitRepo(ws.id, url)
+    gitBindTarget.value = null
+    gitBindUrl.value = ''
+  } catch (e) {
+    notifyError(e, t('workspace.bindGitFailed'))
+  } finally {
+    isGitBinding.value = false
+  }
+}
+
+function openDeleteDialog(ws: WorkspaceInfo) {
+  if (!canDeleteWorkspace(ws)) return
+  showDropdown.value = false
+  deleteTarget.value = ws
+  deleteAlsoRemote.value = false
+}
+
+async function confirmDelete() {
+  const ws = deleteTarget.value
+  if (!ws || isDeleting.value) return
+  isDeleting.value = true
+  try {
+    await workspaceStore.deleteWorkspace(ws.id, deleteAlsoRemote.value)
+    deleteTarget.value = null
+  } catch (e) {
+    notifyError(e, t('workspace.deleteFailed'))
+  } finally {
+    isDeleting.value = false
+  }
 }
 
 function openCreateDialog() {
@@ -60,6 +179,8 @@ async function createWorkspace() {
     showCreateDialog.value = false
     newWorkspaceName.value = ''
     newWorkspaceGitUrl.value = ''
+  } catch (e) {
+    notifyError(e, t('workspace.createFailed'))
   } finally {
     isCreating.value = false
   }
@@ -68,8 +189,6 @@ async function createWorkspace() {
 function closeCreateDialog() {
   showCreateDialog.value = false
 }
-
-
 </script>
 
 <template>
@@ -91,13 +210,49 @@ function closeCreateDialog() {
       <div
         v-for="ws in workspaceStore.workspaces"
         :key="ws.id"
-        :class="['ws-item', { active: ws.id === workspaceStore.currentWorkspaceId }]"
-        @click="selectWorkspace(ws.id)"
+        :class="[
+          'ws-item',
+          {
+            active: ws.id === workspaceStore.currentWorkspaceId,
+            disabled: !ws.openable,
+          },
+        ]"
+        :title="ws.openable ? ws.gitRepoUrl : blockedTooltip(ws)"
+        @click="selectWorkspace(ws)"
       >
-        <span class="ws-item-icon">📂</span>
+        <span class="ws-item-icon">{{ ws.openable ? '📂' : '🔒' }}</span>
         <div class="ws-item-info">
           <span class="ws-item-name">{{ ws.name }}</span>
-          <span class="ws-item-path">{{ ws.path }}</span>
+          <span class="ws-item-repo">{{ repoLabel(ws) }}</span>
+          <span v-if="!ws.openable" class="ws-item-blocked">{{ blockedTooltip(ws) }}</span>
+        </div>
+        <div class="ws-item-actions" @click.stop>
+          <button
+            class="ws-item-action"
+            :class="{ 'is-disabled': !canBindGit(ws) }"
+            :disabled="!canBindGit(ws)"
+            :title="canBindGit(ws) ? t('workspace.bindGit') : t('workspace.noPermission')"
+            @click="openGitBindDialog(ws)"
+          >
+            ⚙
+          </button>
+          <button
+            v-if="ws.isOwner"
+            class="ws-item-action"
+            :title="t('workspace.members')"
+            @click="openMembersDialog(ws)"
+          >
+            👥
+          </button>
+          <button
+            class="ws-item-action ws-item-action-danger"
+            :class="{ 'is-disabled': !canDeleteWorkspace(ws) }"
+            :disabled="!canDeleteWorkspace(ws)"
+            :title="canDeleteWorkspace(ws) ? t('workspace.delete') : t('workspace.noPermission')"
+            @click="openDeleteDialog(ws)"
+          >
+            🗑
+          </button>
         </div>
       </div>
 
@@ -151,9 +306,7 @@ function closeCreateDialog() {
           />
           <span class="field-hint">{{ t('workspace.gitRepoUrlHint') }}</span>
         </div>
-        <p class="dialog-hint">
-          {{ t('workspace.pathHint') }}: ~/{{ 'user-admin-001' }}/{{ newWorkspaceName.replace(/\s+/g, '_').toLowerCase() || '...' }}/
-        </p>
+        <p class="dialog-hint">{{ t('workspace.sharedHint') }}</p>
         <div class="dialog-actions">
           <button class="btn-cancel" @click="closeCreateDialog">{{ t('common.cancel') }}</button>
           <button class="btn-primary" @click="createWorkspace" :disabled="!newWorkspaceName.trim() || isCreating">
@@ -163,7 +316,80 @@ function closeCreateDialog() {
       </div>
     </div>
 
+    <!-- Branch picker dialog -->
+    <div v-if="branchPicker" class="dialog-overlay" @click.self="branchPicker = null">
+      <div class="dialog">
+        <h3>{{ t('workspace.selectBranch') }}</h3>
+        <div class="dialog-field">
+          <label>{{ t('workspace.branchLabel') }}</label>
+          <select v-model="branchPicker.selected">
+            <option v-for="b in branchPicker.branches" :key="b" :value="b">{{ b }}</option>
+          </select>
+        </div>
+        <div class="dialog-actions">
+          <button class="btn-cancel" @click="branchPicker = null">{{ t('common.cancel') }}</button>
+          <button class="btn-primary" :disabled="workspaceStore.isOpening" @click="confirmBranch">
+            {{ workspaceStore.isOpening ? t('common.loading') : t('workspace.open') }}
+          </button>
+        </div>
+      </div>
+    </div>
 
+    <!-- Member management dialog (owner only) -->
+    <WorkspaceMembersDialog
+      v-if="membersTarget"
+      :workspace-id="membersTarget.id"
+      :workspace-name="membersTarget.name"
+      @close="membersTarget = null"
+    />
+
+    <!-- Git binding dialog -->
+    <div v-if="gitBindTarget" class="dialog-overlay" @click.self="gitBindTarget = null">
+      <div class="dialog">
+        <h3>{{ t('workspace.bindGit') }} — {{ gitBindTarget.name }}</h3>
+        <div class="dialog-field">
+          <label>{{ t('workspace.gitRepoUrl') }}</label>
+          <input
+            v-model="gitBindUrl"
+            type="text"
+            :placeholder="t('workspace.gitRepoUrlPlaceholder')"
+            autofocus
+            @keydown.enter="confirmGitBind"
+          />
+          <span class="field-hint">{{ t('workspace.bindGitHint') }}</span>
+        </div>
+        <div class="dialog-actions">
+          <button class="btn-cancel" @click="gitBindTarget = null">{{ t('common.cancel') }}</button>
+          <button
+            class="btn-primary"
+            :disabled="!gitBindUrl.trim() || isGitBinding"
+            @click="confirmGitBind"
+          >
+            {{ isGitBinding ? t('common.loading') : t('workspace.bind') }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Delete confirmation dialog -->
+    <div v-if="deleteTarget" class="dialog-overlay" @click.self="deleteTarget = null">
+      <div class="dialog">
+        <h3>{{ t('workspace.deleteTitle') }}</h3>
+        <p class="dialog-hint">
+          {{ t('workspace.deleteConfirm', { name: deleteTarget.name }) }}
+        </p>
+        <label v-if="deleteTarget.gitRepoUrl" class="dialog-checkbox">
+          <input v-model="deleteAlsoRemote" type="checkbox" />
+          <span>{{ t('workspace.deleteAlsoRemote', { url: deleteTarget.gitRepoUrl }) }}</span>
+        </label>
+        <div class="dialog-actions">
+          <button class="btn-cancel" @click="deleteTarget = null">{{ t('common.cancel') }}</button>
+          <button class="btn-danger" :disabled="isDeleting" @click="confirmDelete">
+            {{ isDeleting ? t('common.loading') : t('common.delete') }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -251,6 +477,15 @@ function closeCreateDialog() {
   border-left: 2px solid var(--accent);
 }
 
+.ws-item.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ws-item.disabled:hover {
+  background: none;
+}
+
 .ws-item-icon {
   font-size: 14px;
   margin-top: 2px;
@@ -268,12 +503,78 @@ function closeCreateDialog() {
   color: var(--text-primary);
 }
 
-.ws-item-path {
+.ws-item-repo {
   font-size: 11px;
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ws-item-blocked {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  white-space: normal;
+}
+
+.ws-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 1px;
+}
+
+.ws-item-action {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.ws-item-action:hover {
+  color: var(--text-primary);
+}
+
+.ws-item-action.is-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.ws-item-action.is-disabled:hover {
+  color: var(--text-muted);
+}
+
+.ws-item-action-danger:hover:not(.is-disabled) {
+  color: var(--danger, #e34d59);
+}
+
+.dialog-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.btn-danger {
+  background: var(--danger, #e34d59);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-danger:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .ws-empty {
@@ -375,7 +676,6 @@ function closeCreateDialog() {
 .dialog-hint {
   font-size: 11px;
   color: var(--text-muted);
-  font-family: monospace;
   margin-bottom: 16px;
 }
 

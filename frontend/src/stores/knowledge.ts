@@ -8,6 +8,7 @@ import { ref, computed } from 'vue'
 import { defineStore } from 'pinia'
 import { useWorkspaceStore } from './workspace'
 import api from '@/utils/api'
+import { extractApiMessage } from '@/utils/notifyError'
 import type { KnowledgeDocument, KnowledgeContentResponse } from '@/types/knowledge'
 
 export const useKnowledgeStore = defineStore('knowledge', () => {
@@ -43,7 +44,7 @@ export const useKnowledgeStore = defineStore('knowledge', () => {
       })
       documents.value = data.documents || []
     } catch (e: any) {
-      error.value = e?.response?.data?.detail || e?.message || 'Failed to fetch documents'
+      error.value = extractApiMessage(e, 'Failed to fetch documents')
       documents.value = []
     } finally {
       isLoading.value = false

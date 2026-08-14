@@ -79,6 +79,14 @@
   /* Inputs */
   --input-bg: var(--td-bg-color-component);
 
+  /* Git decorations (editor-style file tree colours, light palette) */
+  --git-untracked: #007100;
+  --git-added: #587c0c;
+  --git-modified: #895503;
+  --git-renamed: #007100;
+  --git-deleted: #ad0707;
+  --git-conflict: #ad0707;
+
   /* Shadows */
   --shadow-float: var(--td-shadow-1);
   --shadow-float-lg: var(--td-shadow-2);
@@ -143,6 +151,14 @@
 
   /* Inputs */
   --input-bg: var(--td-bg-color-component);
+
+  /* Git decorations (editor-style file tree colours, dark palette) */
+  --git-untracked: #81b88b;
+  --git-added: #81b88b;
+  --git-modified: #e2c08d;
+  --git-renamed: #73c991;
+  --git-deleted: #c74e39;
+  --git-conflict: #e4676b;
 
   /* Shadows */
   --shadow-float: var(--td-shadow-1);

@@ -6,7 +6,7 @@ All timestamps are stored in UTC.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Index, Integer, String, Text, func
+from sqlalchemy import Column, DateTime, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -21,37 +21,46 @@ class Base(DeclarativeBase):
 
 
 class WorkspaceModel(Base):
-    """Workspace metadata persisted in database."""
+    """Workspace metadata persisted in database.
+
+    A workspace is a tenant-level shared unit. Git is the only durable carrier
+    of its code, therefore NO local filesystem path is stored here: each user's
+    working copy path is derived at runtime (see ``src.workspace.paths``).
+
+    Membership and roles are NOT stored here: authorization is centralized in
+    the gateway, which owns the role bindings and tells this service what the
+    caller may do (see ``src.api.deps.CallerContext``).
+    """
 
     __tablename__ = "workspaces"
 
-    id = Column(String(128), primary_key=True)
-    user_id = Column(String(64), nullable=False)
+    id = Column(String(128), primary_key=True)  # ws-{tenant_id}-{slug}
+    tenant_id = Column(String(64), nullable=False)
+    owner_user_id = Column(String(64), nullable=False)
     name = Column(String(128), nullable=False)
     dialect = Column(String(32), nullable=False, default="duckdb")
     git_repo_url = Column(String(512), nullable=True)
     git_branch = Column(String(64), nullable=False, default="main")
     status = Column(String(32), nullable=False, default="active")
-    local_path = Column(String(512), nullable=False)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+        default=_utc_now,
     )
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
+        default=_utc_now,
+        onupdate=_utc_now,
     )
     last_active_at = Column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+        default=_utc_now,
     )
 
     __table_args__ = (
-        Index("idx_workspaces_user_status", "user_id", "status"),
+        Index("idx_workspaces_tenant_status", "tenant_id", "status"),
     )
 
 

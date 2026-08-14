@@ -44,10 +44,24 @@ INFRA_MODE=docker make dev
 
 Optional: `make proto` generates gRPC contract code to `gen/` (not required for HTTP dev).
 
-### Default User (MVP)
+### Accounts & Authentication
 
-- Username: `admin`
-- Password: `admin123`
+The gateway owns authentication: it issues and verifies JWTs, then injects the verified identity
+into every proxied request (client-supplied `X-User-ID` / `user_id` values are always overwritten).
+
+- **Sign up** creates an organization (tenant) and makes the registrant its administrator.
+- An account may belong to **several tenants** — its own (primary account) plus any it was invited
+  to (sub account). When more than one identity exists, the login page asks which one to use, and
+  the active identity can be switched at any time from the user menu.
+- Roles inside a tenant: `admin` (can manage members) / `developer` / `viewer`.
+- Credentials are a short-lived **access token** plus a rotating **refresh token**; the frontend
+  refreshes expired sessions transparently.
+
+**Required environment variable**: `GW_JWT_SECRET` — the JWT signing secret. Secrets are env-only
+and the gateway refuses to start without it. The dev scripts generate one on first run and store it
+in `.data/gateway_jwt_secret` (gitignored). Account data lives in the gateway's own SQLite database
+(`auth.db_path` in `conf/gateway.yaml`, default `.data/gateway.db`); delete that file to reset all
+accounts during development.
 
 ## Project Structure
 

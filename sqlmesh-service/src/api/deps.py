@@ -1,12 +1,14 @@
 """Shared FastAPI dependencies for API route modules.
 
-Provides service instances and common validation utilities.
+Provides service instances, the caller's authorization context and common
+validation utilities.
 """
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Callable, FrozenSet
 
-from fastapi import Depends
+from fastapi import Depends, Header
+from pydantic import BaseModel, Field
 
 from src.config import settings
 from src.core.command_service import get_command_service
@@ -18,19 +20,109 @@ from src.core.model_service import get_model_service
 from src.core.plan_service import get_plan_service
 from src.core.query_service import get_query_service
 from src.core.schema_service import get_schema_service
-from src.utils.errors import WorkspacePathInvalidError
+from src.utils.errors import PermissionDeniedError, WorkspacePathInvalidError
+from src.utils.logging import get_logger
+from src.workspace.paths import WorkspacePathLayoutError, parse_workspace_path
+
+logger = get_logger(__name__)
+
+
+class CallerContext(BaseModel):
+    """Identity and authorization decided upstream by the gateway.
+
+    The gateway is the platform's single authorization center: it verifies the
+    access token, resolves the caller's roles from the RBAC tables and publishes
+    the outcome on headers it fully controls (clients cannot forge them, they are
+    stripped and rewritten on every request).
+
+    This service therefore never re-derives permissions and never reads identity
+    from a request body or query string for authorization purposes.
+    """
+
+    user_id: str
+    tenant_id: str
+    workspace_id: str = ""
+    workspace_role: str = ""
+    permissions: FrozenSet[str] = Field(default_factory=frozenset)
+
+    def can(self, permission: str) -> bool:
+        """Whether the gateway granted a permission for this request."""
+        return permission in self.permissions
+
+
+def caller_context(
+    x_user_id: str = Header(default="", alias="X-User-ID"),
+    x_tenant_id: str = Header(default="", alias="X-Tenant-ID"),
+    x_workspace_id: str = Header(default="", alias="X-Workspace-ID"),
+    x_workspace_role: str = Header(default="", alias="X-Workspace-Role"),
+    x_granted_permissions: str = Header(default="", alias="X-Granted-Permissions"),
+) -> CallerContext:
+    """Build the caller context from the gateway-controlled headers."""
+    if not x_user_id or not x_tenant_id:
+        # Reaching this service without a gateway-issued identity means the
+        # request bypassed authorization entirely.
+        logger.warning("caller_context_missing_identity")
+        raise PermissionDeniedError(
+            "This request carries no verified identity: it did not pass through "
+            "the API gateway"
+        )
+
+    permissions = frozenset(
+        code.strip() for code in x_granted_permissions.split(",") if code.strip()
+    )
+    return CallerContext(
+        user_id=x_user_id,
+        tenant_id=x_tenant_id,
+        workspace_id=x_workspace_id,
+        workspace_role=x_workspace_role,
+        permissions=permissions,
+    )
+
+
+# FastAPI dependency exposing the authorization context of the current request.
+Caller = Annotated[CallerContext, Depends(caller_context)]
+
+
+def require_permission(permission: str) -> Callable[..., CallerContext]:
+    """Build a dependency asserting that the gateway granted a permission.
+
+    Defence in depth: the gateway already denied the request if the permission
+    was missing, so a failure here means the two layers disagree and the request
+    must not proceed.
+    """
+
+    def dependency(caller: Caller) -> CallerContext:
+        if not caller.can(permission):
+            logger.warning(
+                "permission_assertion_failed",
+                user_id=caller.user_id,
+                tenant_id=caller.tenant_id,
+                workspace_id=caller.workspace_id,
+                permission=permission,
+            )
+            raise PermissionDeniedError(
+                "Permission denied: your role does not allow this operation",
+                permission=permission,
+            )
+        return caller
+
+    return dependency
 
 
 def validate_workspace_path(workspace_path: str) -> str:
-    """Validate workspace path exists and is within allowed base.
+    """Validate a workspace working-copy path before any operation uses it.
 
-    Prevents path traversal attacks and ensures workspace exists.
+    Two independent layers of defence:
+    1. containment - the resolved path must live under the configured base
+       (``relative_to``, not string prefix matching, so a sibling directory such
+       as ``/workspaces-evil`` is rejected);
+    2. layout - it must be exactly ``{base}/{tenant_id}/{workspace_id}/{user_id}``,
+       which stops a caller from reaching the shared root, another tenant's
+       directory, or an arbitrary nested folder.
     """
     base = Path(settings.workspace_base_path).expanduser().resolve()
     target = Path(workspace_path).expanduser().resolve()
 
-    # Reject paths outside the allowed base (use relative_to, not string
-    # startswith, so a sibling like /workspaces-evil is not accepted).
     try:
         target.relative_to(base)
     except ValueError:
@@ -38,6 +130,11 @@ def validate_workspace_path(workspace_path: str) -> str:
             workspace_path,
             reason=f"Path is outside allowed base: {base}",
         ) from None
+
+    try:
+        parse_workspace_path(str(base), str(target))
+    except WorkspacePathLayoutError as e:
+        raise WorkspacePathInvalidError(workspace_path, reason=str(e)) from None
 
     if not target.exists():
         raise WorkspacePathInvalidError(
@@ -63,4 +160,8 @@ __all__ = [
     "get_environment_service",
     "validate_workspace_path",
     "WorkspacePath",
+    "CallerContext",
+    "Caller",
+    "caller_context",
+    "require_permission",
 ]

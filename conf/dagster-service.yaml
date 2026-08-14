@@ -1,5 +1,8 @@
 # Dagster Service Configuration
 # Role: FastAPI wrapper around a Dagster deployment (local/remote dual-mode).
+#
+# Service-specific settings only. Workspace, sqlmesh service URL, and logging
+# are sourced from conf/platform.yaml.
 server:
   rest_port: 8004                 # NOTE: 8003 is ontology-service
   host: "0.0.0.0"
@@ -30,15 +33,14 @@ dagster:
   process_start_timeout: 30
   process_stop_timeout: 5
 
-# Workspace storage — must match sqlmesh-service base path.
-workspace:
-  base_path: "~/.agenticdata/workspaces"
-
-# SQLMesh service URL (for the SQLMesh -> Dagster bridge).
+# SQLMesh bridge request timeout
 sqlmesh:
-  service_url: "http://localhost:8002"
   request_timeout: 10
 
-# Logging
-logging:
-  level: "debug"
+# ── Shared config (from platform.yaml) ──────────────────────────────────
+# workspace:           → platform.yaml → workspace.base_path
+# sqlmesh.service_url: → platform.yaml → services.sqlmesh.rest_url
+# logging:             → platform.yaml → logging.level
+#
+# To override per-service, use env vars:
+#   DAGSTER_SERVICE_WORKSPACE_BASE_PATH, DAGSTER_SERVICE_SQLMESH_SERVICE_URL, etc.

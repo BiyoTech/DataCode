@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from src.config import settings
 from src.core.context_pool import get_context_pool, init_context_pool
 from src.utils.errors import ErrorCode, ServiceError
+from src.workspace.paths import WorkspacePathLayoutError
 from src.utils.logging import get_logger, setup_logging
 
 setup_logging()
@@ -45,6 +46,20 @@ def _register_exception_handlers(application: FastAPI) -> None:
     @application.exception_handler(ServiceError)
     async def _service_error_handler(_request: Request, exc: ServiceError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=exc.to_response_dict())
+
+    @application.exception_handler(WorkspacePathLayoutError)
+    async def _workspace_layout_error_handler(
+        _request: Request, exc: WorkspacePathLayoutError
+    ) -> JSONResponse:
+        # Identifier / path convention violations are caller mistakes (or
+        # tampering attempts), never server faults, so they map to 400.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error_code": ErrorCode.WORKSPACE_PATH_INVALID.value,
+                "message": str(exc),
+            },
+        )
 
     @application.exception_handler(HTTPException)
     async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:

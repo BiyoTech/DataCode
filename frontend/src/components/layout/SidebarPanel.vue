@@ -11,6 +11,13 @@ import { useFileStore, type FileNode } from '@/stores/files'
 import { useWorkspaceStore } from '@/stores/workspace'
 import { useGitStore } from '@/stores/git'
 import { useFileMention } from '@/composables/useFileMention'
+import {
+  baseName,
+  buildGitDecorations,
+  dirName,
+  kindOfStatus,
+  letterOfStatus,
+} from '@/utils/gitDecoration'
 import FileTreeNode from './FileTreeNode.vue'
 import ImportExternalModelsDialog from './ImportExternalModelsDialog.vue'
 import IconButton from '@/components/common/IconButton.vue'
@@ -35,15 +42,40 @@ const isMainEditorRoute = computed(
   () => !isModelsPage.value && !isPlanPage.value && !isAbiPage.value && !isAssetDagPage.value,
 )
 
-// Build a quick-lookup map of git status per file path for the tree.
-// Key = file path, value = { status, staged }
-const gitStatusMap = computed(() => {
-  const map: Record<string, { status: string; staged: boolean }> = {}
-  for (const c of gitStore.changes) {
-    map[c.path] = { status: c.status, staged: c.staged }
-  }
-  return map
-})
+// Git decorations for the file tree: `path → decoration`, with every ancestor
+// directory inheriting its most significant descendant so collapsed folders
+// still signal inner changes. Built once per status refresh, so each tree node
+// only does an O(1) lookup.
+const gitDecorations = computed(() => buildGitDecorations(gitStore.changes))
+
+// Changes list, split into the two groups the panel renders.
+const stagedChanges = computed(() => gitStore.changes.filter((c) => c.staged))
+const unstagedChanges = computed(() => gitStore.changes.filter((c) => !c.staged))
+
+/** Row label: file name, with the parent directory shown as dimmed context. */
+function changeName(path: string): string {
+  return baseName(path)
+}
+
+function changeDir(path: string): string {
+  return dirName(path)
+}
+
+/** One-letter badge + colour class, shared with the file tree decoration model. */
+function changeLetter(status: string): string {
+  return letterOfStatus(status)
+}
+
+function changeClass(status: string): string {
+  const kind = kindOfStatus(status)
+  return kind ? `git-${kind}` : ''
+}
+
+/** Open the changed file in the editor. Deleted paths have nothing to open. */
+function handleChangeClick(path: string, status: string): void {
+  if (kindOfStatus(status) === 'deleted') return
+  handleOpenFile(path)
+}
 
 withDefaults(defineProps<{
   activeTab: 'files' | 'models' | 'diff'
@@ -104,9 +136,14 @@ watch(
 
     if (ws?.path) {
       fileStore.loadFileTree(ws.path)
+      // Git decorations must follow the tree, so the status is refreshed on the
+      // same cadence: otherwise a file edited outside the Git panel would keep
+      // its stale colour.
+      gitStore.fetchStatus()
       // Poll every 3 seconds to pick up external file changes
       refreshTimer = setInterval(() => {
         fileStore.refreshFileTree(ws.path)
+        gitStore.fetchStatus()
       }, 3000)
     }
   },
@@ -307,7 +344,7 @@ async function handleImportSuccess() {
             :key="node.path"
             :node="node"
             :depth="0"
-            :git-status-map="gitStatusMap"
+            :git-decorations="gitDecorations"
             @toggle-dir="handleToggleDir"
             @open-file="handleOpenFile"
             @context-menu="handleContextMenu"
@@ -336,42 +373,60 @@ async function handleImportSuccess() {
           <IconButton
             class="diff-commit-btn"
             :label="t('git.commit')"
-            :disabled="!gitStore.commitMessage.trim() || gitStore.changes.filter(c => c.staged).length === 0"
+            :disabled="!gitStore.commitMessage.trim() || stagedChanges.length === 0"
             @click="gitStore.commit()"
           ><t-icon name="check" size="14px" /></IconButton>
         </div>
 
         <!-- Staged files -->
-        <div v-if="gitStore.changes.filter(c => c.staged).length > 0" class="diff-group">
+        <div v-if="stagedChanges.length > 0" class="diff-group">
           <div class="diff-group-title">
             <span>{{ t('git.stagedChanges') }}</span>
-            <span class="diff-count">{{ gitStore.changes.filter(c => c.staged).length }}</span>
+            <span class="diff-count">{{ stagedChanges.length }}</span>
           </div>
           <div
-            v-for="change in gitStore.changes.filter(c => c.staged)"
+            v-for="change in stagedChanges"
             :key="'s-' + change.path"
             class="diff-item"
+            :title="change.path"
+            @click="handleChangeClick(change.path, change.status)"
           >
-            <span class="diff-status" :class="'st-' + change.status">{{ change.status }}</span>
-            <span class="diff-filename">{{ change.path.split('/').pop() }}</span>
-            <IconButton class="diff-action" :label="t('git.unstage')" @click="gitStore.unstageFiles([change.path])"><t-icon name="minus" size="14px" /></IconButton>
+            <span class="diff-status" :class="changeClass(change.status)">
+              {{ changeLetter(change.status) }}
+            </span>
+            <span class="diff-filename" :class="changeClass(change.status)">
+              {{ changeName(change.path) }}
+            </span>
+            <span v-if="changeDir(change.path)" class="diff-filedir">
+              {{ changeDir(change.path) }}
+            </span>
+            <IconButton class="diff-action" :label="t('git.unstage')" @click.stop="gitStore.unstageFiles([change.path])"><t-icon name="minus" size="14px" /></IconButton>
           </div>
         </div>
 
         <!-- Unstaged files -->
-        <div v-if="gitStore.changes.filter(c => !c.staged).length > 0" class="diff-group">
+        <div v-if="unstagedChanges.length > 0" class="diff-group">
           <div class="diff-group-title">
             <span>{{ t('git.changes') }}</span>
-            <span class="diff-count">{{ gitStore.changes.filter(c => !c.staged).length }}</span>
+            <span class="diff-count">{{ unstagedChanges.length }}</span>
           </div>
           <div
-            v-for="change in gitStore.changes.filter(c => !c.staged)"
+            v-for="change in unstagedChanges"
             :key="'u-' + change.path"
             class="diff-item"
+            :title="change.path"
+            @click="handleChangeClick(change.path, change.status)"
           >
-            <span class="diff-status" :class="'st-' + change.status">{{ change.status }}</span>
-            <span class="diff-filename">{{ change.path.split('/').pop() }}</span>
-            <IconButton class="diff-action" :label="t('git.stage')" @click="gitStore.stageFiles([change.path])"><t-icon name="add" size="14px" /></IconButton>
+            <span class="diff-status" :class="changeClass(change.status)">
+              {{ changeLetter(change.status) }}
+            </span>
+            <span class="diff-filename" :class="changeClass(change.status)">
+              {{ changeName(change.path) }}
+            </span>
+            <span v-if="changeDir(change.path)" class="diff-filedir">
+              {{ changeDir(change.path) }}
+            </span>
+            <IconButton class="diff-action" :label="t('git.stage')" @click.stop="gitStore.stageFiles([change.path])"><t-icon name="add" size="14px" /></IconButton>
           </div>
         </div>
 
@@ -792,19 +847,42 @@ async function handleImportSuccess() {
   font-family: var(--font-mono);
   width: 12px;
   text-align: center;
+  flex-shrink: 0;
 }
 
-.st-M { color: var(--warning); }
-.st-A { color: var(--success); }
-.st-D { color: var(--error); }
-.st-R { color: var(--accent); }
+/* Git decoration colours, shared with the file tree. */
+.git-untracked { color: var(--git-untracked); }
+.git-added { color: var(--git-added); }
+.git-modified { color: var(--git-modified); }
+.git-renamed { color: var(--git-renamed); }
+.git-deleted { color: var(--git-deleted); }
+.git-conflict { color: var(--git-conflict); font-weight: 600; }
+
+.diff-filename.git-deleted {
+  text-decoration: line-through;
+}
 
 .diff-filename {
-  flex: 1;
+  flex-shrink: 0;
+  max-width: 60%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-primary);
+}
+
+/* Parent directory shown as dimmed context, truncated from the left so the
+ * closest folder stays visible on narrow sidebars. */
+.diff-filedir {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .diff-action {

@@ -5,34 +5,53 @@
  *
  * Shows:
  *  - File type icon (lucide icons mapped by extension)
- *  - Git status badge (M/A/D/R/U as coloured labels)
+ *  - Git decoration: editor-style colouring of the name plus a one-letter
+ *    badge. Directories inherit the decoration of their most significant
+ *    descendant, so a collapsed folder still signals inner changes.
  *  - Directory expand/collapse chevron + folder icon
  */
 import { computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { FileNode } from '@/stores/files'
+import type { GitDecoration } from '@/utils/gitDecoration'
 // TDesign icons used via <t-icon> in template
 
-export interface GitFileStatus {
-  status: string   // M | A | D | R | U | ?
-  staged: boolean
-}
+const { t } = useI18n()
 
 const props = defineProps<{
   node: FileNode
   depth: number
-  /** Map of file path → Git status (optional, only populated when git is initialized). */
-  gitStatusMap?: Record<string, GitFileStatus>
+  /** Map of path → Git decoration (empty when git is not initialized). */
+  gitDecorations?: Record<string, GitDecoration>
 }>()
 
-const emit = defineEmits<{
+defineEmits<{
   (e: 'toggle-dir', node: FileNode): void
   (e: 'open-file', path: string): void
   (e: 'context-menu', event: MouseEvent, node: FileNode): void
 }>()
 
 // ────── File type icon mapping (returns t-icon name) ──────
+// Well-known dot-files are matched by FULL NAME: they have no extension, so the
+// extension switch below would fall through to the unknown-file icon.
+const DOTFILE_ICONS: Record<string, string> = {
+  '.gitignore': 'setting',
+  '.gitattributes': 'setting',
+  '.gitmodules': 'setting',
+  '.editorconfig': 'setting',
+  '.dockerignore': 'setting',
+  '.env': 'lock-on',
+}
+
 function getFileIcon(name: string): string {
-  const ext = name.split('.').pop()?.toLowerCase()
+  const lower = name.toLowerCase()
+  if (lower.startsWith('.')) {
+    // `.env.local`, `.env.production`, ... share the `.env` treatment.
+    if (lower.startsWith('.env')) return DOTFILE_ICONS['.env']
+    return DOTFILE_ICONS[lower] || 'file'
+  }
+
+  const ext = lower.split('.').pop()
   switch (ext) {
     case 'sql': return 'server'
     case 'py': case 'ts': case 'js': case 'tsx': case 'jsx': return 'code'
@@ -112,24 +131,24 @@ function getDirIcon(node: FileNode): string {
   return node.isExpanded ? 'folder-open' : 'folder'
 }
 
-// ────── Git status for this node ──────
-const gitStatus = computed<GitFileStatus | null>(() => {
-  const map = props.gitStatusMap
-  if (!map) return null
-  return map[props.node.path] || null
-})
+// ────── Git decoration for this node ──────
+const decoration = computed<GitDecoration | null>(
+  () => props.gitDecorations?.[props.node.path] ?? null
+)
 
-const gitLabel = computed(() => gitStatus.value?.status || '')
+/** CSS modifier driving the name colour, e.g. `git-modified`. */
+const decorationClass = computed(() =>
+  decoration.value ? `git-${decoration.value.kind}` : ''
+)
 
-const gitColor = computed(() => {
-  switch (gitLabel.value) {
-    case 'M': return 'var(--warning)'     // modified
-    case 'A': return 'var(--success)'     // added
-    case 'D': return 'var(--error)'       // deleted
-    case 'R': return 'var(--accent)'      // renamed
-    case 'U': case '?': return 'var(--text-muted)' // untracked
-    default: return 'var(--text-muted)'
-  }
+/** Localized tooltip: the change kind, plus whether it is staged. */
+const decorationTitle = computed(() => {
+  const current = decoration.value
+  if (!current) return ''
+  const kind = t(`git.decoration.${current.kind}`)
+  if (current.inherited) return `${t('git.decoration.containsChanges')} · ${kind}`
+  const stageLabel = current.staged ? t('git.staged') : t('git.unstaged')
+  return `${kind} · ${stageLabel}`
 })
 </script>
 
@@ -165,19 +184,23 @@ const gitColor = computed(() => {
         class="file-type-icon"
       />
 
-      <!-- Name -->
-      <span class="node-name" :class="{ directory: node.isDirectory }">
+      <!-- Name — coloured by Git decoration, like an editor's explorer -->
+      <span
+        class="node-name"
+        :class="[{ directory: node.isDirectory }, decorationClass]"
+        :title="decorationTitle || node.name"
+      >
         {{ node.name }}
       </span>
 
-      <!-- Git status badge -->
+      <!-- Git status badge. Inherited (directory rollup) badges are dimmed. -->
       <span
-        v-if="gitStatus"
+        v-if="decoration"
         class="git-badge"
-        :style="{ color: gitColor, borderColor: gitColor }"
-        :title="gitStatus.staged ? 'Staged' : 'Unstaged'"
+        :class="[decorationClass, { inherited: decoration.inherited }]"
+        :title="decorationTitle"
       >
-        {{ gitLabel }}
+        {{ decoration.letter }}
       </span>
     </div>
 
@@ -188,7 +211,7 @@ const gitColor = computed(() => {
         :key="child.path"
         :node="child"
         :depth="depth + 1"
-        :git-status-map="gitStatusMap"
+        :git-decorations="gitDecorations"
         @toggle-dir="$emit('toggle-dir', $event)"
         @open-file="$emit('open-file', $event)"
         @context-menu="(evt: MouseEvent, n: FileNode) => $emit('context-menu', evt, n)"
@@ -245,17 +268,51 @@ const gitColor = computed(() => {
   font-weight: 500;
 }
 
+/* ── Git decorations ──
+ * The node name takes the colour of its change kind; hover must not override
+ * it, so these rules are declared after `.tree-node:hover`.
+ */
+.node-name.git-untracked,
+.git-badge.git-untracked { color: var(--git-untracked); }
+
+.node-name.git-added,
+.git-badge.git-added { color: var(--git-added); }
+
+.node-name.git-modified,
+.git-badge.git-modified { color: var(--git-modified); }
+
+.node-name.git-renamed,
+.git-badge.git-renamed { color: var(--git-renamed); }
+
+.node-name.git-deleted,
+.git-badge.git-deleted { color: var(--git-deleted); }
+
+.node-name.git-conflict,
+.git-badge.git-conflict {
+  color: var(--git-conflict);
+  font-weight: 600;
+}
+
+/* A deleted path no longer exists on disk: strike it through. */
+.node-name.git-deleted {
+  text-decoration: line-through;
+}
+
 /* Git status badge — compact coloured label */
 .git-badge {
   flex-shrink: 0;
   margin-left: auto;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 9px;
   font-weight: 700;
-  padding: 1px 4px;
-  border-radius: 10px;
-  border: 1px solid;
-  opacity: 0.8;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+
+/* Rolled up from a descendant: present but visually secondary. */
+.git-badge.inherited {
+  opacity: 0.5;
+  font-weight: 500;
 }
 
 .spinner {

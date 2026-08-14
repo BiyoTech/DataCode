@@ -19,6 +19,7 @@
 import { ref, computed, onMounted, watch, nextTick, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
+import { extractApiMessage } from '@/utils/notifyError'
 import { useAdhocStore, type QueryResult, type CatalogNode } from '@/stores/adhoc'
 import { useWorkspaceStore } from '@/stores/workspace'
 import AbiCatalogTree from './AbiCatalogTree.vue'
@@ -231,7 +232,7 @@ async function saveFile() {
             MessagePlugin.success(t('abi.adhoc.file.saveSuccess'))
           }
         } catch (e: any) {
-          MessagePlugin.error(e?.message || t('abi.adhoc.file.saveFailed'))
+          MessagePlugin.error(extractApiMessage(e, t('abi.adhoc.file.saveFailed')))
         }
       },
     })
@@ -242,7 +243,7 @@ async function saveFile() {
     tab.savedContent = tab.sql
     MessagePlugin.success(t('abi.adhoc.file.saveSuccess'))
   } catch (e: any) {
-    MessagePlugin.error(e?.message || t('abi.adhoc.file.saveFailed'))
+    MessagePlugin.error(extractApiMessage(e, t('abi.adhoc.file.saveFailed')))
   }
 }
 
@@ -260,7 +261,7 @@ async function openAdhocFile(filePath: string) {
     tabs.value.push(tab)
     activeId.value = tab.id
   } catch (e: any) {
-    MessagePlugin.error(e?.message || 'Failed to open file')
+    MessagePlugin.error(extractApiMessage(e, 'Failed to open file'))
   }
 }
 
@@ -331,7 +332,7 @@ async function commitRenameTab(tab: QueryTab) {
       MessagePlugin.success(t('abi.adhoc.file.savedAs', { name: finalName }))
     }
   } catch (e: any) {
-    MessagePlugin.error(e?.message || t('abi.adhoc.file.saveFailed'))
+    MessagePlugin.error(extractApiMessage(e, t('abi.adhoc.file.saveFailed')))
   }
 }
 
@@ -390,11 +391,7 @@ async function onCatalogPreview(node: CatalogNode) {
   try {
     previewResult.value = await adhoc.previewTable(node, PREVIEW_ROW_LIMIT)
   } catch (e: any) {
-    previewError.value =
-      e?.response?.data?.detail?.detail ||
-      e?.response?.data?.error ||
-      e?.message ||
-      'Preview failed'
+    previewError.value = extractApiMessage(e, 'Preview failed')
   } finally {
     previewLoading.value = false
   }
@@ -415,11 +412,7 @@ async function runQuery() {
   try {
     tab.result = await adhoc.runQuery(sql, rowLimit.value)
   } catch (e: any) {
-    tab.error =
-      e?.response?.data?.detail?.detail ||
-      e?.response?.data?.error ||
-      e?.message ||
-      'Query failed'
+    tab.error = extractApiMessage(e, 'Query failed')
     tab.result = null
   } finally {
     tab.loading = false

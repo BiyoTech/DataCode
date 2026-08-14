@@ -15,6 +15,7 @@
 import { ref, computed, h, onMounted, watch, defineAsyncComponent } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
+import { extractApiMessage } from '@/utils/notifyError'
 import { useAdhocStore, type AdhocFile } from '@/stores/adhoc'
 import { useWorkspaceStore } from '@/stores/workspace'
 import AbiAdhoc from '@/components/abi/AbiAdhoc.vue'
@@ -163,7 +164,7 @@ async function createQuery() {
           MessagePlugin.success(t('abi.adhoc.file.savedAs', { name: finalName }))
         }
       } catch (e: any) {
-        MessagePlugin.error(e?.message || t('abi.adhoc.file.saveFailed'))
+        MessagePlugin.error(extractApiMessage(e, t('abi.adhoc.file.saveFailed')))
       }
     },
   })
@@ -206,7 +207,7 @@ function renameFile(file: AdhocFile) {
         await adhoc.renameAdhocFile(file.path, newPath)
         await adhoc.listAdhocFiles()
       } catch (e: any) {
-        MessagePlugin.error(e?.message || 'Rename failed')
+        MessagePlugin.error(extractApiMessage(e, 'Rename failed'))
       }
     },
   })
@@ -226,7 +227,7 @@ function deleteFile(file: AdhocFile) {
         await adhoc.listAdhocFiles()
         MessagePlugin.success(t('common.deleted'))
       } catch (e: any) {
-        MessagePlugin.error(e?.message || 'Delete failed')
+        MessagePlugin.error(extractApiMessage(e, 'Delete failed'))
       }
     },
   })

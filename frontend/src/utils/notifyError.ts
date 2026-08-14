@@ -1,5 +1,7 @@
 import { MessagePlugin } from 'tdesign-vue-next'
 
+import { i18n } from '@/i18n'
+
 type ApiErrorDetail =
   | string
   | { error?: string; message?: string; detail?: string }
@@ -30,12 +32,87 @@ export interface ApiErrorBody {
   message?: string
   detail?: ApiErrorDetail
   error?: string
+  /** Gateway error identifier, e.g. "forbidden", "no_membership". */
+  code?: string
+  /** Gateway authorization denial reason, e.g. "missing_permission". */
+  reason?: string
+  /** Permission code the denied request was evaluated against. */
+  requiredPermission?: string
+  /** Stable reason code for a rejected remote Git operation. */
+  git_error_reason?: string
+  /** Host of the Git remote the operation targeted. */
+  git_remote_host?: string
+  /** Redacted git stderr, kept for support/diagnostics only. */
+  git_detail?: string
 }
 
 export interface ParsedApiError {
   message: string
   errorCode?: string
   detail?: ApiErrorDetail
+}
+
+/**
+ * Localized message for an authorization rejection.
+ *
+ * Authorization failures are the one error class users hit while doing nothing
+ * wrong, so they must never surface as "Request failed with status code 403".
+ * The gateway answers every denial with `{ code: 'forbidden', reason,
+ * requiredPermission }`; sqlmesh-service answers with
+ * `{ error_code: 'PERMISSION_DENIED', detail: <permission> }`. Both are mapped
+ * to a localized sentence that names the missing capability.
+ *
+ * Returns an empty string when the error is not authorization-related, so the
+ * caller falls back to the generic extraction path.
+ */
+function localizeAuthorizationError(status: number | undefined, data?: ApiErrorBody): string {
+  if (status !== 403 && !data?.reason && data?.error_code !== 'PERMISSION_DENIED') {
+    return ''
+  }
+  const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
+
+  // Denials raised by a downstream service (the gateway already allowed the
+  // request, so the two layers disagree — still a permission problem).
+  if (data?.error_code === 'PERMISSION_DENIED') {
+    const permission = typeof data.detail === 'string' ? data.detail : ''
+    return permission
+      ? t('errors.forbidden.missingPermission', { permission })
+      : t('errors.forbidden.default')
+  }
+
+  // Non-authorization 403s carry a dedicated code (e.g. a disabled account).
+  const codeKeys: Record<string, string> = {
+    account_disabled: 'errors.forbidden.accountDisabled',
+    no_membership: 'errors.forbidden.noMembership',
+    role_builtin: 'errors.forbidden.roleBuiltin',
+    owner_role_locked: 'errors.forbidden.ownerRoleLocked',
+  }
+  if (data?.code && codeKeys[data.code]) {
+    return t(codeKeys[data.code])
+  }
+
+  const reasonKeys: Record<string, string> = {
+    no_active_tenant: 'errors.forbidden.noTenant',
+    route_not_allowed: 'errors.forbidden.routeNotAllowed',
+    missing_permission: 'errors.forbidden.missingPermission',
+    workspace_not_member: 'errors.forbidden.workspaceNotMember',
+    workspace_unresolved: 'errors.forbidden.workspaceUnresolved',
+    workspace_path_foreign: 'errors.forbidden.workspacePathForeign',
+  }
+  const key = (data?.reason && reasonKeys[data.reason]) || ''
+  const permission = data?.requiredPermission || ''
+  if (key) {
+    // The permission code is what makes the message actionable ("ask an admin
+    // for X"); without it a generic sentence is clearer than a dangling quote.
+    if (!permission && key === reasonKeys.missing_permission) {
+      return t('errors.forbidden.default')
+    }
+    return t(key, { permission })
+  }
+
+  // A 403 from an endpoint that does not follow the contract: keep whatever the
+  // backend said, but never leak the bare axios status text.
+  return data?.message || t('errors.forbidden.default')
 }
 
 function stringifyDetail(detail: ApiErrorDetail): string {
@@ -52,6 +129,39 @@ function stringifyDetail(detail: ApiErrorDetail): string {
 }
 
 /**
+ * Reason codes a rejected remote Git operation can carry, mapped to i18n keys.
+ *
+ * The backend answers `GIT_REMOTE_ACCESS_DENIED` with a stable
+ * `git_error_reason` instead of raw git stderr, so the user reads an
+ * actionable sentence in their own language ("the token has no write access to
+ * this repository") rather than "The requested URL returned error: 403".
+ * Unknown reasons fall through to the backend's English message.
+ */
+const GIT_REASON_KEYS: Record<string, string> = {
+  credential_missing: 'errors.git.credentialMissing',
+  invalid_credential: 'errors.git.invalidCredential',
+  no_write_access: 'errors.git.noWriteAccess',
+  repo_not_found: 'errors.git.repoNotFound',
+  non_fast_forward: 'errors.git.nonFastForward',
+  branch_not_found: 'errors.git.branchNotFound',
+  host_unreachable: 'errors.git.hostUnreachable',
+  unknown: 'errors.git.unknown',
+}
+
+function localizeGitError(data?: ApiErrorBody): string {
+  const reason = data?.git_error_reason
+  if (!reason) {
+    return ''
+  }
+  const key = GIT_REASON_KEYS[reason]
+  if (!key) {
+    return ''
+  }
+  const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
+  return t(key, { host: data?.git_remote_host || '' })
+}
+
+/**
  * Parse an axios/fetch error into a structured `{ message, errorCode, detail }`.
  *
  * Priority: `data.message` (root cause) > `data.detail` (supplementary) >
@@ -64,10 +174,32 @@ function stringifyDetail(detail: ApiErrorDetail): string {
  */
 export function extractApiError(error: unknown, fallback = 'Request failed'): ParsedApiError {
   const err = error as {
-    response?: { data?: ApiErrorBody }
+    response?: { status?: number; data?: ApiErrorBody }
     message?: string
   }
   const data = err?.response?.data
+
+  // Remote Git rejections carry their own reason code and are the most
+  // actionable class of error, so they are localized before anything else.
+  const gitMessage = localizeGitError(data)
+  if (gitMessage) {
+    return {
+      message: gitMessage,
+      errorCode: data?.error_code,
+      detail: data?.git_detail || data?.detail,
+    }
+  }
+
+  // Authorization failures win over the generic path: they get a localized,
+  // actionable sentence naming the missing permission.
+  const authorizationMessage = localizeAuthorizationError(err?.response?.status, data)
+  if (authorizationMessage) {
+    return {
+      message: authorizationMessage,
+      errorCode: data?.error_code || data?.code,
+      detail: data?.detail,
+    }
+  }
 
   let message = ''
   if (data?.message) {
@@ -85,7 +217,7 @@ export function extractApiError(error: unknown, fallback = 'Request failed'): Pa
 
   return {
     message,
-    errorCode: data?.error_code,
+    errorCode: data?.error_code || data?.code,
     detail: data?.detail,
   }
 }

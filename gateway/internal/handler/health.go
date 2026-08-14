@@ -9,28 +9,12 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/agenticdata/gateway/internal/config"
-	"github.com/agenticdata/gateway/internal/middleware"
 )
 
 type upstreamHealth struct {
 	Status string `json:"status"`
 	URL    string `json:"url,omitempty"`
 	Error  string `json:"error,omitempty"`
-}
-
-// GetCurrentUser returns the current user info derived from request context.
-func GetCurrentUser(w http.ResponseWriter, r *http.Request) {
-	userID := middleware.GetUserID(r.Context())
-	tenantID := middleware.GetTenantID(r.Context())
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"user_id":   userID,
-		"tenant_id": tenantID,
-		"username":  "admin",
-		"email":     "admin@agenticdata.local",
-		"role":      "admin",
-	})
 }
 
 // HealthCheck returns gateway liveness. With ?deep=1, probes upstream services.
@@ -81,9 +65,9 @@ func HealthCheck(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":     overall,
-			"service":    "gateway",
-			"upstreams":  results,
+			"status":    overall,
+			"service":   "gateway",
+			"upstreams": results,
 		})
 	}
 }

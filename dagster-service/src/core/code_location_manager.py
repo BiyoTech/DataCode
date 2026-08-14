@@ -323,9 +323,16 @@ class CodeLocationManager:
 
     @staticmethod
     def _location_name(workspace_path: str) -> str:
-        """Derive a stable, GraphQL-safe location name from the workspace path."""
-        name = Path(workspace_path).name or "workspace"
-        safe = re.sub(r"[^A-Za-z0-9_]", "_", name)
+        """Derive a stable, GraphQL-safe location name from the workspace path.
+
+        A working copy lives at ``{base}/{tenant}/{workspace_id}/{user_id}``, so
+        the last segment alone (the user) is not unique across workspaces. The
+        name therefore combines the workspace and user segments.
+        """
+        target = Path(workspace_path)
+        segments = [p for p in (target.parent.name, target.name) if p]
+        raw = "_".join(segments) or "workspace"
+        safe = re.sub(r"[^A-Za-z0-9_]", "_", raw)
         return f"ws_{safe}"
 
     @staticmethod

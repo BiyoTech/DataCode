@@ -1,0 +1,25 @@
+# Platform Docker overrides.
+#
+# Loaded on top of platform.yaml when AGENTICDATA_ENV=docker.
+# Use for Docker infrastructure (e.g. PostgreSQL instead of MySQL).
+
+database:
+  type: "postgresql"
+  host: "localhost"
+  port: 5432
+  name: "agenticdata"
+  username: "agenticdata"
+  # password: env-only (DB_PASSWORD)
+  pool_size: 5
+  pool_overflow: 10
+
+  # All services use PostgreSQL in Docker (including gateway auth).
+  # To use a separate SQLite for gateway auth, uncomment:
+  # services:
+  #   gateway_auth:
+  #     type: "sqlite"
+  #     sqlite_path: ".data/gateway.db"
+
+logging:
+  level: "info"
+  format: "json"

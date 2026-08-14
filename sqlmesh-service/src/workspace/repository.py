@@ -1,6 +1,10 @@
 """Workspace repository - database CRUD layer.
 
-Encapsulates all DB operations for workspaces and user Git credentials.
+Encapsulates all DB operations for workspace metadata and user Git credentials.
+
+Membership is deliberately absent: role bindings live in the gateway, which is
+the platform's single authorization center. This layer only answers "does this
+workspace exist inside this tenant", never "may this user use it".
 """
 
 import typing as t
@@ -10,6 +14,7 @@ from sqlalchemy import select, update
 
 from src.utils.logging import get_logger
 from src.workspace.database import get_session
+from src.workspace.git_ops import credential_host
 from src.workspace.models import UserGitCredentialModel, WorkspaceModel
 
 logger = get_logger(__name__)
@@ -19,35 +24,70 @@ class WorkspaceRepository:
     """Database CRUD operations for workspace metadata."""
 
     async def create(self, workspace: WorkspaceModel) -> WorkspaceModel:
-        """Insert a new workspace record."""
+        """Insert a workspace row.
+
+        The owner role binding is recorded by the gateway right after this call
+        succeeds; it compensates by deleting the workspace if that fails.
+        """
         async with get_session() as session:
             session.add(workspace)
             await session.flush()
-            logger.info("workspace_db_created", workspace_id=workspace.id)
+            logger.info(
+                "workspace_db_created",
+                workspace_id=workspace.id,
+                tenant_id=workspace.tenant_id,
+                owner_user_id=workspace.owner_user_id,
+            )
             return workspace
 
     async def get_by_id(self, workspace_id: str) -> t.Optional[WorkspaceModel]:
-        """Get workspace by ID."""
+        """Get workspace by ID regardless of tenant (internal use only)."""
         async with get_session() as session:
             result = await session.execute(
                 select(WorkspaceModel).where(WorkspaceModel.id == workspace_id)
             )
             return result.scalar_one_or_none()
 
-    async def list_by_user(
-        self, user_id: str, status: str = "active"
+    async def list_by_ids(
+        self, tenant_id: str, workspace_ids: t.Sequence[str], status: str = "active"
     ) -> t.List[WorkspaceModel]:
-        """List all workspaces for a user filtered by status."""
+        """List workspaces of a tenant restricted to an explicit id set.
+
+        The caller (gateway) resolved which workspaces it may see from the role
+        bindings, so this is a plain metadata lookup. The tenant filter is kept
+        as defence in depth against an id belonging to another tenant.
+        """
+        if not workspace_ids:
+            return []
         async with get_session() as session:
             result = await session.execute(
                 select(WorkspaceModel)
                 .where(
-                    WorkspaceModel.user_id == user_id,
+                    WorkspaceModel.tenant_id == tenant_id,
                     WorkspaceModel.status == status,
+                    WorkspaceModel.id.in_(list(workspace_ids)),
                 )
                 .order_by(WorkspaceModel.last_active_at.desc())
             )
             return list(result.scalars().all())
+
+    async def get_in_tenant(
+        self, workspace_id: str, tenant_id: str
+    ) -> t.Optional[WorkspaceModel]:
+        """Get a non-deleted workspace inside a tenant, or None.
+
+        Returning None for both "does not exist" and "belongs to another tenant"
+        lets callers answer 404 without leaking cross-tenant existence.
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                select(WorkspaceModel).where(
+                    WorkspaceModel.id == workspace_id,
+                    WorkspaceModel.tenant_id == tenant_id,
+                    WorkspaceModel.status != "deleted",
+                )
+            )
+            return result.scalar_one_or_none()
 
     async def update_status(self, workspace_id: str, status: str) -> bool:
         """Update workspace status (active / archived / deleted)."""
@@ -68,16 +108,22 @@ class WorkspaceRepository:
                 .values(last_active_at=datetime.now(timezone.utc))
             )
 
-    async def update_git_repo(self, workspace_id: str, git_repo_url: str) -> bool:
-        """Bind a Git repository URL to a workspace."""
+    async def update_git_repo(
+        self, workspace_id: str, git_repo_url: str, git_branch: str = ""
+    ) -> bool:
+        """Bind a Git repository URL (and optionally default branch)."""
+        values: t.Dict[str, t.Any] = {
+            "git_repo_url": git_repo_url,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if git_branch:
+            values["git_branch"] = git_branch
+
         async with get_session() as session:
             result = await session.execute(
                 update(WorkspaceModel)
                 .where(WorkspaceModel.id == workspace_id)
-                .values(
-                    git_repo_url=git_repo_url,
-                    updated_at=datetime.now(timezone.utc),
-                )
+                .values(**values)
             )
             return result.rowcount > 0
 
@@ -269,6 +315,46 @@ class UserGitCredentialRepository:
                 )
             )
             return result.scalar_one_or_none() is not None
+
+    async def list_for_host(
+        self, user_id: str, host: str
+    ) -> t.List[UserGitCredentialModel]:
+        """Credentials of ``user_id`` that authenticate against ``host``.
+
+        Host matching is what makes a multi-provider setup correct: a GitHub
+        remote must never be pushed with a Gitea token. The host is derived
+        from ``server_url`` when present, otherwise from the provider's public
+        host. Results keep ``list_by_user`` ordering, so the default credential
+        comes first.
+        """
+        target = (host or "").strip().lower()
+        if not target:
+            return []
+        candidates = await self.list_by_user(user_id)
+        return [
+            cred
+            for cred in candidates
+            if credential_host(cred.provider, cred.server_url or "") == target
+        ]
+
+    async def get_for_host(
+        self, user_id: str, host: str
+    ) -> t.Optional[UserGitCredentialModel]:
+        """Best credential for ``host`` (default first), or None when unmatched."""
+        matches = await self.list_for_host(user_id, host)
+        return matches[0] if matches else None
+
+    async def get_for_provider(
+        self, user_id: str, provider: str
+    ) -> t.Optional[UserGitCredentialModel]:
+        """Best credential for ``provider`` (default first), or None."""
+        target = (provider or "").strip().lower()
+        if not target:
+            return None
+        for cred in await self.list_by_user(user_id):
+            if (cred.provider or "").lower() == target:
+                return cred
+        return None
 
     async def get_by_user(self, user_id: str) -> t.Optional[UserGitCredentialModel]:
         """Get the default (or first) credential for a user.

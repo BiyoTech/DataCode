@@ -150,21 +150,35 @@ class ImportExternalModelsRequest(WorkspacePathMixin):
 
 # --- Workspace ---
 
-class CreateWorkspaceRequest(BaseModel):
-    user_id: str = ""
-    tenant_id: str = ""
-    name: str
+class IdentityMixin(BaseModel):
+    """Caller identity injected by the gateway from the verified JWT.
+
+    Both fields are always overwritten by the gateway, so a client-supplied
+    value can never be used to impersonate another user or tenant.
+    """
+
+    user_id: str = Field(min_length=1)
+    tenant_id: str = Field(min_length=1)
+
+
+class CreateWorkspaceRequest(IdentityMixin):
+    name: str = Field(min_length=1, max_length=128)
     dialect: str = "duckdb"
     git_repo_url: str = ""
 
 
-class BindGitRepoRequest(BaseModel):
+class OpenWorkspaceRequest(IdentityMixin):
+    """Materialize the caller's working copy, optionally on a chosen branch."""
+
+    branch: str = ""
+
+
+class BindGitRepoRequest(IdentityMixin):
     workspace_id: str
-    user_id: str = ""
-    git_repo_url: str
+    git_repo_url: str = Field(min_length=1, max_length=512)
 
 
-class SyncWorkspaceRequest(BaseModel):
+class SyncWorkspaceRequest(IdentityMixin):
     workspace_id: str
     message: str = "Auto-save"
 
@@ -198,6 +212,33 @@ class GitPullRequest(WorkspacePathMixin):
 class GitCheckoutRequest(WorkspacePathMixin):
     branch: str
     create: bool = False
+    # Ref the new branch starts from, e.g. "origin/dev". Combined with
+    # ``track`` this materializes a remote branch as a local tracking branch.
+    start_point: str = ""
+    track: bool = False
+
+
+class GitFetchRequest(WorkspacePathMixin):
+    user_id: str = ""
+    remote: str = "origin"
+    # Delete local refs whose remote counterpart is gone.
+    prune: bool = True
+
+
+class GitResetRequest(WorkspacePathMixin):
+    # Target commit. Restricted to a hex object name by the endpoint so it can
+    # never be mistaken for a git option.
+    commit_hash: str
+    # soft  : move HEAD only (changes stay staged)
+    # mixed : move HEAD + reset index (changes stay in the working tree)
+    # hard  : move HEAD + reset index + working tree (DISCARDS changes)
+    mode: str = "mixed"
+
+
+class GitDeleteBranchRequest(WorkspacePathMixin):
+    branch: str
+    # Delete even when the branch is not fully merged.
+    force: bool = False
 
 
 class GitPublishRequest(WorkspacePathMixin):

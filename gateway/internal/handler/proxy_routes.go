@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
+	"strings"
 
 	"go.uber.org/zap"
+
+	"github.com/agenticdata/gateway/internal/middleware"
 )
 
 // ValidatedRoute describes a route that requires certain query parameters
@@ -18,7 +22,7 @@ import (
 // Fields:
 //   - Method:   HTTP method ("GET", "DELETE", …)
 //   - Pattern:  chi route pattern relative to the route group
-//               (e.g. "/models", "/apply/history")
+//     (e.g. "/models", "/apply/history")
 //   - Required: query parameter names that must be non-empty
 type ValidatedRoute struct {
 	Method   string
@@ -53,6 +57,12 @@ func MakeValidatedProxy(target ProxyTarget, route ValidatedRoute, logger *zap.Lo
 			}
 		}
 
+		// Defence in depth: a working copy belongs to exactly one user, so the
+		// caller may only address their own directory.
+		if !assertWorkspacePathOwnership(w, r, logger) {
+			return
+		}
+
 		// Build backend path with query string
 		backendPath := rewrite(r.URL.Path)
 		if r.URL.RawQuery != "" {
@@ -74,6 +84,35 @@ func MakeValidatedProxy(target ProxyTarget, route ValidatedRoute, logger *zap.Lo
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		}
 	}
+}
+
+// assertWorkspacePathOwnership verifies that a `workspace_path` query parameter
+// addresses the caller's own working copy.
+//
+// Working copies live at `{base}/{tenant}/{workspace}/{user}`, so the last path
+// segment must equal the authenticated user ID. Containment and layout are
+// re-validated by the backend; this check only stops one member from operating
+// on another member's checkout. Requests without the parameter are untouched.
+func assertWorkspacePathOwnership(
+	w http.ResponseWriter, r *http.Request, logger *zap.Logger,
+) bool {
+	workspacePath := r.URL.Query().Get("workspace_path")
+	if workspacePath == "" {
+		return true
+	}
+	userID := middleware.GetUserID(r.Context())
+	if userID == "" {
+		return true
+	}
+	if path.Base(path.Clean(strings.ReplaceAll(workspacePath, "\\", "/"))) == userID {
+		return true
+	}
+
+	logger.Warn("workspace_path_ownership_denied",
+		zap.String("path", r.URL.Path),
+		zap.String("user_id", userID))
+	middleware.WriteForbidden(w, middleware.DenyWorkspacePathForeign, "")
+	return false
 }
 
 // readBodyOrError reads the request body or writes a 400 error and returns nil.

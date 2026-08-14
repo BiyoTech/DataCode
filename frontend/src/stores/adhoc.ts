@@ -15,7 +15,7 @@ import { defineStore } from 'pinia'
 import { useWorkspaceStore } from './workspace'
 import { useModelsStore } from './models'
 import api from '@/utils/api'
-import { notifyError } from '@/utils/notifyError'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
 import type { GatewayInfo } from './externalModels'
 import type { ModelSummary } from '@/types/models'
 
@@ -119,7 +119,7 @@ export const useAdhocStore = defineStore('adhoc', () => {
       await modelsStore.fetchModels()
       tree.value = _buildCatalogTree(modelsStore.models)
     } catch (e: any) {
-      catalogError.value = e?.message || 'Failed to load catalog'
+      catalogError.value = extractApiMessage(e, 'Failed to load catalog')
       tree.value = []
     } finally {
       catalogLoading.value = false
@@ -189,8 +189,7 @@ export const useAdhocStore = defineStore('adhoc', () => {
           } as AdhocFile
         })
     } catch (e: any) {
-      const msg = e?.response?.data?.detail || e?.message || 'Failed to list files'
-      filesError.value = msg
+      filesError.value = extractApiMessage(e, 'Failed to list files')
       notifyError(e, 'Failed to list ad-hoc files')
       // Directory may not exist yet — that's fine, return empty
       if (e?.response?.status === 404) {

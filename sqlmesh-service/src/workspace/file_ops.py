@@ -14,6 +14,17 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Directories that are never listed. Dot-entries in general ARE listed (an
+# editor's explorer shows ``.gitignore``, ``.env``, ``.cache`` ...), but Git's
+# object store holds thousands of machine-written files and carries no user
+# value, so it stays hidden everywhere.
+_EXCLUDED_DIRS = frozenset({".git"})
+
+# Additionally pruned when walking recursively (flat file index behind search
+# and @-mentions): regenerable, machine-written trees that would otherwise
+# drown the real project files. They remain browsable in the lazy tree.
+_RECURSION_EXCLUDED_DIRS = _EXCLUDED_DIRS | frozenset({".cache", ".dagster"})
+
 
 @dataclass
 class FileInfo:
@@ -88,6 +99,10 @@ def list_files(
 ) -> t.List[FileInfo]:
     """List files in a workspace directory.
 
+    Hidden (dot-prefixed) entries ARE returned so files such as ``.gitignore``
+    are visible and editable; only :data:`_EXCLUDED_DIRS` (and, when recursing,
+    :data:`_RECURSION_EXCLUDED_DIRS`) are skipped.
+
     Args:
         workspace_path: Absolute workspace root path.
         directory: Subdirectory to list (relative), empty = root.
@@ -105,11 +120,9 @@ def list_files(
 
     if recursive:
         for root, dirs, filenames in os.walk(base):
-            # Skip hidden directories
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            # Prune in place so os.walk never descends into excluded trees.
+            dirs[:] = [d for d in dirs if d not in _RECURSION_EXCLUDED_DIRS]
             for name in filenames:
-                if name.startswith("."):
-                    continue
                 if pattern and not _matches_pattern(name, pattern):
                     continue
                 full = os.path.join(root, name)
@@ -123,7 +136,7 @@ def list_files(
                 ))
     else:
         for entry in os.scandir(base):
-            if entry.name.startswith("."):
+            if entry.is_dir() and entry.name in _EXCLUDED_DIRS:
                 continue
             if pattern and not entry.is_dir() and not _matches_pattern(entry.name, pattern):
                 continue
