@@ -37,6 +37,19 @@ if ! $DOCKER_COMPOSE -f "$ROOT_DIR/deploy/docker-compose.infra.yml" ps 2>/dev/nu
 fi
 echo "    Infrastructure OK."
 
+# Gateway JWT secret is env-only. For local development we persist a random
+# secret under .data/ (gitignored) so sessions survive restarts.
+if [[ -z "${GW_JWT_SECRET:-}" ]]; then
+  SECRET_FILE="$ROOT_DIR/.data/gateway_jwt_secret"
+  if [[ ! -f "$SECRET_FILE" ]]; then
+    mkdir -p "$(dirname "$SECRET_FILE")"
+    openssl rand -base64 48 > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    echo "==> Generated a local development JWT secret at .data/gateway_jwt_secret"
+  fi
+  export GW_JWT_SECRET="$(cat "$SECRET_FILE")"
+fi
+
 echo "==> Starting SQLMesh Service (port 8002)..."
 (
   cd "$ROOT_DIR/sqlmesh-service"
@@ -72,7 +85,7 @@ PIDS+=($!)
 echo "==> Starting Gateway (port 8000)..."
 (
   cd "$ROOT_DIR/gateway"
-  go run ./cmd/server/ 2>&1 | sed "s/^/[gateway]/"
+  GW_JWT_SECRET="$GW_JWT_SECRET" go run ./cmd/server/ 2>&1 | sed "s/^/[gateway]/"
 ) &
 PIDS+=($!)
 

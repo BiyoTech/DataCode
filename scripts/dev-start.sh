@@ -90,6 +90,31 @@ fi
 # --- Ensure data directory exists (for SQLite & file locks) ---
 mkdir -p "$ROOT_DIR/.data"
 
+# --- Set AGENTICDATA_ENV for platform config (dev overrides) ---
+export AGENTICDATA_ENV="${AGENTICDATA_ENV:-dev}"
+
+# --- Database password (env-only) ---
+# sqlmesh-service reads DB_PASSWORD from the environment. For local dev with
+# the default MySQL, set this to your local root password. For zero-dep mode
+# (SQLite), leave it empty — services that use SQLite ignore it.
+if [ -z "${DB_PASSWORD:-}" ]; then
+  export DB_PASSWORD="${DB_PASSWORD:-root@123}"
+  echo -e "${YELLOW}==> DB_PASSWORD not set, using local dev default.${NC}"
+fi
+
+# --- Gateway JWT secret (env-only) ---
+# For local development we persist a random secret under .data/ (gitignored)
+# so issued sessions survive gateway restarts.
+if [ -z "${GW_JWT_SECRET:-}" ]; then
+  SECRET_FILE="$ROOT_DIR/.data/gateway_jwt_secret"
+  if [ ! -f "$SECRET_FILE" ]; then
+    openssl rand -base64 48 > "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    echo -e "${BLUE}==> Generated local development JWT secret (.data/gateway_jwt_secret)${NC}"
+  fi
+  export GW_JWT_SECRET="$(cat "$SECRET_FILE")"
+fi
+
 # --- Ensure Go dependencies ---
 echo -e "${BLUE}==> Checking Go dependencies...${NC}"
 for svc in gateway; do
