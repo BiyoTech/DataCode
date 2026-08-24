@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package sqlmesh.v1;
 
-option go_package = "github.com/agenticdata/proto/sqlmesh/v1;sqlmeshv1";
+option go_package = "github.com/datacode/proto/sqlmesh/v1;sqlmeshv1";
 
 import "common/v1/common.proto";
 

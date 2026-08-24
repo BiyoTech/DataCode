@@ -1106,8 +1106,8 @@ class GitWorktreeOperations:
 
     # Identity used for commits the platform creates itself (bootstrap commit).
     # Never a user identity: those commits carry no user content.
-    COMMITTER_NAME = "AgenticData"
-    COMMITTER_EMAIL = "agenticdata@localhost"
+    COMMITTER_NAME = "DataCode"
+    COMMITTER_EMAIL = "datacode@localhost"
 
     @staticmethod
     def init_bare(repo_path: str, default_branch: str = "main") -> bool:
@@ -1733,8 +1733,8 @@ class GitMergeOperations:
 # out of the process argument list and off disk.
 _ASKPASS_SCRIPT_BODY = """#!/bin/sh
 case "$1" in
-  Username*) printf '%s' "${AGENTICDATA_GIT_USERNAME}" ;;
-  *)         printf '%s' "${AGENTICDATA_GIT_PASSWORD}" ;;
+  Username*) printf '%s' "${DATACODE_GIT_USERNAME}" ;;
+  *)         printf '%s' "${DATACODE_GIT_PASSWORD}" ;;
 esac
 """
 
@@ -1754,7 +1754,7 @@ def _askpass_script() -> str:
     with _askpass_lock:
         if _askpass_path and os.path.exists(_askpass_path):
             return _askpass_path
-        fd, path = tempfile.mkstemp(prefix="agenticdata-git-askpass-", suffix=".sh")
+        fd, path = tempfile.mkstemp(prefix="datacode-git-askpass-", suffix=".sh")
         with os.fdopen(fd, "w") as handle:
             handle.write(_ASKPASS_SCRIPT_BODY)
         os.chmod(path, 0o700)
@@ -1776,13 +1776,13 @@ def _git_env(auth: t.Optional[GitAuth] = None) -> t.Dict[str, str]:
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
     env.pop("GIT_ASKPASS", None)
     env.pop("SSH_ASKPASS", None)
-    env.pop("AGENTICDATA_GIT_USERNAME", None)
-    env.pop("AGENTICDATA_GIT_PASSWORD", None)
+    env.pop("DATACODE_GIT_USERNAME", None)
+    env.pop("DATACODE_GIT_PASSWORD", None)
 
     if auth and auth.token:
         env["GIT_ASKPASS"] = _askpass_script()
-        env["AGENTICDATA_GIT_USERNAME"] = auth.basic_username()
-        env["AGENTICDATA_GIT_PASSWORD"] = auth.token
+        env["DATACODE_GIT_USERNAME"] = auth.basic_username()
+        env["DATACODE_GIT_PASSWORD"] = auth.token
     return env
 
 

@@ -69,7 +69,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 echo -e "${CYAN}============================================${NC}"
-echo -e "${CYAN}  AgenticData - Development Mode${NC}"
+echo -e "${CYAN}  DataCode - Development Mode${NC}"
 echo -e "${CYAN}  Zero external dependencies (DuckDB + SQLite)${NC}"
 echo -e "${CYAN}============================================${NC}"
 echo ""
@@ -90,8 +90,8 @@ fi
 # --- Ensure data directory exists (for SQLite & file locks) ---
 mkdir -p "$ROOT_DIR/.data"
 
-# --- Set AGENTICDATA_ENV for platform config (dev overrides) ---
-export AGENTICDATA_ENV="${AGENTICDATA_ENV:-dev}"
+# --- Set DATACODE_ENV for platform config (dev overrides) ---
+export DATACODE_ENV="${DATACODE_ENV:-dev}"
 
 # --- Database password (env-only) ---
 # sqlmesh-service reads DB_PASSWORD from the environment. For local dev with
@@ -139,7 +139,7 @@ if [ -n "$VENV_DIR" ]; then
   # Install deps for all Python services into the shared venv
   "$VENV_DIR/bin/pip" install -q -e "$ROOT_DIR/shared/python"
   for svc in sqlmesh-service agent-service ontology-service dagster-service; do
-    if ! "$VENV_DIR/bin/python" -c "import fastapi, agenticdata_common" &>/dev/null; then
+    if ! "$VENV_DIR/bin/python" -c "import fastapi, datacode_common" &>/dev/null; then
       echo "    [$svc] Installing dependencies into shared venv..."
       (cd "$ROOT_DIR/$svc" && "$VENV_DIR/bin/pip" install -q -e ".[dev]")
     fi
@@ -157,7 +157,7 @@ else
       needs_install=true
     fi
     if [[ "$svc" == sqlmesh-service || "$svc" == agent-service || "$svc" == dagster-service ]] && \
-       ! "$svc_dir/.venv/bin/python" -c "import agenticdata_common" &>/dev/null; then
+       ! "$svc_dir/.venv/bin/python" -c "import datacode_common" &>/dev/null; then
       needs_install=true
     fi
     if [ "$needs_install" = true ]; then

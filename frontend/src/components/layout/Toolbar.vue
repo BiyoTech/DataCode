@@ -461,7 +461,7 @@ watch(currentEnvironment, async () => {
       >
         <t-icon name="menu-fold" size="18px" />
       </IconButton>
-      <span class="app-name">AgenticData</span>
+      <span class="app-name">DataCode</span>
     </div>
 
     <div class="toolbar-center">

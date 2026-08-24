@@ -6,8 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/agenticdata/gateway/internal/config"
-	"github.com/agenticdata/gateway/internal/handler"
+	"github.com/datacode/gateway/internal/config"
+	"github.com/datacode/gateway/internal/handler"
 	"go.uber.org/zap"
 )
 

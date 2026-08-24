@@ -4,7 +4,7 @@
 # by all services: database, workspace storage, service topology, logging.
 # Each service ALSO reads its own <service>.yaml for service-specific settings.
 #
-# Environment overrides: set AGENTICDATA_ENV=dev to load platform.dev.yaml on
+# Environment overrides: set DATACODE_ENV=dev to load platform.dev.yaml on
 # top of this file (deep merge, env-specific wins).
 #
 # Secrets are NEVER stored here — see the `security` section below for the
@@ -19,7 +19,7 @@ database:
   type: "mysql"                         # "sqlite" | "mysql" | "postgresql"
   host: "localhost"
   port: 3306
-  name: "agenticdata"
+  name: "datacode"
   username: "root"
   # password: env-only (DB_PASSWORD)
   pool_size: 5
@@ -40,13 +40,13 @@ database:
     #   sqlite_path: ".data/gateway.db"
     # agent:
     #   type: "sqlite"
-    #   sqlite_path: ".data/agenticdata.db"
+    #   sqlite_path: ".data/datacode.db"
 
 # ── Workspace Storage ──────────────────────────────────────────────────
 # Base directory for all workspace data. Must be consistent across
 # sqlmesh-service, dagster-service, and ontology-service.
 workspace:
-  base_path: "~/.agenticdata/workspaces"
+  base_path: "~/.datacode/workspaces"
 
 # ── Service Topology ──────────────────────────────────────────────────
 # Single source of truth for inter-service URLs. Each service reads its

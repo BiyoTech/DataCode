@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 from typing import AsyncGenerator
 
-from agenticdata_common.database.engine import create_async_engine_for_url
-from agenticdata_common.database.url import build_database_url
+from datacode_common.database.engine import create_async_engine_for_url
+from datacode_common.database.url import build_database_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,

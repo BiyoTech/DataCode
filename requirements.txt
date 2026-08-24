@@ -1,4 +1,4 @@
-# AgenticData - Python Dependencies (unified for shared venv)
+# DataCode - Python Dependencies (unified for shared venv)
 # Install: pip install -r requirements.txt
 
 # === Core Frameworks ===

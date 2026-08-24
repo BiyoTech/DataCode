@@ -1,6 +1,6 @@
 # 领域模型与业务术语设计
 
-> AgenticData — Data+AI 一体化 AI 原生开发平台
+> DataCode — Data+AI 一体化 AI 原生开发平台
 > 将传统数据工程（ELT、数据建模、数据质量、血缘）与现代 AI 工程（模型训练/推理、特征工程、RAG 索引构建）统一在一个 AI 原生开发平台中
 > 基于 sqlmesh-service / dagster-service / ontology-service / agent-service 实际实现
 
@@ -10,9 +10,9 @@
 
 ### 0.1 平台定位
 
-AgenticData 是 **Data+AI 一体化 AI 原生开发平台**。传统数据平台与 AI 平台是割裂的，AgenticData 将两者统一在同一个用户工作区内，由 AI Agent 贯穿全流程。
+DataCode 是 **Data+AI 一体化 AI 原生开发平台**。传统数据平台与 AI 平台是割裂的，DataCode 将两者统一在同一个用户工作区内，由 AI Agent 贯穿全流程。
 
-| 维度 | 传统数据平台 | 传统 AI 平台 | AgenticData |
+| 维度 | 传统数据平台 | 传统 AI 平台 | DataCode |
 |------|------------|------------|-------------|
 | 数据建模 | dbt / SQLMesh | 手写 SQL | SQLMesh（SQL Warehouse） |
 | 流水线编排 | Airflow | Kubeflow / Metaflow | Dagster（Asset Dag） |
@@ -448,7 +448,7 @@ stateDiagram-v2
 
 | 术语 | 英文 | 定义 | 所属域 | 所在服务 |
 |------|------|------|--------|---------|
-| **工作区** | Workspace | 一个 SQLMesh 数据工程工作区，对应本地目录 `~/.agenticdata/workspaces/{user}/{name}/`，包含模型、Git、asset-dag 等 | 工作区与身份域 | sqlmesh-service |
+| **工作区** | Workspace | 一个 SQLMesh 数据工程工作区，对应本地目录 `~/.datacode/workspaces/{user}/{name}/`，包含模型、Git、asset-dag 等 | 工作区与身份域 | sqlmesh-service |
 | **模型** | Model | SQLMesh 中的数据转换单元，用 SQL 定义。显示名 `schema.table`，FQN 为完全限定名 | 模型开发域 | sqlmesh-service |
 | **Context 池** | ContextPool | SQLMesh Context 的缓存池，按 (workspace, gateway) 键化，TTL/LRU 淘汰 | 模型开发域 | sqlmesh-service |
 | **Context 条目** | ContextEntry | ContextPool 中的缓存条目，持有 Context + asyncio.Lock + dirty flag | 模型开发域 | sqlmesh-service |

@@ -17,7 +17,7 @@ else
 fi
 
 echo "============================================"
-echo "  AgenticData - Dev Environment Setup"
+echo "  DataCode - Dev Environment Setup"
 echo "============================================"
 echo ""
 

@@ -44,7 +44,7 @@ def spec(env):
         location_name=LOCATION,
         workspace_path=workspace,
         workspace_name="ws-t1-sales",
-        env={"AGENTICDATA_ENVIRONMENT": "dev_alice"},
+        env={"DATACODE_ENVIRONMENT": "dev_alice"},
     )
 
 
@@ -152,7 +152,7 @@ async def test_ensure_injects_the_deployment_identity(env, spec, stub_backends):
     await CodeLocationManager(cfg).ensure(spec)
 
     injected = fake_pm.envs[0]
-    assert injected["AGENTICDATA_ENVIRONMENT"] == "dev_alice"
+    assert injected["DATACODE_ENVIRONMENT"] == "dev_alice"
     assert injected["DAGSTER_WORKSPACE_PATH"] == workspace
     assert injected["SQLMESH_SERVICE_URL"]
 

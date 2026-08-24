@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from agenticdata_common.logging.redact import redact_value
+from datacode_common.logging.redact import redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +363,7 @@ def build_workspace_sink(service: str) -> Optional[WorkspaceLogSink]:
     pass the result straight to ``setup_logging(workspace_sink=...)``.
     """
     try:
-        from agenticdata_common.config.platform import platform_config
+        from datacode_common.config.platform import platform_config
 
         cfg = platform_config().logging.workspace_file
         if not cfg.enabled:

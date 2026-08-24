@@ -193,11 +193,11 @@ async def test_launch_run_sends_deployment_tags_as_execution_metadata(
         repository_location_name="ws_t1_sales__dev_alice",
         repository_name="__repository__",
         job_name="my_job",
-        tags={"agenticdata/environment": "dev_alice"},
+        tags={"datacode/environment": "dev_alice"},
     )
 
     assert captured["executionParams"]["executionMetadata"]["tags"] == [
-        {"key": "agenticdata/environment", "value": "dev_alice"}
+        {"key": "datacode/environment", "value": "dev_alice"}
     ]
 
 

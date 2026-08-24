@@ -1,7 +1,7 @@
 version: v2
 modules:
   - path: .
-    name: buf.build/agenticdata/platform
+    name: buf.build/datacode/platform
 lint:
   use:
     - STANDARD

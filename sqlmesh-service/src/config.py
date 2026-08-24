@@ -4,7 +4,7 @@ Loads from YAML file (conf/sqlmesh-service.yaml) with environment variable overr
 Priority: env vars > YAML file > defaults.
 
 Shared cross-cutting config (database, workspace, logging, service topology)
-is sourced from ``conf/platform.yaml`` via :mod:`agenticdata_common.config.platform`.
+is sourced from ``conf/platform.yaml`` via :mod:`datacode_common.config.platform`.
 This service-specific YAML only carries settings unique to sqlmesh-service.
 """
 
@@ -12,8 +12,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from agenticdata_common.config.platform import platform_config
-from agenticdata_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
+from datacode_common.config.platform import platform_config
+from datacode_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
 from pydantic_settings import BaseSettings
 
 _CONFIG_FILE = Path(__file__)

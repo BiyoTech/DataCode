@@ -1,13 +1,13 @@
 """Structured logging configuration using structlog.
 
-Reuses the shared agenticdata_common logging setup so every service emits
+Reuses the shared datacode_common logging setup so every service emits
 logs in the same format. All log messages MUST be in English and timestamps
 are UTC (enforced by the shared setup).
 """
 
-from agenticdata_common.logging.setup import get_logger as _get_logger
-from agenticdata_common.logging.setup import setup_logging as _setup_logging
-from agenticdata_common.logging.workspace_sink import build_workspace_sink
+from datacode_common.logging.setup import get_logger as _get_logger
+from datacode_common.logging.setup import setup_logging as _setup_logging
+from datacode_common.logging.workspace_sink import build_workspace_sink
 
 from src.config import settings
 

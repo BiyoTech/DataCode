@@ -1,6 +1,6 @@
 # 平台权限体系设计 — 控制面 RBAC（数据面下沉引擎）
 
-> AgenticData — Data+AI 一体化 AI 原生开发平台
+> DataCode — Data+AI 一体化 AI 原生开发平台
 > 本文档定义平台的**身份认证、功能权限（RBAC）、工作区归属、发布审批、审计**五件事。
 > **明确不做**：不在平台层重建一套数据访问控制去替代数据引擎的权限。
 
@@ -12,12 +12,12 @@
 
 ### 0.1 核心判断
 
-AgenticData 是**开发工具（developer tool）**，不是数据网关，也不是数据安全产品。因此：
+DataCode 是**开发工具（developer tool）**，不是数据网关，也不是数据安全产品。因此：
 
 | 层面 | 谁是权威（authority） | 理由 |
 |------|---------------------|------|
 | **数据面**：谁能读哪张表 / 哪些行 / 哪些列 | **数据引擎**（Trino / PostgreSQL 的 `GRANT` / RLS / 列掩码） | 引擎是执行时强制点（runtime enforcement），不可绕过；应用层解析 SQL 只是"猜"，永远堵不完（动态 SQL、方言差异、表函数、外部读） |
-| **控制面**：谁能用平台的哪个能力 | **AgenticData 平台** | 这些操作**引擎看不见**，引擎无从鉴权 |
+| **控制面**：谁能用平台的哪个能力 | **DataCode 平台** | 这些操作**引擎看不见**，引擎无从鉴权 |
 
 ### 0.2 为什么控制面必须平台自己管
 
@@ -35,7 +35,7 @@ SQLMesh 在引擎之上造了一层抽象（environment / snapshot / virtual upd
 
 ### 0.3 边界声明（必须显式承认，不可默认成立）
 
-> **AgenticData 的数据面权限强度 = 底层数据引擎的权限强度。**
+> **DataCode 的数据面权限强度 = 底层数据引擎的权限强度。**
 
 - ✅ **Trino / PostgreSQL / Snowflake / BigQuery**（本项目生产形态）：有 `GRANT` / RLS，定位成立。
 - ⚠️ **DuckDB / 本地嵌入式**：无身份鉴权。本平台**仅将其定位为本地开发引擎，不承载生产敏感数据**。不再试图用应用层沙箱模拟鉴权（那是必败的军备竞赛）。
@@ -50,7 +50,7 @@ workspace 成员资格  →  该 workspace 的 config.yaml gateways 凭证  → 
 
 即：**workspace 是数据隔离单元**，同一 workspace 内的成员共享同一引擎身份、拥有同等数据可见性。工作区之间的数据隔离靠"不同 workspace 配不同引擎凭证 + 引擎侧 GRANT"实现。
 
-这是一个诚实且常见的开发工具定位（dbt Cloud、Hex 同类做法）。**必须写进产品文档**，避免让人误以为"用了 AgenticData 就有细粒度数据权限"。
+这是一个诚实且常见的开发工具定位（dbt Cloud、Hex 同类做法）。**必须写进产品文档**，避免让人误以为"用了 DataCode 就有细粒度数据权限"。
 
 ### 0.5 被明确否决的设计（相比早期草案）
 
@@ -280,7 +280,7 @@ graph TB
         SAFE["查询安全兜底<br/>语句/函数 denylist（非权限）"]
     end
 
-    subgraph AUTHZ["shared/agenticdata_authz (进程内 PDP)"]
+    subgraph AUTHZ["shared/datacode_authz (进程内 PDP)"]
         EVAL["决策引擎<br/>deny-overrides / default-deny"]
         CACHE["版本化缓存 policy_version"]
         AUDIT["决策审计写入"]

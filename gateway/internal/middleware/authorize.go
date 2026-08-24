@@ -12,7 +12,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 // Capability headers published to downstream services. They are always

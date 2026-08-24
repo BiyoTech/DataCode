@@ -12,8 +12,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/auth"
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 const testSecret = "middleware-test-secret"

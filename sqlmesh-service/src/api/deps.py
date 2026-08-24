@@ -20,7 +20,7 @@ from src.core.model_service import get_model_service
 from src.core.plan_service import get_plan_service
 from src.core.query_service import get_query_service
 from src.core.schema_service import get_schema_service
-from agenticdata_common.logging.context import bind_workspace_context
+from datacode_common.logging.context import bind_workspace_context
 
 from src.utils.errors import PermissionDeniedError, WorkspacePathInvalidError
 from src.utils.logging import get_logger

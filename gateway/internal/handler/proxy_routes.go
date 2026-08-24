@@ -11,8 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/middleware"
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/middleware"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 // ValidatedRoute describes a route that requires certain query parameters

@@ -3,7 +3,7 @@
 import threading
 import typing as t
 
-from src.config import settings
+from src.config import env_id_suffix, settings
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,7 +39,7 @@ def resolve_model(model_id: str) -> t.Optional[t.Any]:
         raise ValueError(
             f"Model '{model_cfg.id}' has base_url='{model_cfg.base_url}' but no "
             f"api_key configured. Set it via env "
-            f"AGENT_SERVICE_LLM_API_KEY__{model_cfg.id.upper()} or in "
+            f"AGENT_SERVICE_LLM_API_KEY__{env_id_suffix(model_cfg.id)} or in "
             f"conf/agent-service.yaml."
         )
 

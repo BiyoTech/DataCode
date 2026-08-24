@@ -44,18 +44,18 @@ import dagster as dg
 # ── Deployment identity (injected by dagster-service) ──────────────────
 # Empty values mean the code was loaded outside a platform deployment (a local
 # `dagster dev`, a unit test); the gate then falls back to the safest behavior.
-ENVIRONMENT = os.getenv("AGENTICDATA_ENVIRONMENT", "")
-DEPLOYMENT_NAME = os.getenv("AGENTICDATA_DEPLOYMENT", "")
-DEPLOYMENT_TYPE = os.getenv("AGENTICDATA_DEPLOYMENT_TYPE", "sandbox")
-WORKSPACE_ID = os.getenv("AGENTICDATA_WORKSPACE_ID", "")
-TENANT_ID = os.getenv("AGENTICDATA_TENANT_ID", "")
+ENVIRONMENT = os.getenv("DATACODE_ENVIRONMENT", "")
+DEPLOYMENT_NAME = os.getenv("DATACODE_DEPLOYMENT", "")
+DEPLOYMENT_TYPE = os.getenv("DATACODE_DEPLOYMENT_TYPE", "sandbox")
+WORKSPACE_ID = os.getenv("DATACODE_WORKSPACE_ID", "")
+TENANT_ID = os.getenv("DATACODE_TENANT_ID", "")
 
 # Whether this deployment is the workspace's production line.
 IS_PRODUCTION = DEPLOYMENT_TYPE == "production"
 
 # Whether the daemon may run this deployment's schedules and sensors. Granted to
 # production automatically; to any other environment only explicitly.
-SCHEDULES_ENABLED = os.getenv("AGENTICDATA_SCHEDULES_ENABLED", "") == "1"
+SCHEDULES_ENABLED = os.getenv("DATACODE_SCHEDULES_ENABLED", "") == "1"
 
 # ── Scheduling gate ────────────────────────────────────────────────────
 DEFAULT_SCHEDULE_STATUS = (
@@ -79,8 +79,8 @@ def run_tags() -> dict[str, str]:
     attributable to the environment that produced it.
     """
     tags = {
-        "agenticdata/environment": ENVIRONMENT,
-        "agenticdata/workspace_id": WORKSPACE_ID,
-        "agenticdata/deployment": DEPLOYMENT_NAME,
+        "datacode/environment": ENVIRONMENT,
+        "datacode/workspace_id": WORKSPACE_ID,
+        "datacode/deployment": DEPLOYMENT_NAME,
     }
     return {key: value for key, value in tags.items() if value}

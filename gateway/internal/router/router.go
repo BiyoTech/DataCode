@@ -15,11 +15,11 @@ import (
 	"github.com/go-chi/cors"
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/auth"
-	"github.com/agenticdata/gateway/internal/config"
-	"github.com/agenticdata/gateway/internal/handler"
-	"github.com/agenticdata/gateway/internal/middleware"
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/config"
+	"github.com/datacode/gateway/internal/handler"
+	"github.com/datacode/gateway/internal/middleware"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 // Setup creates and configures the Chi router with all API routes.

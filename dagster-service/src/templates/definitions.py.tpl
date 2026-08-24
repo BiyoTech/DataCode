@@ -13,9 +13,9 @@ Auto-discovery rules (Dagster ``dg`` convention):
 
 This code location serves ONE environment: dagster-service launches one per
 environment, each loading that environment's own Git branch. The deployment
-identity is injected as environment variables (``AGENTICDATA_ENVIRONMENT``,
-``AGENTICDATA_DEPLOYMENT``, ``AGENTICDATA_DEPLOYMENT_TYPE``,
-``AGENTICDATA_WORKSPACE_ID``, ``AGENTICDATA_SCHEDULES_ENABLED``) alongside the
+identity is injected as environment variables (``DATACODE_ENVIRONMENT``,
+``DATACODE_DEPLOYMENT``, ``DATACODE_DEPLOYMENT_TYPE``,
+``DATACODE_WORKSPACE_ID``, ``DATACODE_SCHEDULES_ENABLED``) alongside the
 SQLMesh bridge settings (``SQLMESH_SERVICE_URL``, ``DAGSTER_WORKSPACE_PATH``,
 ``SQLMESH_GATEWAY``); read it through ``defs/deployment.py``, which also gates
 schedule and sensor statuses on it.

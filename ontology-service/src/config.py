@@ -5,7 +5,7 @@ Configuration is sourced from environment variables and the shared
 
 Shared cross-cutting config (sqlmesh service URL, workspace base path) is
 sourced from ``conf/platform.yaml`` via
-:mod:`agenticdata_common.config.platform`. Per-service env vars still take
+:mod:`datacode_common.config.platform`. Per-service env vars still take
 precedence over platform defaults.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-from agenticdata_common.config.platform import platform_config
+from datacode_common.config.platform import platform_config
 
 
 class Settings:

@@ -12,8 +12,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/config"
-	"github.com/agenticdata/gateway/internal/middleware"
+	"github.com/datacode/gateway/internal/config"
+	"github.com/datacode/gateway/internal/middleware"
 )
 
 // AgentSSEEvents proxies the SSE event stream from Agent Service.

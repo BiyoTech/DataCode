@@ -1,14 +1,14 @@
--- Database initialization for AgenticData platform.
+-- Database initialization for DataCode platform.
 -- Creates necessary databases and extensions.
 
 -- Database for Gitea
-CREATE DATABASE gitea OWNER agenticdata;
+CREATE DATABASE gitea OWNER datacode;
 
 -- Database for SQLMesh state (separate from platform metadata)
-CREATE DATABASE sqlmesh_state OWNER agenticdata;
+CREATE DATABASE sqlmesh_state OWNER datacode;
 
--- Extensions for the main agenticdata database
-\c agenticdata;
+-- Extensions for the main datacode database
+\c datacode;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
@@ -17,10 +17,10 @@ CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- =====================================================
--- Platform metadata tables (agenticdata database)
+-- Platform metadata tables (datacode database)
 -- =====================================================
 
-\c agenticdata;
+\c datacode;
 
 -- Git 授权凭证表
 CREATE TABLE IF NOT EXISTS git_credentials (

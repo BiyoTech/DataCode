@@ -104,7 +104,7 @@ def test_non_production_defaults_to_sandbox_without_schedules(manager, env):
 
     assert spec.env_type == naming.ENV_TYPE_SANDBOX
     assert spec.schedules_enabled is False
-    assert spec.code_location_env()["AGENTICDATA_SCHEDULES_ENABLED"] == "0"
+    assert spec.code_location_env()["DATACODE_SCHEDULES_ENABLED"] == "0"
 
 
 def test_production_is_scheduled_by_default(manager, env):
@@ -115,7 +115,7 @@ def test_production_is_scheduled_by_default(manager, env):
     assert spec.env_type == naming.ENV_TYPE_PRODUCTION
     assert spec.is_production
     assert spec.schedules_enabled is True
-    assert spec.code_location_env()["AGENTICDATA_SCHEDULES_ENABLED"] == "1"
+    assert spec.code_location_env()["DATACODE_SCHEDULES_ENABLED"] == "1"
 
 
 def test_registry_may_grant_schedules_to_a_shared_environment(manager, env):
@@ -162,9 +162,9 @@ def test_run_tags_attribute_a_run_to_its_environment(manager, env):
     mgr, _ = manager
     _, _, dev = env
     assert mgr.resolve(dev).run_tags() == {
-        "agenticdata/environment": "dev_alice",
-        "agenticdata/workspace_id": "ws-t1-sales",
-        "agenticdata/deployment": "ws_t1_sales__dev_alice",
+        "datacode/environment": "dev_alice",
+        "datacode/workspace_id": "ws-t1-sales",
+        "datacode/deployment": "ws_t1_sales__dev_alice",
     }
 
 
@@ -180,7 +180,7 @@ async def test_ensure_starts_the_location_under_the_deployment_name(manager, env
     assert info.as_dict()["location_name"] == "ws_t1_sales__dev_alice"
     assert info.alive is True
     # The identity travels with the spec, not with the path.
-    assert locations.specs[0].env["AGENTICDATA_DEPLOYMENT"] == "ws_t1_sales__dev_alice"
+    assert locations.specs[0].env["DATACODE_DEPLOYMENT"] == "ws_t1_sales__dev_alice"
 
 
 async def test_two_environments_of_one_workspace_get_two_deployments(manager, env):

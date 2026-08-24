@@ -1,4 +1,4 @@
-module github.com/agenticdata/gateway
+module github.com/datacode/gateway
 
 go 1.24.0
 

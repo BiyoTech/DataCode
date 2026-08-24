@@ -192,7 +192,7 @@ export default {
     forbidden: '你没有查看该工作区日志的权限',
   },
   common: {
-    appName: 'AgenticData',
+    appName: 'DataCode',
     loading: '加载中...',
     save: '保存',
     cancel: '取消',

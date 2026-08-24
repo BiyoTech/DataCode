@@ -11,10 +11,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/auth"
-	"github.com/agenticdata/gateway/internal/config"
-	"github.com/agenticdata/gateway/internal/rbac"
-	"github.com/agenticdata/gateway/internal/router"
+	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/config"
+	"github.com/datacode/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/router"
 )
 
 func main() {

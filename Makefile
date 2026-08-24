@@ -2,7 +2,7 @@
 
 # Default target
 help:
-	@echo "AgenticData - AI Native DataOps Platform"
+	@echo "DataCode - AI Native DataOps Platform"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make setup        - One-click dev environment setup (install all deps)"

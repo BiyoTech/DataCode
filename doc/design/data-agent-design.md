@@ -1,6 +1,6 @@
 # Data Agent Design Specification
 
-> AgenticData Platform — AI Data Agent Architecture
+> DataCode Platform — AI Data Agent Architecture
 > Based on OpenAI Agents SDK, inspired by Claude Code & Cursor Composer
 
 ---
@@ -496,7 +496,7 @@ name: "dbt-migration"
 display_name: "DBT to SQLMesh Migration"
 description: "Migrate dbt models, tests, and macros to SQLMesh"
 version: "1.0.0"
-author: "AgenticData"
+author: "DataCode"
 categories: ["migration", "dbt"]
 
 # Requirements

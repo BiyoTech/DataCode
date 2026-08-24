@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package workspace.v1;
 
-option go_package = "github.com/agenticdata/proto/workspace/v1;workspacev1";
+option go_package = "github.com/datacode/proto/workspace/v1;workspacev1";
 
 import "common/v1/common.proto";
 

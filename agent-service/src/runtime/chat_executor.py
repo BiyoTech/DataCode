@@ -2,7 +2,7 @@
 
 import asyncio
 
-from agenticdata_common.logging.context import bind_workspace_context
+from datacode_common.logging.context import bind_workspace_context
 
 from src.agents.registry import AgentRegistry
 from src.api.schemas import ChatMessageRequest

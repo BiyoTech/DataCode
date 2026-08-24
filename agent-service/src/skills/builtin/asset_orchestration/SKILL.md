@@ -143,7 +143,7 @@ code; conversely, a reload picks up whatever is in the working copy.
 
 ## CLI Usage — dc Command Reference
 
-`dc` is the DataCursor platform CLI. Call it via the `shell` tool:
+`dc` is the DataCode platform CLI. Call it via the `shell` tool:
 
 **How to call**: `shell(commands=["dc <subcommand> <args>"], timeout_ms=<ms>)`
 

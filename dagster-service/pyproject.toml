@@ -14,7 +14,7 @@ dependencies = [
     "pydantic-settings>=2.6.0",
     "pyyaml>=6.0.0",
     "httpx>=0.27.0",
-    "agenticdata-common @ file:../shared/python",
+    "datacode-common @ file:../shared/python",
 ]
 
 [tool.hatch.metadata]

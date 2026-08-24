@@ -11,7 +11,7 @@ Two binding points cover a service:
 * :func:`bind_workspace_context` — the working copy a request operates on,
   bound where the workspace path is validated.
 
-``workspace_path`` is what tells :class:`~agenticdata_common.logging.
+``workspace_path`` is what tells :class:`~datacode_common.logging.
 workspace_sink.WorkspaceLogSink` where to mirror the line, so binding it is
 what makes a record land in the right workspace directory.
 """

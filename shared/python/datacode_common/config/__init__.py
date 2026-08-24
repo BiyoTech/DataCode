@@ -1,6 +1,6 @@
 """Configuration loading utilities."""
 
-from agenticdata_common.config.platform import (
+from datacode_common.config.platform import (
     DatabaseConfig,
     DatabaseServiceConfig,
     LoggingConfig,
@@ -9,7 +9,7 @@ from agenticdata_common.config.platform import (
     WorkspaceConfig,
     platform_config,
 )
-from agenticdata_common.config.yaml_loader import (
+from datacode_common.config.yaml_loader import (
     find_config_file,
     flatten_yaml_mapping,
     load_yaml_config,

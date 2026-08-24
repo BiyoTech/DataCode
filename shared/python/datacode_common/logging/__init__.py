@@ -1,17 +1,17 @@
 """Structured logging utilities."""
 
-from agenticdata_common.logging.context import (
+from datacode_common.logging.context import (
     bind_request_context,
     bind_workspace_context,
     clear_context,
 )
-from agenticdata_common.logging.redact import (
+from datacode_common.logging.redact import (
     redact_dict_in_place,
     redact_string,
     redact_value,
 )
-from agenticdata_common.logging.setup import get_logger, setup_logging
-from agenticdata_common.logging.workspace_sink import (
+from datacode_common.logging.setup import get_logger, setup_logging
+from datacode_common.logging.workspace_sink import (
     CHANNEL_RUNS,
     CHANNEL_SERVICE,
     WorkspaceLogSink,

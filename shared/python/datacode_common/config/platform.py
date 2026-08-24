@@ -1,7 +1,7 @@
 """Platform-level shared configuration loader.
 
 Reads ``conf/platform.yaml`` (plus an optional ``platform.{env}.yaml`` override
-selected by the ``AGENTICDATA_ENV`` environment variable) and exposes typed
+selected by the ``DATACODE_ENV`` environment variable) and exposes typed
 accessors for database, workspace, service URLs, and logging.
 
 Each Python service composes this module with its own service-specific
@@ -9,7 +9,7 @@ Each Python service composes this module with its own service-specific
 
 Usage::
 
-    from agenticdata_common.config.platform import platform_config
+    from datacode_common.config.platform import platform_config
 
     cfg = platform_config()
     db_url = cfg.database.url(service="sqlmesh")
@@ -27,8 +27,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from agenticdata_common.config.yaml_loader import load_yaml_config
-from agenticdata_common.database.url import build_database_url
+from datacode_common.config.yaml_loader import load_yaml_config
+from datacode_common.database.url import build_database_url
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,9 @@ class DatabaseServiceConfig(BaseModel):
     type: str = "sqlite"           # "sqlite" | "mysql" | "postgresql"
     host: str = "localhost"
     port: int = 3306
-    name: str = "agenticdata"
+    name: str = "datacode"
     username: str = "root"
-    sqlite_path: str = ".data/agenticdata.db"
+    sqlite_path: str = ".data/datacode.db"
     pool_size: int = 5
     pool_overflow: int = 10
 
@@ -65,11 +65,11 @@ class DatabaseConfig(BaseModel):
     type: str = "sqlite"
     host: str = "localhost"
     port: int = 3306
-    name: str = "agenticdata"
+    name: str = "datacode"
     username: str = "root"
     pool_size: int = 5
     pool_overflow: int = 10
-    sqlite_path: str = ".data/agenticdata.db"
+    sqlite_path: str = ".data/datacode.db"
     services: dict[str, DatabaseServiceConfig] = {}
 
     def url(self, *, service: Optional[str] = None) -> str:
@@ -121,7 +121,7 @@ class ServiceTopology(BaseModel):
 class WorkspaceConfig(BaseModel):
     """Workspace storage configuration."""
 
-    base_path: str = "~/.agenticdata/workspaces"
+    base_path: str = "~/.datacode/workspaces"
 
 
 class WorkspaceFileLoggingConfig(BaseModel):
@@ -196,7 +196,7 @@ def _load_platform() -> PlatformConfig:
     base = load_yaml_config("platform.yaml", package_file=_PACKAGE_FILE)
     logger.debug("Loaded platform.yaml: %s keys", len(base))
 
-    env = os.getenv("AGENTICDATA_ENV", "")
+    env = os.getenv("DATACODE_ENV", "")
     if env:
         override = load_yaml_config(
             f"platform.{env}.yaml", package_file=_PACKAGE_FILE
