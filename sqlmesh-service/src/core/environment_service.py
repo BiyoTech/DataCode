@@ -1,6 +1,12 @@
-"""Environment service - SQLMesh environment operations.
+"""Engine-side environment view — reconciliation and troubleshooting only.
 
-Matches SQLMesh web server's environments endpoint behavior.
+This service reads the environments that ACTUALLY exist in the SQLMesh state.
+It is deliberately read-only: the platform registry is the source of truth for
+what an environment is, and destroying one is an orchestration
+(:class:`~src.environments.registry.EnvironmentRegistry`) that must also release
+the Git branch, the worktree and the Dagster deployment. Invalidating a virtual
+environment on its own would leave exactly those orphans behind, which is why
+the corresponding delete operation lives in the registry's SQLMesh binder.
 """
 
 import asyncio
@@ -16,18 +22,18 @@ logger = get_logger(__name__)
 
 
 class EnvironmentService:
-    """Environment read/delete operations using SQLMesh SDK."""
+    """Read access to the environments present in the SQLMesh state."""
 
     async def list_environments(
         self,
         workspace_path: str,
         gateway: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get all environments.
+        """List the environments recorded in the workspace's SQLMesh state.
 
-        Matches SQLMesh web server's GET /environments behavior:
-        - Lists all environments from state reader
-        - Includes pinned and default target environment info
+        Since the state schema is workspace-scoped, every member of the workspace
+        sees the same list regardless of which working copy they queried from.
+        Differences against the registry are drift for the reconciler to resolve.
         """
         pool = get_context_pool()
         entry = await pool.get_context(workspace_path, gateway)
@@ -45,39 +51,6 @@ class EnvironmentService:
                     workspace_path=workspace_path,
                     operation="environment.list",
                     gateway=gateway,
-                ),
-            ) from e
-
-    async def delete_environment(
-        self,
-        workspace_path: str,
-        environment: str,
-        gateway: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Invalidate and delete an environment.
-
-        Matches SQLMesh web server's DELETE /environments/{environment} behavior.
-        """
-        pool = get_context_pool()
-        entry = await pool.get_context(workspace_path, gateway)
-
-        try:
-            await asyncio.to_thread(entry.context.state_sync.invalidate_environment, environment)
-            await asyncio.to_thread(entry.context.state_sync.delete_expired_environments)
-
-            logger.info("environment_deleted", workspace_path=workspace_path, environment=environment)
-            return {"deleted": True, "environment": environment}
-        except Exception as e:
-            logger.error("delete_environment_failed", error=str(e), environment=environment)
-            raise service_error_from_exception(
-                e,
-                code=ErrorCode.INTERNAL_ERROR,
-                fallback_message=f"Failed to delete environment: {environment}",
-                archive=ErrorArchiveContext(
-                    workspace_path=workspace_path,
-                    operation="environment.delete",
-                    gateway=gateway,
-                    context={"environment": environment},
                 ),
             ) from e
 

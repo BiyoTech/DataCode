@@ -12,10 +12,15 @@ loading a second SQLMesh engine.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import httpx
 from dagster import ConfigurableResource
+
+# Deployment identity injected by dagster-service when it launches the code
+# location. Read at import time: the value is fixed for the life of the process.
+_INJECTED_ENVIRONMENT = os.environ.get("AGENTICDATA_ENVIRONMENT", "")
 
 
 class SQLMeshResource(ConfigurableResource):
@@ -23,14 +28,19 @@ class SQLMeshResource(ConfigurableResource):
 
     Attributes:
         sqlmesh_service_url: Base URL of the sqlmesh-service REST API.
-        workspace_path: Workspace root; sqlmesh-service resolves the
-            ``sql-warehouse/`` sub-directory internally.
+        workspace_path: Working copy of ONE environment; sqlmesh-service resolves
+            the ``sql-warehouse/`` sub-directory internally.
+        environment: SQLMesh environment the operations target. Defaults to the
+            deployment's own environment, never to ``prod``: a branch deployment
+            loads the same code as production, so a hard-coded default would let
+            a feature branch's run write production data.
         gateway: Optional SQLMesh gateway name.
         request_timeout: Per-request timeout in seconds.
     """
 
     sqlmesh_service_url: str = "http://localhost:8002"
     workspace_path: str = ""
+    environment: str = _INJECTED_ENVIRONMENT
     gateway: str = ""
     request_timeout: float = 600.0
 
@@ -41,25 +51,34 @@ class SQLMeshResource(ConfigurableResource):
             resp.raise_for_status()
             return resp.json()
 
-    def plan(self, environment: str = "prod", **kwargs: Any) -> dict[str, Any]:
-        """Preview a SQLMesh plan for the configured workspace/environment."""
-        payload = {
-            "workspace_path": self.workspace_path,
-            "gateway": self.gateway,
-            "environment": environment,
-            **kwargs,
-        }
-        return self._post("/api/v1/plan", payload)
+    def _payload(self, environment: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build a request body, refusing to guess the target environment.
 
-    def apply(self, environment: str = "prod", **kwargs: Any) -> dict[str, Any]:
-        """Apply a SQLMesh plan for the configured workspace/environment."""
-        payload = {
+        An undetermined environment is an error rather than a fallback: the only
+        safe default would be the deployment's own environment, and if that was
+        not injected the process does not know where it is running.
+        """
+        target = environment or self.environment
+        if not target:
+            raise ValueError(
+                "SQLMesh environment is undetermined: set the resource's "
+                "`environment`, or run inside a deployment that injects "
+                "AGENTICDATA_ENVIRONMENT"
+            )
+        return {
             "workspace_path": self.workspace_path,
             "gateway": self.gateway,
-            "environment": environment,
+            "environment": target,
             **kwargs,
         }
-        return self._post("/api/v1/apply", payload)
+
+    def plan(self, environment: str = "", **kwargs: Any) -> dict[str, Any]:
+        """Preview a SQLMesh plan for the configured workspace/environment."""
+        return self._post("/api/v1/plan", self._payload(environment, kwargs))
+
+    def apply(self, environment: str = "", **kwargs: Any) -> dict[str, Any]:
+        """Apply a SQLMesh plan for the configured workspace/environment."""
+        return self._post("/api/v1/apply", self._payload(environment, kwargs))
 
 
 def make_sqlmesh_resource(
@@ -67,11 +86,13 @@ def make_sqlmesh_resource(
     sqlmesh_service_url: str = "http://localhost:8002",
     gateway: str = "",
     request_timeout: Optional[float] = None,
+    environment: str = "",
 ) -> SQLMeshResource:
     """Factory used by generated code location templates."""
     return SQLMeshResource(
         sqlmesh_service_url=sqlmesh_service_url,
         workspace_path=workspace_path,
+        environment=environment or _INJECTED_ENVIRONMENT,
         gateway=gateway,
         request_timeout=request_timeout or 600.0,
     )

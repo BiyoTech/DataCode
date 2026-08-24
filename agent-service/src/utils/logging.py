@@ -2,12 +2,19 @@
 
 from agenticdata_common.logging.setup import get_logger as _get_logger
 from agenticdata_common.logging.setup import setup_logging as _setup_logging
+from agenticdata_common.logging.workspace_sink import build_workspace_sink
 
 from src.config import settings
 
+SERVICE_NAME = "agent-service"
+
 
 def setup_logging() -> None:
-    _setup_logging(settings.log_level.upper())
+    """Configure stdout logging plus the workspace NDJSON mirror."""
+    _setup_logging(
+        settings.log_level.upper(),
+        workspace_sink=build_workspace_sink(SERVICE_NAME),
+    )
 
 
 def get_logger(name: str):

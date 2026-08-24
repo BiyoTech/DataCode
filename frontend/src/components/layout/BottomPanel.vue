@@ -4,10 +4,18 @@
  * Contains Git (source control) and Log tabs.
  * Positioned at the bottom of the main content area.
  */
+import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import GitPanel from '@/components/git/GitPanel.vue'
+import LogPanel from '@/components/logs/LogPanel.vue'
+import { usePermission } from '@/composables/usePermission'
 
 const { t } = useI18n()
+const { canInWorkspace } = usePermission()
+
+// Logs can quote SQL, data values and tool output, so they carry their own
+// permission rather than riding on workspace:code:read.
+const canReadLogs = computed(() => canInWorkspace('workspace:logs:read'))
 
 defineProps<{
   activeTab: 'git' | 'log'
@@ -52,10 +60,11 @@ defineEmits<{
         <GitPanel @go-to-settings="$emit('goToSettings')" />
       </template>
 
-      <!-- Log tab (placeholder) -->
+      <!-- Log tab -->
       <template v-if="activeTab === 'log'">
-        <div class="empty-state">
-          {{ t('common.noData') }}
+        <LogPanel v-if="canReadLogs" />
+        <div v-else class="empty-state">
+          {{ t('logs.forbidden') }}
         </div>
       </template>
     </div>

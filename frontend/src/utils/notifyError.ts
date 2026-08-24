@@ -158,7 +158,15 @@ function localizeGitError(data?: ApiErrorBody): string {
     return ''
   }
   const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
-  return t(key, { host: data?.git_remote_host || '' })
+  const message = t(key, { host: data?.git_remote_host || '' })
+
+  // "unknown" is the only reason with no actionable sentence of its own, so the
+  // redacted git stderr is the whole diagnosis. Showing it here saves a trip to
+  // the log panel for the one case that most needs it.
+  if (reason === 'unknown' && data?.git_detail) {
+    return `${message} ${data.git_detail}`
+  }
+  return message
 }
 
 /**

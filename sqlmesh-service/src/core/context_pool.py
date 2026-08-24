@@ -22,7 +22,7 @@ from sqlmesh.utils.errors import ConfigError
 from src.utils.errors import ContextConfigError, ContextLoadError, ContextRefreshError, ServiceError
 from src.utils.error_archive import ErrorArchiveContext
 from src.utils.logging import get_logger
-from src.workspace.config_ops import ensure_state_isolation
+from src.workspace.config_ops import reconcile_state_schema
 
 logger = get_logger(__name__)
 
@@ -262,6 +262,30 @@ class ContextPool:
                 logger.info("contexts_invalidated_for_workspace",
                             workspace_path=workspace_path, count=len(keys_to_remove))
 
+    async def invalidate_under_path(self, root_path: str) -> int:
+        """Invalidate every context whose working copy lives under ``root_path``.
+
+        Used by teardown paths that remove a whole subtree (a deleted workspace,
+        a revoked member's root): one workspace holds MANY working copies — one
+        per member and per environment — and each is its own pool entry, so
+        eviction has to match the prefix rather than a single path.
+
+        Returns the number of evicted entries.
+        """
+        prefix = root_path.rstrip("/") + "/"
+        async with self._pool_lock:
+            keys_to_remove = [k for k in self._pool if k.startswith(prefix)]
+            for key in keys_to_remove:
+                entry = self._pool.pop(key)
+                await self._close_entry(entry)
+        if keys_to_remove:
+            logger.info(
+                "contexts_invalidated_under_path",
+                root_path=root_path,
+                count=len(keys_to_remove),
+            )
+        return len(keys_to_remove)
+
     async def _create_entry(
         self,
         workspace_path: str,
@@ -275,22 +299,22 @@ class ContextPool:
         # the workspace). The pool key and entry stay keyed by the workspace
         # ROOT so dirty/invalidate/archive remain consistent, while the actual
         # SQLMesh Context, state isolation and cache operate on sql-warehouse/.
+        from src.workspace.identity import resolve_workspace_identity
         from src.workspace.layout import sqlmesh_root
 
         project_root = sqlmesh_root(workspace_path)
+        identity = resolve_workspace_identity(workspace_path)
 
-        # Guarantee workspace-scoped SQLMesh state isolation before loading, so
-        # workspaces sharing one engine/database don't read each other's state
-        # (snapshots / external models). When isolation is newly applied, drop
-        # the local .cache so the context re-reads from the now workspace-
-        # specific state schema instead of stale cross-workspace snapshots.
-        try:
-            if ensure_state_isolation(project_root):
-                self._clear_workspace_cache(project_root)
-        except Exception as e:  # never block context creation on maintenance
-            logger.warning(
-                "state_isolation_skipped", workspace_path=workspace_path, error=str(e)
-            )
+        # The SQLMesh state is a WORKSPACE-level shared asset, so its location is
+        # platform-managed. Reconcile before loading: a gateway without a
+        # ``state_schema`` gets the managed value written into config.yaml, while
+        # a gateway declaring a different one aborts the load with a 409 instead
+        # of silently writing snapshots into an orphan state. When the file was
+        # rewritten, drop the local .cache so the context re-reads from the
+        # now-correct state schema rather than stale cross-workspace snapshots.
+        reconciliation = reconcile_state_schema(project_root, identity.workspace_id)
+        if reconciliation.changed:
+            self.clear_workspace_cache(project_root)
 
         kwargs: dict = {"paths": project_root, "load": True}
         if gateway:
@@ -310,7 +334,12 @@ class ContextPool:
                 gateway=gateway,
                 error=str(e),
             )
-            svc_err = ContextConfigError(workspace_path, detail=str(e))
+            svc_err = ContextConfigError(
+                workspace_path,
+                detail=str(e),
+                workspace_id=identity.workspace_id,
+                environment=identity.environment,
+            )
             _archive(
                 svc_err,
                 exc=e,
@@ -352,8 +381,14 @@ class ContextPool:
         )
 
     @staticmethod
-    def _clear_workspace_cache(workspace_path: str) -> None:
-        """Remove a workspace's local SQLMesh ``.cache`` (regenerable)."""
+    def clear_workspace_cache(workspace_path: str) -> None:
+        """Remove a workspace's local SQLMesh ``.cache`` (regenerable).
+
+        Public because it is part of the repair contract: when config.yaml's
+        ``state_schema`` is rewritten outside ``_create_entry``, the caller
+        must drop the cache so the next context reads snapshots from the
+        corrected state schema instead of stale ones.
+        """
         import shutil
 
         cache_dir = Path(workspace_path) / ".cache"

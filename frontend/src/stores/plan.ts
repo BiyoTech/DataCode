@@ -92,12 +92,20 @@ function parsePlanError(payload: PlanApiError): { message: string; lintResults: 
     }
   }
 
-  // 3) Legacy 4xx shape with `detail` as a string.
+  // 3) Top-level message: the backend's PRIMARY, actionable root cause (see
+  // ``ServiceError.to_response_dict``). Checked BEFORE ``detail`` so a
+  // structured error (e.g. STATE_SCHEMA_MISMATCH) never gets its message
+  // replaced by the more verbose supplementary detail.
+  if (typeof payload.message === 'string' && payload.message) {
+    return { message: payload.message, lintResults: null }
+  }
+
+  // 4) Legacy 4xx shape with `detail` as a string.
   if (typeof anyPayload.detail === 'string') {
     return { message: anyPayload.detail as string, lintResults: null }
   }
 
-  // 4) Legacy 4xx shape with `detail` as a dict (some errors wrap ``message``).
+  // 5) Legacy 4xx shape with `detail` as a dict (some errors wrap ``message``).
   const detail = anyPayload.detail
   if (detail && typeof detail === 'object' && typeof detail.message === 'string') {
     const lr = (detail as any).lint_results as LintResults | undefined
@@ -105,11 +113,6 @@ function parsePlanError(payload: PlanApiError): { message: string; lintResults: 
       message: detail.message as string,
       lintResults: lr ?? null,
     }
-  }
-
-  // 5) Top-level message.
-  if (typeof payload.message === 'string') {
-    return { message: payload.message, lintResults: null }
   }
 
   // 6) Fallback for unrecognized 500 bodies.
@@ -124,6 +127,12 @@ export const usePlanStore = defineStore('plan', () => {
   const planResult = ref<PlanResult | null>(null)
   const applyStages = ref<ApplyStage[]>([])
   const errorMessage = ref('')
+  // Structured context of the last error: ``errorCode`` lets the UI pick a
+  // dedicated surface (e.g. the state-schema repair card) instead of a plain
+  // message banner; ``errorPayload`` carries the backend's inlined fields
+  // (gateway / expected / actual for STATE_SCHEMA_MISMATCH).
+  const errorCode = ref('')
+  const errorPayload = ref<PlanApiError | null>(null)
   const isLoading = ref(false)
 
   // --- History State ---
@@ -200,6 +209,8 @@ export const usePlanStore = defineStore('plan', () => {
     actionState.value = 'running'
     isLoading.value = true
     errorMessage.value = ''
+    errorCode.value = ''
+    errorPayload.value = null
     planResult.value = null
     lintResultsFromError.value = null
     applyStages.value = []
@@ -218,6 +229,8 @@ export const usePlanStore = defineStore('plan', () => {
     if (error) {
       const parsed = parsePlanError(error)
       errorMessage.value = parsed.message
+      errorCode.value = typeof error.error_code === 'string' ? error.error_code : ''
+      errorPayload.value = error
       lintResultsFromError.value = parsed.lintResults
       actionState.value = 'error'
       isLoading.value = false
@@ -257,6 +270,8 @@ export const usePlanStore = defineStore('plan', () => {
     actionState.value = 'applying'
     isLoading.value = true
     errorMessage.value = ''
+    errorCode.value = ''
+    errorPayload.value = null
     lintResultsFromError.value = null
     applyStages.value = [
       { name: 'creation', status: 'pending' },
@@ -276,6 +291,8 @@ export const usePlanStore = defineStore('plan', () => {
     if (error) {
       const parsed = parsePlanError(error)
       errorMessage.value = parsed.message
+      errorCode.value = typeof error.error_code === 'string' ? error.error_code : ''
+      errorPayload.value = error
       lintResultsFromError.value = parsed.lintResults
       applyStages.value = applyStages.value.map((s) => ({ ...s, status: 'fail' as const }))
       actionState.value = 'error'
@@ -426,6 +443,8 @@ export const usePlanStore = defineStore('plan', () => {
     planResult.value = null
     applyStages.value = []
     errorMessage.value = ''
+    errorCode.value = ''
+    errorPayload.value = null
     isLoading.value = false
   }
 
@@ -447,6 +466,8 @@ export const usePlanStore = defineStore('plan', () => {
     planResult,
     applyStages,
     errorMessage,
+    errorCode,
+    errorPayload,
     isLoading,
     // History State
     activeTab,

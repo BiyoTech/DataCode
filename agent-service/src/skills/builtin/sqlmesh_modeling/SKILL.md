@@ -161,11 +161,16 @@ virtual environment activated.
 
 **How to call**: `shell(commands=["sqlmesh <subcommand> <args>", "..."], timeout_ms=<ms>)`
 
+**Working directory**: The SQLMesh project lives at `{workspace}/sql-warehouse/`.
+The CLI wrapper locates it automatically — run `sqlmesh test`, `sqlmesh audit`,
+`sqlmesh render`, etc. directly from anywhere in the workspace. Do NOT prepend
+`cd sql-warehouse` yourself.
+
 | Command | Purpose | Risk |
 |---------|---------|------|
 | `sqlmesh plan <env>` | Preview changes without applying (read-only, never deploys) | Read-only |
 | `sqlmesh apply <env>` | Deploy changes via platform backend API — **requires user confirmation first** | **Write** ⚠️ |
-| `sqlmesh run <env>` | Execute scheduled model runs (passthrough) | **Write** ⚠️ |
+| `sqlmesh run <env>` | **DISABLED** — data refresh bypasses governance; use `sqlmesh apply` for versioned landing or `dc run <job>` for orchestrated refresh | **Blocked** ⚠️ |
 | `sqlmesh test` | Run all unit tests for models | Read-only |
 | `sqlmesh audit` | Run data quality audits | Read-only |
 | `sqlmesh render <model_name>` | Render a model's compiled SQL (debugging) | Read-only |
@@ -203,8 +208,9 @@ virtual environment activated.
 executed via the sqlmesh-service backend API for unified governance, locking, and
 auditability. It is a destructive write operation and MUST only be run after the
 user has explicitly confirmed the deployment. Always run `sqlmesh plan <env>` first
-to preview. The legacy `plan --auto-apply` is disabled. `sqlmesh run` is passed
-through directly to the native binary.
+to preview. The legacy `plan --auto-apply` is disabled, and so is `sqlmesh run`:
+data refresh outside platform governance is forbidden — land data with
+`sqlmesh apply`, or trigger an orchestrated refresh with `dc run <job_name>`.
 
 ---
 

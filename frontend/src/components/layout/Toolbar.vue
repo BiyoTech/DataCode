@@ -2,18 +2,19 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useWorkspaceStore } from '@/stores/workspace'
-import { useEnvironmentStore } from '@/stores/environment'
+import { useEnvironmentStore, type EnvironmentInfo } from '@/stores/environment'
 import { useGatewayStore } from '@/stores/gateway'
 import { useModelsStore } from '@/stores/models'
 import api from '@/utils/api'
-import { extractApiMessage } from '@/utils/notifyError'
+import { MessagePlugin } from 'tdesign-vue-next'
+import { extractApiMessage, notifyError } from '@/utils/notifyError'
+import {
+  extractMismatchPayload,
+  isStateSchemaMismatch,
+  useStateSchemaRepair,
+} from '@/composables/useStateSchemaRepair'
 import IconButton from '@/components/common/IconButton.vue'
-
-interface SqlmeshEnvironment {
-  name: string
-  snapshots: string[]
-  type?: 'remote' | 'local'
-}
+import StateSchemaRepairDialog from '@/components/plan/StateSchemaRepairDialog.vue'
 
 interface PlanChanges {
   added?: Array<{ name: string }>
@@ -46,26 +47,84 @@ const showEnvDropdown = ref(false)
 const showGatewayDropdown = ref(false)
 const showChangesTooltip = ref(false)
 const newEnvironmentName = ref('')
-const selectedEnvironment = ref(environmentStore.selectedEnvironment)
-const environments = ref<SqlmeshEnvironment[]>([])
-const pinnedEnvironments = ref<string[]>([])
-const defaultTargetEnvironment = ref(environmentStore.defaultTargetEnvironment)
 
-const isLoadingEnvironments = ref(false)
 const isCreatingEnvironment = ref(false)
-const deletingEnvironmentName = ref<string | null>(null)
 const changeCount = ref<number | null>(null)
 const changedModels = ref<string[]>([])
 const isLoadingChanges = ref(false)
 const isRefreshingChanges = ref(false)
 
-const sortedEnvironments = computed(() => {
-  return [...environments.value].sort((a, b) => {
-    if (a.name === 'prod') return -1
-    if (b.name === 'prod') return 1
+// The change-count probe hits the same 409 a real plan does. Its mismatch is
+// reported once per workspace into the shared repair dialog; re-probes stay
+// silent so the dialog cannot re-open on every file save.
+const repairState = useStateSchemaRepair()
+const mismatchPromptedWorkspaceId = ref('')
+
+// Environment state is owned by the registry-backed store: it is a shared team
+// asset, so it must not be mirrored into component-local refs.
+const environments = computed(() => environmentStore.selectable)
+const isLoadingEnvironments = computed(() => environmentStore.isLoading)
+const environmentsLoaded = computed(() => environmentStore.isLoaded)
+const currentEnvironment = computed(() => environmentStore.currentEnvironment)
+const pendingEnvironmentId = computed(() => environmentStore.pendingEnvironmentId)
+const isSwitchingEnvironment = computed(() => environmentStore.isSwitching)
+
+/** Production first, then alphabetical: the production line is the reference. */
+const sortedEnvironments = computed(() =>
+  [...environments.value].sort((a, b) => {
+    if (a.isProduction !== b.isProduction) return a.isProduction ? -1 : 1
     return a.name.localeCompare(b.name)
   })
-})
+)
+
+/**
+ * Production is the workspace's own line of development and is reached through
+ * promotion, never destroyed. An environment already being released cannot be
+ * destroyed twice either.
+ */
+function canDestroyEnvironment(env: EnvironmentInfo): boolean {
+  return !env.isProduction && env.status !== 'archiving'
+}
+
+/** Short type label rendered next to the environment name. */
+function environmentTypeLabel(env: EnvironmentInfo): string {
+  return t(`environment.type.${env.envType}`)
+}
+
+/**
+ * Repair is offered only where it can help: a drifted or failed environment is
+ * missing a resource the reconciler can rebuild. Healthy environments have
+ * nothing to repair, so the action stays out of the way.
+ */
+function canRepairEnvironment(env: EnvironmentInfo): boolean {
+  return ['drifted', 'failed'].includes(env.status)
+}
+
+/**
+ * Reconcile an environment: rebuild the branch or the virtual environment it is
+ * missing. Safe to invoke repeatedly — it only performs repairs that cost no
+ * data, and reports what it could not fix.
+ */
+async function repairEnvironment(env: EnvironmentInfo): Promise<void> {
+  if (pendingEnvironmentId.value) return
+
+  try {
+    const { driftCount, repairedCount } = await environmentStore.reconcileEnvironment(
+      env.environmentId
+    )
+    if (repairedCount > 0) {
+      MessagePlugin.success(t('environment.repairSucceeded', { count: repairedCount }))
+    } else if (driftCount > 0) {
+      // Detected but not fixable here (an unreachable warehouse, a commit drift
+      // that needs an apply): say so instead of implying success.
+      MessagePlugin.warning(t('environment.repairIncomplete', { count: driftCount }))
+    } else {
+      MessagePlugin.success(t('environment.repairNothingToDo'))
+    }
+  } catch (e) {
+    notifyError(e, t('environment.repairFailed'))
+  }
+}
 
 // Gateway selector state (list is owned by the gateway store).
 const gateways = computed(() => gatewayStore.gateways)
@@ -79,9 +138,6 @@ const isPingingGateway = computed(() => gatewayStore.pinging)
 // True once environments have been loaded at least once for the current
 // workspace. Environments load lazily (on opening the dropdown) so that
 // opening a workspace never connects to the gateway DB.
-const environmentsLoaded = ref(false)
-
-const currentEnvironment = computed(() => selectedEnvironment.value || defaultTargetEnvironment.value || 'dev')
 
 const changesLabel = computed(() => {
   if (isLoadingChanges.value) return t('toolbar.loading')
@@ -94,45 +150,30 @@ const changedModelsTooltip = computed(() => {
   return changedModels.value.join('\n')
 })
 
-function canDeleteEnvironment(name: string): boolean {
-  const isPinned = pinnedEnvironments.value.includes(name)
-  return name !== 'prod' && !isPinned
-}
-
+/**
+ * Load the workspace's environments from the platform registry.
+ *
+ * The registry — not the SQLMesh engine — is the source of truth: it is the same
+ * list for every member and it carries the lifecycle metadata (type, status,
+ * TTL, last applied commit) the engine does not know about.
+ */
 async function loadEnvironments(): Promise<void> {
-  const workspacePath = workspaceStore.currentWorkspace?.path
-  if (!workspacePath) {
-    environments.value = []
-    return
-  }
+  if (!workspaceStore.currentWorkspaceId) return
 
-  isLoadingEnvironments.value = true
   try {
-    const { data } = await api.get('/sqlmesh/environments', {
-      params: { workspace_path: workspacePath },
-    })
-
-    const envMap = (data?.environments || {}) as Record<string, SqlmeshEnvironment>
-    environments.value = Object.values(envMap)
-    pinnedEnvironments.value = data?.pinned_environments || []
-    defaultTargetEnvironment.value = data?.default_target_environment || 'dev'
-    environmentStore.setDefault(defaultTargetEnvironment.value)
-
-    const hasCurrent = environments.value.some((env) => env.name === selectedEnvironment.value)
-    if (!hasCurrent) {
-      selectedEnvironment.value = defaultTargetEnvironment.value || environments.value[0]?.name || 'dev'
+    await environmentStore.fetchEnvironments()
+  } catch (e: any) {
+    // Only a transport/infrastructure failure is a connectivity problem. An
+    // answered request that was refused (403 without the env:read permission,
+    // 404, a service error) must not be reported as "gateway unreachable" —
+    // that would send the user debugging the wrong layer.
+    const status = e?.response?.status
+    if (status === undefined) {
+      gatewayStore.connectionOk = false
+      gatewayStore.connectionError = extractApiMessage(e, 'Gateway connection failed')
+      return
     }
-    // Sync to shared store
-    environmentStore.setEnvironment(selectedEnvironment.value)
-    environmentsLoaded.value = true
-  } catch (e) {
-    // Gateway DB may have become unreachable between the ping and this call.
-    // Reflect it as a local connection hint instead of a global error dialog.
-    gatewayStore.connectionOk = false
-    gatewayStore.connectionError = extractApiMessage(e, 'Gateway connection failed')
-    environments.value = []
-  } finally {
-    isLoadingEnvironments.value = false
+    notifyError(e, t('environment.loadFailed'))
   }
 }
 
@@ -191,13 +232,38 @@ async function loadChangesGap(): Promise<void> {
     const models = extractChangedModels(data?.changes)
     changedModels.value = models
     changeCount.value = models.length
-  } catch {
+  } catch (e) {
     changeCount.value = null
     changedModels.value = []
+    // A mismatched state_schema blocks every plan/apply — surface it with the
+    // repair dialog instead of failing silently. Other probe failures stay
+    // quiet (ambient state, logged by the API interceptor) so a transient
+    // error cannot toast on every refresh.
+    const workspaceId = workspaceStore.currentWorkspace?.id ?? ''
+    if (
+      isStateSchemaMismatch(e) &&
+      workspaceId &&
+      mismatchPromptedWorkspaceId.value !== workspaceId
+    ) {
+      mismatchPromptedWorkspaceId.value = workspaceId
+      repairState.open(extractMismatchPayload(e))
+    }
   } finally {
     isLoadingChanges.value = false
   }
 }
+
+// After a successful repair the probe must refresh itself: the 409 it hit is
+// gone, and the change count it feeds (the toolbar badge) is stale.
+watch(
+  () => repairState.lastRepairedAt.value,
+  (repairedAt) => {
+    if (repairedAt > 0) {
+      mismatchPromptedWorkspaceId.value = ''
+      void loadChangesGap()
+    }
+  },
+)
 
 function toggleEnvironmentDropdown(): void {
   const willOpen = !showEnvDropdown.value
@@ -214,10 +280,35 @@ function toggleEnvironmentDropdown(): void {
   }
 }
 
-function selectEnvironment(environmentName: string): void {
-  selectedEnvironment.value = environmentName
-  environmentStore.setEnvironment(environmentName)
+/**
+ * Switch to another environment.
+ *
+ * This is not a local selection: it materializes that environment's Git
+ * worktree and makes it the active working copy, so the code on screen always
+ * matches the data being planned. Uncommitted work in the previous environment
+ * is untouched — each environment is its own directory.
+ */
+async function selectEnvironment(env: EnvironmentInfo): Promise<void> {
   showEnvDropdown.value = false
+  if (env.name === currentEnvironment.value) return
+  // An environment with no materializable branch (creating / failed /
+  // archiving) cannot be opened; say so instead of letting the backend 409.
+  if (!environmentStore.isOpenable(env)) {
+    notifyError(
+      null,
+      t('environment.notOpenable', {
+        name: env.name,
+        status: t(`environment.status.${env.status}`),
+      })
+    )
+    return
+  }
+
+  try {
+    await environmentStore.switchEnvironment(env.environmentId)
+  } catch (e) {
+    notifyError(e, t('environment.switchFailed'))
+  }
 }
 
 function toggleGatewayDropdown(): void {
@@ -248,28 +339,27 @@ async function selectGateway(gatewayName: string): Promise<void> {
   await loadChangesGap()
 }
 
+/**
+ * Create an environment through the registry: it provisions the Git branch, the
+ * worktree and the SQLMesh virtual environment as one unit. The caller is then
+ * switched to it, since creating a development line means intending to work in
+ * it.
+ */
 async function createEnvironment(): Promise<void> {
-  const workspacePath = workspaceStore.currentWorkspace?.path
   const envName = newEnvironmentName.value.trim()
-  if (!workspacePath || !envName || isCreatingEnvironment.value) return
+  if (!envName || isCreatingEnvironment.value) return
 
   isCreatingEnvironment.value = true
   try {
-    await api.post('/sqlmesh/apply', {
-      workspace_path: workspacePath,
-      environment: envName,
-      plan_options: {
-        create_from: currentEnvironment.value,
-        include_unmodified: true,
-        skip_backfill: true,
-        skip_tests: true,
-      },
+    const created = await environmentStore.createEnvironment({
+      name: envName,
+      baseEnv: currentEnvironment.value,
     })
-
     newEnvironmentName.value = ''
-    await loadEnvironments()
-    selectedEnvironment.value = envName
     showEnvDropdown.value = false
+    await environmentStore.switchEnvironment(created.environmentId)
+  } catch (e) {
+    notifyError(e, t('environment.createFailed'))
   } finally {
     isCreatingEnvironment.value = false
   }
@@ -289,21 +379,39 @@ async function refreshChanges(): Promise<void> {
   }
 }
 
-async function deleteEnvironment(environmentName: string): Promise<void> {
-  const workspacePath = workspaceStore.currentWorkspace?.path
-  if (!workspacePath || !canDeleteEnvironment(environmentName)) return
+/**
+ * Destroy an environment: releases its SQLMesh views, worktree and branch while
+ * keeping the audit trail. Irreversible, so it is confirmed first; the active
+ * environment must be left before it can be destroyed, because destroying the
+ * directory the user is working in would strand the UI on a dead path.
+ */
+async function destroyEnvironment(env: EnvironmentInfo): Promise<void> {
+  if (!canDestroyEnvironment(env) || pendingEnvironmentId.value) return
+  if (env.name === currentEnvironment.value) {
+    notifyError(null, t('environment.cannotDestroyCurrent'))
+    return
+  }
+  if (!window.confirm(t('environment.confirmDestroy', { name: env.name }))) return
 
-  deletingEnvironmentName.value = environmentName
   try {
-    await api.delete(`/sqlmesh/environments/${encodeURIComponent(environmentName)}`, {
-      params: {
-        workspace_path: workspacePath,
-      },
-    })
+    await environmentStore.destroyEnvironment(env.environmentId)
+    return
+  } catch (e: any) {
+    // The backend refuses (409) while the working copy holds uncommitted work,
+    // and reports how much would be lost. Discarding it must be an explicit
+    // second decision, never an automatic retry.
+    if (e?.response?.status !== 409) {
+      notifyError(e, t('environment.destroyFailed'))
+      return
+    }
+    const reason = extractApiMessage(e, t('environment.destroyFailed'))
+    if (!window.confirm(t('environment.confirmDestroyForce', { reason }))) return
+  }
 
-    await loadEnvironments()
-  } finally {
-    deletingEnvironmentName.value = null
+  try {
+    await environmentStore.destroyEnvironment(env.environmentId, true)
+  } catch (e) {
+    notifyError(e, t('environment.destroyFailed'))
   }
 }
 
@@ -320,9 +428,11 @@ watch(
   async () => {
     showEnvDropdown.value = false
     showGatewayDropdown.value = false
-    // Reset per-workspace state; reload only the gateway list (no DB).
-    environmentsLoaded.value = false
-    environments.value = []
+    // The path changes both on workspace switch and on environment switch, and
+    // both point at a different working copy: the gateway list comes from that
+    // copy's config.yaml, so it is re-read. The environment list is
+    // workspace-scoped and owned by the store, which the workspace lifecycle
+    // resets — clearing it here would drop it on every environment switch.
     changeCount.value = null
     changedModels.value = []
     gatewayStore.reset()
@@ -416,7 +526,7 @@ watch(currentEnvironment, async () => {
       </div>
 
       <div class="env-selector-wrap">
-        <button class="env-selector-btn" @click="toggleEnvironmentDropdown">
+        <button class="env-selector-btn" :disabled="isSwitchingEnvironment" @click="toggleEnvironmentDropdown">
           <span class="env-selector-label">{{ t('toolbar.environment') }}:</span>
           <span class="env-selector-value">{{ currentEnvironment }}</span>
           <t-icon name="chevron-down" size="12px" class="env-selector-arrow" />
@@ -429,27 +539,66 @@ watch(currentEnvironment, async () => {
 
           <div
             v-for="env in sortedEnvironments"
-            :key="env.name"
+            :key="env.environmentId"
             class="env-item"
             :class="{ active: env.name === currentEnvironment }"
           >
-            <button class="env-item-main" @click="selectEnvironment(env.name)">
+            <button
+              class="env-item-main"
+              :class="{ 'env-item-main--blocked': !environmentStore.isOpenable(env) }"
+              :title="
+                environmentStore.isOpenable(env)
+                  ? undefined
+                  : t('environment.notOpenable', {
+                      name: env.name,
+                      status: t(`environment.status.${env.status}`),
+                    })
+              "
+              @click="selectEnvironment(env)"
+            >
               <t-icon v-if="env.name === currentEnvironment" name="check" size="14px" class="env-item-check" />
-              <span class="env-item-name" :class="env.type">
+              <span class="env-item-name" :class="env.envType">
                 {{ env.name }}
-                <span class="env-item-type">({{ env.type ?? 'remote' }})</span>
+                <span class="env-item-type">({{ environmentTypeLabel(env) }})</span>
+                <span v-if="env.status !== 'active'" class="env-item-status">
+                  {{ t(`environment.status.${env.status}`) }}
+                </span>
+                <!-- The data was produced by code that is not in Git, so no
+                     commit describes it: a commit + re-apply clears this. -->
+                <span
+                  v-if="env.lastAppliedDirty"
+                  class="env-item-status"
+                  :title="t('environment.appliedDirtyHint')"
+                >
+                  {{ t('environment.appliedDirty') }}
+                </span>
               </span>
+            </button>
+            <!-- Repair is the only way out of `drifted`: the missing resource
+                 (branch or virtual environment) is invisible to the user. -->
+            <button
+              v-if="canRepairEnvironment(env)"
+              class="env-item-repair"
+              :disabled="pendingEnvironmentId === env.environmentId"
+              :title="t('environment.repairHint')"
+              @click="repairEnvironment(env)"
+            >
+              {{ t('environment.repair') }}
             </button>
             <button
               class="env-item-delete"
-              :disabled="!canDeleteEnvironment(env.name) || deletingEnvironmentName === env.name"
-              @click="deleteEnvironment(env.name)"
+              :disabled="!canDestroyEnvironment(env) || pendingEnvironmentId === env.environmentId"
+              :title="env.isProduction ? t('environment.productionProtected') : t('environment.destroy')"
+              @click="destroyEnvironment(env)"
             >
               {{ t('common.delete') }}
             </button>
           </div>
 
           <div v-if="isLoadingEnvironments" class="env-dropdown-loading">{{ t('toolbar.loading') }}</div>
+          <div v-else-if="environmentsLoaded && sortedEnvironments.length === 0" class="env-dropdown-loading">
+            {{ t('environment.empty') }}
+          </div>
 
           <div class="env-dropdown-create">
             <input
@@ -463,6 +612,7 @@ watch(currentEnvironment, async () => {
               {{ t('toolbar.add') }}
             </button>
           </div>
+          <div class="env-dropdown-hint">{{ t('environment.nameHint') }}</div>
         </div>
       </div>
 
@@ -504,6 +654,10 @@ watch(currentEnvironment, async () => {
       <slot name="right-extra" />
     </div>
   </header>
+
+  <!-- Shared STATE_SCHEMA_MISMATCH repair surface: opened by this toolbar's
+       change-count probe and by any other mismatch reporter. -->
+  <StateSchemaRepairDialog />
 </template>
 
 <style scoped>
@@ -699,10 +853,48 @@ watch(currentEnvironment, async () => {
   color: var(--text-muted);
 }
 
+/* Sandbox environments are personal and expire, so they read as secondary. */
+.env-item-name.sandbox {
+  color: var(--text-muted);
+}
+
 .env-item-type {
   font-size: 12px;
   color: var(--text-muted);
   margin-left: 4px;
+}
+
+/* Recovery action, only rendered for environments that need it. */
+.env-item-repair {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--warning-color, #e6a23c);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.env-item-repair:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* An environment with no materializable branch stays visible but inert. */
+.env-item-main--blocked {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Any status other than "active" needs attention (creating, drifted, failed). */
+.env-item-status {
+  font-size: 11px;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--warning-color, #e6a23c);
 }
 
 .env-item-delete {
@@ -732,6 +924,15 @@ watch(currentEnvironment, async () => {
   gap: 8px;
   padding: 10px;
   border-top: 1px solid var(--border);
+}
+
+/* Naming rules are stricter than a Git branch, so they are stated up-front
+   instead of surfacing as a validation error after submitting. */
+.env-dropdown-hint {
+  padding: 0 10px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
 }
 
 .env-input {

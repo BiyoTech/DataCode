@@ -21,7 +21,16 @@
 #   sqlmesh ontology list            → list all ontologies (GET /api/v1/ontology).
 #
 # All other read-only / local commands are transparently forwarded to the
-# native sqlmesh binary.
+# native sqlmesh binary. Before forwarding, the shim locates the SQLMesh
+# project directory ({workspace}/sql-warehouse/ under the platform layout)
+# and execs the native binary from there, because the shell tool places us
+# at the worktree root while native sqlmesh expects cwd inside the project.
+#
+#   sqlmesh run ...     → REJECTED. Data refresh is a write operation that
+#                          would bypass platform governance (environment
+#                          guardrail, lock, audit). Land data with plan/apply,
+#                          or trigger an orchestrated refresh with
+#                          `dc run <job_name>`.
 #
 # Designed to be invoked via a thin "sqlmesh" executable placed in PATH
 # before the real sqlmesh binary. The shell tool (shell.py) injects the
@@ -97,7 +106,22 @@ _resolve_workspace_path() {
         echo "${AGENTICDATA_WORKSPACE_PATH}"
         return
     fi
+    # Preferred: platform layout — walk up to the directory whose
+    # sql-warehouse/ sub-directory holds the SQLMesh config. This yields the
+    # WORKTREE ROOT expected by the backend's validate_workspace_path, even
+    # when cwd is deep inside the project.
     local d="$PWD"
+    while [[ "$d" != "/" ]]; do
+        if [[ -f "$d/sql-warehouse/config.yaml" ]]; then
+            echo "$d"
+            return
+        fi
+        d="$(dirname "$d")"
+    done
+    # Fallback: bare SQLMesh project — walk up to the directory that contains
+    # config.yaml itself (standalone projects without the dual-directory
+    # layout).
+    d="$PWD"
     while [[ "$d" != "/" ]]; do
         if [[ -f "$d/config.yaml" ]]; then
             echo "$d"
@@ -106,6 +130,26 @@ _resolve_workspace_path() {
         d="$(dirname "$d")"
     done
     echo ""
+}
+
+# -------------------------------------------------------------------
+# Resolve the directory the native sqlmesh binary should run from.
+#
+# Passthrough commands (test / audit / render / dag / evaluate) exec the
+# real sqlmesh binary, which needs cwd inside the project (where config.yaml
+# lives). Under the platform layout the project is {workspace}/sql-warehouse/
+# — one level below the worktree root where the shell tool places us — so
+# descend into it before exec'ing. Bare projects and project-less calls
+# (--version / --help) keep the current directory.
+# -------------------------------------------------------------------
+_resolve_sqlmesh_project_dir() {
+    local workspace_path
+    workspace_path=$(_resolve_workspace_path)
+    if [[ -n "$workspace_path" && -f "${workspace_path%/}/sql-warehouse/config.yaml" ]]; then
+        echo "${workspace_path%/}/sql-warehouse"
+        return
+    fi
+    echo "$PWD"
 }
 
 # -------------------------------------------------------------------
@@ -241,7 +285,6 @@ _export_api_env() {
     export _AD_FORWARD_ONLY="false"
     export _AD_NO_AUTO_CAT="false"
     export _AD_INCLUDE_UNMOD="false"
-    export _AD_CREATE_FROM=""
     local restate_list='['
     local prev=""
     for arg in "$@"; do
@@ -254,7 +297,6 @@ _export_api_env() {
             --include-unmodified)       export _AD_INCLUDE_UNMOD="true" ;;
         esac
         case "$prev" in
-            --create-from)   export _AD_CREATE_FROM="$arg" ;;
             --restate-model) restate_list+="\"$arg\"," ;;
         esac
         prev="$arg"
@@ -371,7 +413,6 @@ no_gaps        = os.environ.get('_AD_NO_GAPS', 'false') == 'true'
 forward_only   = os.environ.get('_AD_FORWARD_ONLY', 'false') == 'true'
 no_auto_cat    = os.environ.get('_AD_NO_AUTO_CAT', 'false') == 'true'
 include_unmod  = os.environ.get('_AD_INCLUDE_UNMOD', 'false') == 'true'
-create_from    = os.environ.get('_AD_CREATE_FROM', '')
 restate_raw    = os.environ.get('_AD_RESTATE_MODELS', '')
 auto_apply     = os.environ.get('_AD_AUTO_APPLY', 'false') == 'true'
 endpoint       = os.environ.get('_AD_ENDPOINT', '/api/v1/apply')
@@ -395,9 +436,6 @@ payload = {
 
 if auto_apply:
     payload['plan_options']['auto_apply'] = True
-
-if create_from:
-    payload['plan_options']['create_from'] = create_from
 
 if restate_raw:
     try:
@@ -967,6 +1005,26 @@ if [[ "$SUBCOMMAND" == "ontology" ]]; then
     exit $?
 fi
 
-# Default: passthrough to real sqlmesh
+# run → REJECTED. Data refresh is a write operation, and the native binary
+# ignores AGENTICDATA_ENVIRONMENT — it would bypass the environment
+# guardrail, the environment lock, and the audit trail.
+if [[ "$SUBCOMMAND" == "run" ]]; then
+    echo "[sqlmesh.sh] ERROR: 'sqlmesh run' is disabled on this platform." >&2
+    echo "[sqlmesh.sh] 'run' refreshes data. The native binary does not read" >&2
+    echo "[sqlmesh.sh] AGENTICDATA_ENVIRONMENT, so it would bypass the environment" >&2
+    echo "[sqlmesh.sh] guardrail, the environment lock, and auditing. Use instead:" >&2
+    echo "[sqlmesh.sh]   1) sqlmesh plan / sqlmesh apply <env>   # versioned data landing" >&2
+    echo "[sqlmesh.sh]   2) dc run <job_name>                    # orchestrated refresh via Dagster" >&2
+    exit 1
+fi
+
+# Default: passthrough to real sqlmesh, auto-located to the SQLMesh project
+# directory (the shell tool runs us from the worktree root, but native
+# sqlmesh requires cwd where config.yaml lives).
+_PROJECT_DIR=$(_resolve_sqlmesh_project_dir)
 echo "[sqlmesh.sh] Passthrough → native sqlmesh: sqlmesh $*" >&2
+if [[ "$_PROJECT_DIR" != "$PWD" ]]; then
+    echo "[sqlmesh.sh] Project directory → $_PROJECT_DIR" >&2
+    cd "$_PROJECT_DIR"
+fi
 exec "$REAL_SQLMESH" "$@"

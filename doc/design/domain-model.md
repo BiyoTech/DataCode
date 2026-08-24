@@ -141,6 +141,10 @@ erDiagram
     Workspace ||--o{ PlanApplyHistory : "审计"
     Workspace }o--|| GitCredential : "使用凭证"
 
+    Environment ||--|| GitBranch : "1:1 绑定"
+    Environment ||--|| Deployment : "1:1 绑定"
+    Environment ||--o{ EnvironmentEvent : "生命周期审计"
+
     Model ||--o{ Snapshot : "版本化"
     Model }o--o{ Model : "依赖(Lineage)"
     Model ||--o{ ColumnLineage : "列级依赖"
@@ -167,14 +171,30 @@ erDiagram
 
     Workspace {
         string workspace_id PK
-        string user_id FK
+        string tenant_id FK
+        string owner_user_id FK
         string name
-        string local_path
         string dialect
         string git_repo_url
-        string git_branch
+        string production_env
+        string default_env
         string status
         datetime last_active_at
+        datetime created_at
+    }
+
+    Environment {
+        string id PK
+        string workspace_id FK
+        string name
+        string branch
+        string env_type
+        string base_env
+        string owner_user_id
+        string status
+        string deployment_name
+        string last_applied_commit
+        datetime expires_at
         datetime created_at
     }
 
@@ -345,7 +365,7 @@ erDiagram
 | `AssetRunCompleted` | Dagster 运行完成（Data/ML/Feature/RAG 资产） | 前端（状态更新）、EventBus | SSE |
 | `OntologyValidated` | 本体验证完成 | 前端（展示错误）、sqlmesh-service（外部引用检查） | HTTP |
 | `GitOperationCompleted` | Git push/pull 完成 | ContextPool（失效 Context）、前端（状态更新） | HTTP |
-| `ErrorArchived` | 服务错误发生 | 错误归档到 `{workspace}/errors/` | 同步 |
+| `ErrorArchived` | 服务错误发生 | 错误归档到 `{workspace}/logs/errors/` | 同步 |
 | `KnowledgeDocumentUploaded` | 上传知识文档 | KnowledgeDocumentModel（元数据记录） | HTTP |
 | `AgentHandoff` | Triage Agent 路由到专业 Agent | 目标 Agent（加载上下文） | 内部 |
 | `ToolCallRequested` | Agent 请求执行工具 | Approval（审批检查）、Tool Registry（执行） | 内部 |
@@ -400,19 +420,24 @@ stateDiagram-v2
     Evicted --> [*]: 释放
 ```
 
-### 5.4 Code Location 状态机
+### 5.4 Deployment（Code Location）状态机
+
+一个 Deployment 对应一个环境（`{workspace_id}__{env}`），其载体是一个 Code Location gRPC 进程。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Ensuring: ensure_location()
+    [*] --> Ensuring: POST /deployments/ensure
     Ensuring --> Scaffolding: 首次/自愈
-    Scaffolding --> Starting: gRPC 服务器启动
-    Starting --> Ready: 健康检查通过
+    Scaffolding --> Starting: gRPC 服务器启动（注入 deployment 身份）
+    Starting --> Ready: 健康检查通过 + 写 workspace.yaml
     Ready --> Ready: 幂等调用 (不重启)
-    Ready --> Reloading: reload 请求
+    Ready --> Reloading: POST /deployments/reload（apply / promote / 用户刷新）
     Reloading --> Starting: 重启 gRPC
     Ready --> Stopped: 进程退出/关闭
-    Stopped --> Ensuring: 下次请求重新启动
+    Stopped --> Starting: supervisor 自动 respawn（窗口内次数受限）
+    Stopped --> Abandoned: 超出重启预算，上报待人工处理
+    Ready --> Destroyed: DELETE /deployments/{name}（环境销毁）
+    Destroyed --> [*]
 ```
 
 ---
@@ -504,7 +529,8 @@ stateDiagram-v2
 | **Agent Client Protocol** | ACP | 前端与 Agent Service 之间的标准化通信协议 |
 | **Handoff** | Handoff | openai-agents SDK 中 Agent 间的对话转交机制 |
 | **Triage Agent** | Triage Agent | 负责意图识别和路由的入口 Agent |
-| **错误归档** | Error Archive | 将服务错误持久化到 `{workspace}/errors/` 目录，供 Agent 消费 |
+| **错误归档** | Error Archive | 将服务错误持久化到 `{workspace}/logs/errors/` 目录，供 Agent 消费 |
+| **工作区日志** | Workspace Log | 可归因到工作区的服务日志，以 NDJSON 落到 `{workspace}/logs/service/`，级别为字段 |
 | **变更类别** | Change Category | Plan 中模型变更的分类：破坏性(Breaking) / 非破坏性(Non-breaking) |
 | **显示名** | Display Name | SQLMesh 模型的用户可读名称 `schema.table`，对应 Dagster asset key `sqlmesh__schema__table` |
 | **环境切换** | Environment Switching | 前端切换 SQLMesh 虚拟环境，驱动模型列表/血缘/资产图按环境刷新 |

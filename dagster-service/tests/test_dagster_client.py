@@ -173,6 +173,55 @@ async def test_launch_run_error_raises_graphql_error(local_client, monkeypatch):
         )
 
 
+async def test_launch_run_sends_deployment_tags_as_execution_metadata(
+    local_client, monkeypatch
+):
+    """Run tags are the only thing separating environments in a shared run store."""
+    captured: dict = {}
+
+    async def _fake(_query, variables=None):
+        captured.update(variables or {})
+        return {
+            "launchPipelineExecution": {
+                "__typename": "LaunchRunSuccess",
+                "run": {"runId": "r-2", "status": "STARTED"},
+            }
+        }
+
+    monkeypatch.setattr(local_client, "execute", _fake)
+    await local_client.launch_run(
+        repository_location_name="ws_t1_sales__dev_alice",
+        repository_name="__repository__",
+        job_name="my_job",
+        tags={"agenticdata/environment": "dev_alice"},
+    )
+
+    assert captured["executionParams"]["executionMetadata"]["tags"] == [
+        {"key": "agenticdata/environment", "value": "dev_alice"}
+    ]
+
+
+async def test_launch_run_omits_execution_metadata_without_tags(local_client, monkeypatch):
+    captured: dict = {}
+
+    async def _fake(_query, variables=None):
+        captured.update(variables or {})
+        return {
+            "launchPipelineExecution": {
+                "__typename": "LaunchRunSuccess",
+                "run": {"runId": "r-3", "status": "STARTED"},
+            }
+        }
+
+    monkeypatch.setattr(local_client, "execute", _fake)
+    await local_client.launch_run(
+        repository_location_name="ws_demo",
+        repository_name="__repository__",
+        job_name="my_job",
+    )
+    assert "executionMetadata" not in captured["executionParams"]
+
+
 async def test_get_run_status_parses_run(local_client, monkeypatch):
     _stub_execute(
         monkeypatch,

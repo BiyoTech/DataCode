@@ -19,6 +19,10 @@ func RequestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 			if traceID == "" {
 				traceID = uuid.New().String()
 			}
+			// Put it back on the request so the proxy layer forwards it: one
+			// user action spans several services, and the trace id is what
+			// stitches their logs back into a single story.
+			r.Header.Set("X-Trace-ID", traceID)
 
 			// Wrap response writer to capture status code
 			ww := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}

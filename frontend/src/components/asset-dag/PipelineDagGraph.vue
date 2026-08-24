@@ -174,11 +174,11 @@ function toggleLock() {
   }
 }
 
-/** Reload the Code Location (picks up user edits under asset-dag/). */
+/** Reload this environment's deployment (picks up user edits under asset-dag/). */
 async function reload() {
   if (!props.workspacePath || reloading.value) return
   reloading.value = true
-  await dagster.reloadCodeLocation(props.workspacePath).catch(() => {})
+  await dagster.reloadDeployment(props.workspacePath).catch(() => {})
   reloading.value = false
 }
 

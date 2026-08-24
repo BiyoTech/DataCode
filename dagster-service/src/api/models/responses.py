@@ -25,6 +25,10 @@ class ProcessStatus(BaseModel):
     pid: Optional[int] = None
     alive: bool
     uptime_seconds: Optional[float] = None
+    # Supervision state: how often the supervisor respawned this process inside
+    # the current window, and whether it gave up on it.
+    restart_count: int = 0
+    abandoned: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -78,11 +82,52 @@ class ScheduleInfo(BaseModel):
     status: Optional[str] = None
 
 
-class CodeLocationInfo(BaseModel):
+class DeploymentInfo(BaseModel):
+    """One environment's Dagster deployment and the state of its code location.
+
+    ``location_name`` equals ``deployment_name``: the deployment IS the code
+    location, exposed under both names so callers can speak either vocabulary.
+    """
+
+    deployment_name: str
     location_name: str
+    workspace_path: str
+    tenant_id: str
+    workspace_id: str
+    environment: str
+    env_type: str
+    schedules_enabled: bool
     host: str
     port: int
     definitions: Optional[str] = None
+    alive: bool = False
+
+
+class DeploymentAssetDiff(BaseModel):
+    """Asset-key level difference between two deployments."""
+
+    added: list[str] = []
+    changed: list[str] = []
+    removed: list[str] = []
+
+
+class DeploymentScheduleChange(BaseModel):
+    """One schedule that differs between two deployments."""
+
+    name: str
+    change: str  # added | removed | modified
+    cron: str = ""
+    base_cron: str = ""
+    job: str = ""
+
+
+class DeploymentDiff(BaseModel):
+    """Orchestration-graph difference between a deployment and its base."""
+
+    deployment: str
+    base: str
+    assets: DeploymentAssetDiff
+    schedule_changes: list[DeploymentScheduleChange] = []
 
 
 class OperationResult(BaseModel):

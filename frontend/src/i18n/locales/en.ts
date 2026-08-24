@@ -169,8 +169,8 @@ export default {
     notOpenable: 'This workspace cannot be opened',
     contactOwnerToPush:
       'Contact the workspace owner to push the workspace code to Git first.',
-    branchLabel: 'Branch',
-    selectBranch: 'Select a branch to open',
+    environmentLabel: 'Environment',
+    selectEnvironment: 'Select an environment to open',
     members: 'Members',
     addMember: 'Add',
     removeMember: 'Remove',
@@ -179,6 +179,27 @@ export default {
     roleEngineer: 'Engineer',
     roleAnalyst: 'Analyst',
     roleViewer: 'Viewer',
+  },
+  logs: {
+    level: {
+      debug: 'Debug',
+      info: 'Info',
+      warning: 'Warn',
+      error: 'Error',
+      critical: 'Critical',
+    },
+    searchPlaceholder: 'Filter log lines...',
+    live: 'Live',
+    paused: 'Paused',
+    offline: 'Offline',
+    pause: 'Pause / resume following',
+    refresh: 'Reload the newest entries',
+    clear: 'Clear the view',
+    loading: 'Loading logs...',
+    loadOlder: 'Load older entries',
+    empty: 'No log entries yet',
+    noWorkspace: 'Open a workspace to see its logs',
+    forbidden: 'You do not have permission to read this workspace\'s logs',
   },
   common: {
     appName: 'AgenticData',
@@ -611,6 +632,25 @@ export default {
     state_done: 'Done',
     state_error: 'Error',
     idleHint: 'Click "Run Plan" to analyze workspace changes and preview before deployment.',
+    // SQLMesh state-schema mismatch: structured error + one-click repair
+    stateSchema: {
+      title: 'SQLMesh state schema mismatch',
+      reason:
+        'config.yaml declares state_schema "{actual}" for gateway "{gateway}", but this ' +
+        'workspace\'s SQLMesh state must live in "{expected}" — every plan and apply is ' +
+        'rejected until it is fixed.',
+      hint: 'This value is platform-managed; do not edit it in config.yaml manually.',
+      manualHint:
+        'You can also fix it manually: edit config.yaml and set the gateway\'s ' +
+        'state_schema to "{expected}", or remove the key and let the platform regenerate it.',
+      repairAction: 'Auto-fix and retry',
+      repairing: 'Repairing...',
+      repairSuccess: 'state_schema corrected to {schema}',
+      repairFailed: 'Repair failed',
+      fieldGateway: 'Gateway',
+      fieldActual: 'Declared',
+      fieldExpected: 'Expected',
+    },
     // Date range
     startDate: 'Start Date (UTC)',
     endDate: 'End Date (UTC)',
@@ -653,6 +693,9 @@ export default {
     // Tabs
     tabPlan: 'Plan',
     tabHistory: 'History',
+    // Top-level page tabs (PlanView container)
+    tabSqlWarehouse: 'SQL Warehouse',
+    tabAssetDag: 'Asset DAG',
     // History
     historyEmpty: 'No apply history yet. Deployments will appear here.',
     historyStatusApplied: 'Applied',
@@ -674,6 +717,46 @@ export default {
     categoryIndirectNonBreaking: 'Indirect non-breaking',
     categoryMetadata: 'Metadata',
   },
+  // Dagster deployment panel (Plan & Apply page, asset-dag tab). Owns step 2 of
+  // promoting code: making merged code live. Step 1 is the Git panel's merge.
+  deploy: {
+    currentTitle: 'Current Deployment',
+    fieldLocation: 'Code Location',
+    schedulesOn: 'Schedules On',
+    schedulesOff: 'Schedules Off',
+    alive: 'Running',
+    down: 'Stopped',
+    reload: 'Reload only',
+    reloading: 'Working...',
+    reloadSuccess: 'Code location reloaded.',
+    pullReload: 'Pull & Reload',
+    pullReloadSuccess: 'Latest code pulled and code location reloaded.',
+    pullReloadFailed: 'Failed to pull the latest code.',
+    pullReloadConflicted:
+      'The pull left {count} conflicted file(s) in the working copy. Resolve them ' +
+      'in the editor and commit, then reload — the code location was NOT reloaded.',
+    behindRemote:
+      'The remote has {count} commit(s) this environment has not pulled yet — ' +
+      'typically a merge waiting to go live. Use Pull & Reload, then apply the plan.',
+    openGraph: 'Open Asset Graph',
+    refresh: 'Refresh',
+    diffTitle: 'Compare Deployments',
+    diffTarget: 'Deployment',
+    diffBase: 'Base',
+    diffAction: 'Compare',
+    diffRunning: 'Comparing...',
+    diffNoChanges: 'No asset or schedule definition differences.',
+    diffAssetsAdded: 'Added assets',
+    diffAssetsChanged: 'Changed assets',
+    diffAssetsRemoved: 'Removed assets',
+    diffSchedules: 'Schedule changes',
+    schedule_added: 'added',
+    schedule_removed: 'removed',
+    schedule_modified: 'modified',
+    allTitle: 'Workspace Deployments',
+    empty: 'No deployments are running for this workspace yet.',
+    noWorkspace: 'Select a workspace to view its deployment.',
+  },
   toolbar: {
     environment: 'Environment',
     environmentList: 'Virtual Environments',
@@ -690,6 +773,53 @@ export default {
     na: 'N/A',
     noChangedModels: 'No changed models',
   },
+  // Environments: the platform's development lines (branch + SQLMesh env +
+  // deployment). Switching one changes both the code on disk and the data views.
+  environment: {
+    type: {
+      production: 'production',
+      shared: 'shared',
+      sandbox: 'sandbox',
+    },
+    status: {
+      creating: 'creating',
+      active: 'active',
+      applying: 'applying',
+      promoting: 'promoting',
+      drifted: 'drifted',
+      archiving: 'archiving',
+      archived: 'archived',
+      failed: 'failed',
+    },
+    empty: 'No environments yet',
+    destroy: 'Destroy this environment',
+    productionProtected: 'The production environment cannot be destroyed',
+    nameHint:
+      'Lowercase letters, digits and underscores only. Creates the branch env/{name}.',
+    switchFailed: 'Failed to switch environment',
+    createFailed: 'Failed to create environment',
+    destroyFailed: 'Failed to destroy environment',
+    loadFailed: 'Failed to load environments',
+    notOpenable:
+      'Environment "{name}" is {status} and has no working copy to open yet.',
+    repair: 'Repair',
+    repairHint:
+      'Rebuild what this environment is missing (its branch or its data views). Safe to repeat and costs no data.',
+    repairSucceeded: 'Repaired {count} issue(s).',
+    repairIncomplete:
+      'Found {count} issue(s) that cannot be repaired automatically — check the environment timeline.',
+    repairNothingToDo: 'Nothing to repair: this environment is consistent.',
+    repairFailed: 'Failed to repair environment',
+    appliedDirty: 'uncommitted',
+    appliedDirtyHint:
+      'The current data was applied from uncommitted code, so no commit describes it. Commit and apply again to make code and data match.',
+    cannotDestroyCurrent:
+      'Switch to another environment before destroying this one.',
+    confirmDestroy:
+      'Destroy environment "{name}"? Its branch, working copy and data views are released. This cannot be undone.',
+    confirmDestroyForce:
+      '{reason}\n\nDiscard those changes and destroy the environment anyway?',
+  },
   git: {
     sourceControl: 'Source Control',
     commit: 'Commit',
@@ -704,7 +834,6 @@ export default {
     stagedChanges: 'Staged Changes',
     changes: 'Changes',
     noChanges: 'No changes detected. Working tree is clean.',
-    newBranchPlaceholder: 'Create new branch...',
     publish: 'Publish',
     publishDescription: 'Create a remote repository and push your code.',
     repoName: 'Repository Name',
@@ -738,18 +867,19 @@ export default {
     // Branch operations (bottom Git panel)
     fetch: 'Fetch',
     fetchFailed: 'Fetch failed',
-    checkoutFailed: 'Checkout failed',
-    deleteBranchFailed: 'Failed to delete branch',
     resetFailed: 'Reset failed',
     localBranches: 'Local',
     remoteBranches: 'Remote',
-    switchBranch: 'Switch to this branch',
     pushBranch: 'Push this branch to remote',
     pullCurrent: 'Pull into the current branch',
     pushCurrent: 'Push the current branch',
-    deleteBranch: 'Delete this branch',
-    checkoutRemote: 'Check out locally (tracks remote)',
-    alreadyLocal: 'Already available locally',
+    // Branch <-> environment relationship (branches are read-only here)
+    branchOfEnvironment: 'Backs environment "{environment}"',
+    unmanaged: 'external',
+    unmanagedBranch:
+      'Outside the platform: read-only until adopted as an environment',
+    branchesManagedByEnvironment:
+      'Branches follow environments: create, switch and delete them in the environment selector.',
     workingTree: 'Working Tree',
     noUncommitted: 'No uncommitted changes',
     uncommittedCount: '{count} uncommitted',
@@ -762,10 +892,45 @@ export default {
     resetHardWarning:
       'Hard reset permanently discards every uncommitted change in this working copy.',
     confirmReset: 'Reset',
-    confirmDeleteBranch: 'Delete branch "{branch}"?',
-    forceDeleteBranchHint:
-      'Git refuses to delete a branch with unmerged commits. Force delete drops those commits.',
-    forceDelete: 'Force delete',
+    // Branch merge — step 1 of promoting code between environments. Step 2
+    // (plan & apply + code-location reload) happens on the Plan & Apply page.
+    mergeInto: 'Merge this branch into another environment',
+    mergeTitle: 'Merge environment branches',
+    mergeSource: 'From',
+    mergeTarget: 'Into',
+    mergeSummary: '{commits} commit(s), {files} file(s) would be merged.',
+    mergeUpToDate: '{target} already contains every commit of {source}.',
+    mergeMessage: 'Merge message',
+    mergeMessagePlaceholder: "Merge branch '{source}' into '{target}'",
+    mergeRemoteStale:
+      'Remote branches could not be refreshed, so this preview may be out of date.',
+    mergeUnpushed:
+      '{count} commit(s) on the source branch are not pushed yet and would NOT be merged. Push them first.',
+    mergeConflictWarning:
+      '{count} file(s) conflict. Sync the target branch into this environment, resolve them, commit, then merge again.',
+    mergeNextStepHint:
+      'A merge lands code only. Switch to the target environment afterwards to apply the plan and reload its code location.',
+    confirmMerge: 'Merge',
+    merging: 'Merging...',
+    mergeFailed: 'Merge failed',
+    mergePreviewFailed: 'Failed to compare branches',
+    resolveViaSync: 'Resolve conflicts',
+    conflictTag: 'conflict',
+    conflictsTitle: '{count} conflicted file(s)',
+    conflictsHint:
+      'Resolve them in the editor, stage the files, then commit to complete the merge.',
+    // Sync — merges a base branch INTO this working copy, which is where a
+    // conflict is resolved (editor + staging, no separate merge tool).
+    syncWithBase: 'Sync with another branch',
+    syncTitle: 'Sync with another branch',
+    syncDescription:
+      "Merges the selected branch into '{branch}'. Conflicts are left in the working tree for you to resolve in the editor.",
+    syncBase: 'Merge from',
+    syncDirtyWarning:
+      'Commit or discard the uncommitted changes in this working copy first.',
+    confirmSync: 'Sync',
+    syncing: 'Syncing...',
+    syncFailed: 'Sync failed',
     // File-tree decorations (editor-style Git colouring)
     decoration: {
       untracked: 'Untracked',

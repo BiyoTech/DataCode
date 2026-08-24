@@ -81,7 +81,8 @@ def test_gateway_list_includes_dialect() -> None:
     ctx = _FakeContext(config, _FakeAdapter("postgres"))
 
     service = ExternalModelsService()
-    result = service._list_gateways_sync(ctx)
+    # The gateway listing works on the parsed Config, not the Context.
+    result = service._list_gateways_sync(config)
 
     assert len(result) == 2
     by_name = {g["name"]: g for g in result}
@@ -99,7 +100,7 @@ def test_gateway_list_dialect_lowercase() -> None:
     )
     ctx = _FakeContext(config, _FakeAdapter("postgres"))
     service = ExternalModelsService()
-    result = service._list_gateways_sync(ctx)
+    result = service._list_gateways_sync(config)
     assert result[0]["dialect"] == "postgres"
 
 
@@ -111,7 +112,7 @@ def test_gateway_list_empty_dialect_when_no_connection() -> None:
     )
     ctx = _FakeContext(config, _FakeAdapter(""))
     service = ExternalModelsService()
-    result = service._list_gateways_sync(ctx)
+    result = service._list_gateways_sync(config)
     assert result[0]["dialect"] == ""
 
 

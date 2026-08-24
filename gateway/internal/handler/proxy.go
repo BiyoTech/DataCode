@@ -46,6 +46,10 @@ var sseClient = &http.Client{
 // forwardedHeaders are the identity and capability headers produced by the
 // gateway middleware chain. They are the only authorization input downstream
 // services are allowed to trust, so they must accompany every proxied request.
+//
+// X-Trace-ID is not an authorization input: it is set by RequestLogger and
+// carried along so a downstream log line can be correlated with the gateway
+// access log for the same request.
 var forwardedHeaders = []string{
 	"X-User-ID",
 	"X-Tenant-ID",
@@ -54,6 +58,7 @@ var forwardedHeaders = []string{
 	"X-Workspace-ID",
 	"X-Workspace-Role",
 	"X-Granted-Permissions",
+	"X-Trace-ID",
 }
 
 // forwardIdentity copies the gateway-controlled identity and capability headers

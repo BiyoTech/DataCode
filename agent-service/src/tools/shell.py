@@ -161,11 +161,12 @@ class ShellRuntimeBootstrap:
     def build_command_env(self) -> dict[str, str]:
         """Build one environment that prefers the agent-local virtual environment.
 
-        Prepend the sqlmesh CLI shim directory to PATH so that agent shell
-        commands (e.g. sqlmesh plan dev --auto-apply) hit the wrapper first.
-        The wrapper intercepts write operations and redirects them to the
-        sqlmesh-service backend API, while read-only commands are passed
-        through to the native sqlmesh binary.
+        Prepend the CLI shim directory to PATH so that agent shell commands
+        hit the wrappers first: the sqlmesh wrapper intercepts write
+        operations and redirects them to the sqlmesh-service backend API
+        (read-only commands pass through to the native binary), and the dc
+        wrapper routes platform-domain commands (assets / deployment / run)
+        to the dagster-service backend API.
         """
         env = os.environ.copy()
         shim_dir = self._resolve_shim_dir()
@@ -194,6 +195,14 @@ class ShellRuntimeBootstrap:
         except Exception:
             # Fallback to default if settings not available (e.g. tests)
             env["AGENTICDATA_SQLMESH_SERVICE_URL"] = "http://localhost:8002"
+
+        # Dagster service URL for the dc platform CLI shim (assets /
+        # deployment / run commands). Same fallback pattern as above.
+        try:
+            from src.config import settings
+            env["AGENTICDATA_DAGSTER_SERVICE_URL"] = settings.dagster_service_url
+        except Exception:
+            env["AGENTICDATA_DAGSTER_SERVICE_URL"] = "http://localhost:8004"
 
         logger.debug("sqlmesh_shim_injected: shim_dir=%s agent_path=%s user_id=%s", shim_dir, self.agent_path, self._user_id)
         return env

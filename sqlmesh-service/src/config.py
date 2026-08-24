@@ -54,13 +54,33 @@ class Settings(BaseSettings):
     # Security
     token_encryption_secret: str = ""  # MUST be set in production (env-only)
 
-    # Concurrency
+    # Concurrency.
+    # The environment lock is deliberately NOT time-bounded: a backfill may
+    # legitimately run for hours, and preempting it would allow two concurrent
+    # writers on the shared SQLMesh state. It is released when its owning task
+    # dies instead (see src.core.env_locks).
     workspace_write_lock_ttl: int = 600
-    environment_lock_ttl: int = 900
+
+    # Environments (platform registry). Each environment costs a Git branch, a
+    # SQLMesh virtual environment and a Dagster deployment, so the live count
+    # per workspace is capped and sandboxes always expire.
+    max_environments_per_workspace: int = 20
+    sandbox_default_ttl_hours: int = 168  # 7 days
+    # Reclamation of expired sandboxes. Expiry does not destroy immediately: a
+    # warning event is recorded first and the environment survives the grace
+    # period, so an owner who is still using it can extend or commit their work.
+    environment_reaper_enabled: bool = True
+    environment_reaper_interval: int = 3600  # hourly scan
+    sandbox_expiry_grace_hours: int = 24
 
     # Task (async operations)
     task_timeout_seconds: int = 600
     task_ttl_seconds: int = 3600
+
+    # Dagster deployment linkage (create/destroy orchestration + reconcile).
+    # Generous by HTTP standards because ensure may spawn a code location
+    # subprocess and import the user's asset-dag code before answering.
+    dagster_request_timeout: float = 60.0
 
     # Error archive — persist actionable service errors to {workspace}/errors/
     # as JSON files for agent consumption and user diagnostics.
@@ -161,6 +181,20 @@ class Settings(BaseSettings):
             return env_val
         return self.platform.workspace_base_path
 
+    # ── Dagster service (from platform) ────────────────────────────────
+
+    @property
+    def dagster_service_url(self) -> str:
+        """Dagster service URL from platform topology (env override wins).
+
+        Direct service-to-service HTTP for deployment linkage and reconcile —
+        no gateway hop, mirroring how dagster-service reaches this service.
+        """
+        env_val = os.getenv("SQLMESH_SERVICE_DAGSTER_SERVICE_URL")
+        if env_val:
+            return env_val
+        return self.platform.services.url("dagster", "rest_url")
+
     # ── Logging (from platform) ────────────────────────────────────────
 
     @property
@@ -189,9 +223,14 @@ def _flatten_yaml(data: dict) -> dict:
         "sqlmesh.query_max_row_limit": "query_max_row_limit",
         "sqlmesh.query_default_row_limit": "query_default_row_limit",
         "concurrency.workspace_write_lock_ttl": "workspace_write_lock_ttl",
-        "concurrency.environment_lock_ttl": "environment_lock_ttl",
+        "environments.max_per_workspace": "max_environments_per_workspace",
+        "environments.sandbox_default_ttl_hours": "sandbox_default_ttl_hours",
+        "environments.reaper_enabled": "environment_reaper_enabled",
+        "environments.reaper_interval": "environment_reaper_interval",
+        "environments.sandbox_expiry_grace_hours": "sandbox_expiry_grace_hours",
         "task.timeout_seconds": "task_timeout_seconds",
         "task.ttl_seconds": "task_ttl_seconds",
+        "dagster.request_timeout": "dagster_request_timeout",
         "error_archive.enabled": "error_archive_enabled",
         "error_archive.retention": "error_archive_retention",
         "error_archive.max_sql_len": "error_archive_max_sql_len",

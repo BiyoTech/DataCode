@@ -152,16 +152,34 @@ async def lifespan(app: FastAPI):
         pool.start_periodic_cleanup(settings.context_pool_cleanup_interval)
     )
 
+    # Start sandbox reclamation. Expired sandboxes hold a branch, warehouse
+    # schemas and a quota slot, so without this loop resource usage only ever
+    # grows and the per-workspace limit eventually blocks active members.
+    background_tasks = [cleanup_task]
+    if settings.environment_reaper_enabled:
+        from src.environments.reaper import get_environment_reaper
+
+        background_tasks.append(
+            asyncio.create_task(
+                get_environment_reaper().start_periodic(
+                    settings.environment_reaper_interval
+                )
+            )
+        )
+
     logger.info(
         "sqlmesh_service_started",
         rest_port=settings.rest_port,
         context_pool_max_size=settings.context_pool_max_size,
+        environment_reaper_enabled=settings.environment_reaper_enabled,
     )
 
     yield
 
     # Shutdown
-    cleanup_task.cancel()
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
     await pool.shutdown()
     try:
         from src.workspace.database import close_db
@@ -179,15 +197,31 @@ app = FastAPI(
 )
 _register_exception_handlers(app)
 
+from src.api.middleware import LogContextMiddleware  # noqa: E402
+
+app.add_middleware(LogContextMiddleware)
+
 # Register REST route modules
-from src.api.rest import events, files, git, knowledge, meta, sqlmesh, workspace  # noqa: E402
+from src.api.rest import (  # noqa: E402
+    environments,
+    events,
+    files,
+    git,
+    knowledge,
+    logs,
+    meta,
+    sqlmesh,
+    workspace,
+)
 
 app.include_router(sqlmesh.router)
+app.include_router(environments.router)
 app.include_router(workspace.router)
 app.include_router(git.router)
 app.include_router(files.router)
 app.include_router(knowledge.router)
 app.include_router(events.router)
+app.include_router(logs.router)
 app.include_router(meta.router)
 
 

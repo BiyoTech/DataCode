@@ -9,6 +9,11 @@ from src.config import settings
 from src.workspace.database import _build_database_url
 from src.workspace.models import Base
 
+# Importing the model modules is what populates ``Base.metadata`` used for
+# autogenerate. The environment registry lives outside src.workspace, so it has
+# to be imported explicitly.
+from src.environments import models as environment_models  # noqa: F401,E402
+
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -18,10 +23,14 @@ target_metadata = Base.metadata
 
 def get_url() -> str:
     url = _build_database_url()
+    # Alembic migrates over a SYNC connection while the service itself runs
+    # async: swap the async drivers for their sync counterparts. MySQL maps to
+    # pymysql (the driver aiomysql is built on) because the default ``mysql://``
+    # scheme would require the mysqlclient C extension.
     return (
         url.replace("+aiosqlite", "")
-        .replace("+asyncpg", "")
-        .replace("+aiomysql", "")
+        .replace("+asyncpg", "+psycopg2")
+        .replace("+aiomysql", "+pymysql")
     )
 
 

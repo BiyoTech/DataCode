@@ -390,13 +390,13 @@ workspace_members
 
 **打开与 openable 语义**
 
-- `POST /api/v1/workspaces/{id}/open`：首次 clone、之后 `fetch + checkout`，可指定远程分支，落到调用者自己的目录。
+- `POST /api/v1/workspaces/{id}/open`：body 携带 `environment`（不再是 `branch`）。首次为该用户建立共享的裸仓库 `.repo`，之后为目标环境按需追加一个 Git worktree，落到调用者自己的目录 `{tenant}/{ws}/{user}/envs/{env}`。省略 `environment` 时采用 workspace 的 `default_env`。切换环境不做 `checkout`，因此不会被未提交改动阻塞，多个环境可并行持有。
 - `openable = bool(git_repo_url) or (role == owner and 本地副本已存在)`。后半段仅覆盖 Owner "已 scaffold、尚未绑定 Git"的引导期，其他成员一律置灰并提示联系 Owner 推送代码。该值由**后端计算**，前端不得自行从 `git_repo_url` 推导。
 - `git_repo_url` 在创建/绑定时统一做 SSRF 校验：仅允许 `https` / `ssh`（含 `git@host:org/repo.git`），拒绝 loopback、link-local、私有网段及 `9./10./11./21./30.` 段。
 
 ### 5.2 遗留缺口
 
-`POST` body 中的 `workspace_path` 目前只做**容器 + 布局**校验，未与调用者身份做密码学绑定。Gateway 已对以 query 参数携带 `workspace_path` 的 ValidatedRoutes 追加"末段用户目录必须等于已认证 user_id"的纵深校验（不符返回 403），但 body 路径的完整身份绑定依赖 §3 内部令牌阶段落地，本期显式记为遗留缺口。
+`POST` body 中的 `workspace_path` 目前只做**容器 + 布局**校验，未与调用者身份做密码学绑定。Gateway 已对以 query 参数携带 `workspace_path` 的 ValidatedRoutes 追加"路径中的用户目录必须等于已认证 user_id"的纵深校验（`rbac.OwnsWorkingCopy`，按 `{tenant}/{ws}/{user}/envs/{env}` 布局取第三段，不符返回 403），但 body 路径的完整身份绑定依赖 §3 内部令牌阶段落地，本期显式记为遗留缺口。
 
 ---
 

@@ -1,11 +1,14 @@
 /**
- * Dagster store — manages Asset Dag state for the active workspace.
+ * Dagster store — manages Asset Dag state for the active environment.
  *
  * Responsibilities:
  * - Fetch the deployment mode (local/remote) + subprocess health.
- * - Ensure the workspace Code Location gRPC server is running, then load the
- *   asset dependency graph for DAG rendering.
+ * - Ensure the environment's Dagster deployment (its Code Location) is running,
+ *   then load the asset dependency graph for DAG rendering.
  * - List/trigger runs and poll their status; list schedules.
+ *
+ * A deployment is per-environment: the working copy path identifies both the
+ * workspace and the environment, so switching environment switches deployment.
  *
  * All data flows through the Gateway (`/api/v1/dagster/*`). Timestamps returned
  * by the API are UTC epoch seconds; components convert them for display.
@@ -18,7 +21,8 @@ import { useEnvironmentStore } from './environment'
 import type {
   AssetDagGraph,
   AssetInfo,
-  CodeLocationInfo,
+  DeploymentDiff,
+  DeploymentInfo,
   ModeInfo,
   RunInfo,
   RunLogEvent,
@@ -73,6 +77,9 @@ export const useDagsterStore = defineStore('dagster', () => {
   const runs = ref<RunInfo[]>([])
   const runLogs = ref<Record<string, RunLogEvent[]>>({})
   const schedules = ref<ScheduleInfo[]>([])
+  // Deployment backing the loaded graph. Carries the environment, its type and
+  // whether its schedules may run, which is what the DAG/schedule views display.
+  const deployment = ref<DeploymentInfo | null>(null)
 
   const graphLoading = ref(false)
   // Loading / error state for the selected asset's lineage subgraph.
@@ -139,13 +146,30 @@ export const useDagsterStore = defineStore('dagster', () => {
   }
 
   /**
-   * Ensure the workspace Code Location is running, then load the full asset
-   * inventory (left list + native subgraph source). The canvas stays empty
+   * Ensure the environment's Dagster deployment (its Code Location) is running
+   * and refresh ``deployment`` state. Never throws: a failure is logged and the
+   * previous deployment info is kept, so callers can always proceed.
+   */
+  async function ensureDeployment(workspacePath: string): Promise<void> {
+    if (!workspacePath) return
+    try {
+      const { data } = await api.post<DeploymentInfo>('/dagster/deployments/ensure', {
+        workspace_path: workspacePath,
+      })
+      deployment.value = data
+    } catch (e) {
+      console.warn('[dagster] ensure deployment failed:', e)
+    }
+  }
+
+  /**
+   * Ensure the environment's Dagster deployment is running, then load the full
+   * asset inventory (left list + native subgraph source). The canvas stays empty
    * until the user selects an asset.
    *
    * Cached per (workspace path, environment); pass force=true to bypass the
-   * cache (e.g. after a Code Location reload). The graph is scoped to the
-   * selected SQLMesh virtual environment so switching environments re-fetches.
+   * cache (e.g. after a deployment reload). Each environment has its own
+   * deployment loading its own branch, so switching environments re-fetches.
    */
   async function loadGraph(workspacePath: string, force = false): Promise<void> {
     if (!workspacePath) return
@@ -158,14 +182,10 @@ export const useDagsterStore = defineStore('dagster', () => {
     graphLoading.value = true
     errorMsg.value = ''
     try {
-      // The gRPC Code Location must exist before the graph can resolve.
-      await api
-        .post('/dagster/pipelines/code-location/ensure', { workspace_path: workspacePath })
-        .catch((e) => {
-          // Log but continue — the graph query may still return instance-wide
-          // assets even if this workspace has no assets yet.
-          console.warn('[dagster] ensure code-location failed:', e)
-        })
+      // The deployment's Code Location must exist before the graph can resolve.
+      // Log but continue on failure — the graph query may still return assets
+      // from a previously loaded deployment.
+      await ensureDeployment(workspacePath)
 
       const { data } = await api.get<AssetDagGraph>('/dagster/assets/graph', {
         params: { workspace_path: workspacePath, environment },
@@ -181,9 +201,12 @@ export const useDagsterStore = defineStore('dagster', () => {
     }
   }
 
-  /** Reload the workspace Code Location (after user edits asset-dag/ code). */
-  async function reloadCodeLocation(workspacePath: string): Promise<void> {
-    await api.post('/dagster/pipelines/code-location/reload', { workspace_path: workspacePath })
+  /** Reload the environment's deployment (after user edits asset-dag/ code). */
+  async function reloadDeployment(workspacePath: string): Promise<void> {
+    const { data } = await api.post<DeploymentInfo>('/dagster/deployments/reload', {
+      workspace_path: workspacePath,
+    })
+    deployment.value = data
     await loadGraph(workspacePath, true)
   }
 
@@ -374,13 +397,24 @@ export const useDagsterStore = defineStore('dagster', () => {
     }
   }
 
-  /** List active code locations managed by the service (diagnostics). */
-  async function fetchCodeLocations(): Promise<CodeLocationInfo[]> {
-    const { data } = await api.get<CodeLocationInfo[]>('/dagster/pipelines/code-locations')
+  /** List the deployments this service serves (diagnostics). */
+  async function fetchDeployments(): Promise<DeploymentInfo[]> {
+    const { data } = await api.get<DeploymentInfo[]>('/dagster/deployments')
     return data || []
   }
 
-  /** Clear all workspace-scoped state (on workspace switch). */
+  /**
+   * Compare two deployments' asset and schedule definition sets. Both must be
+   * loaded — the service reads definitions from the running code locations.
+   */
+  async function diffDeployments(deploymentName: string, baseName: string): Promise<DeploymentDiff> {
+    const { data } = await api.get<DeploymentDiff>('/dagster/deployments/diff', {
+      params: { deployment: deploymentName, base: baseName },
+    })
+    return data
+  }
+
+  /** Clear all workspace-scoped state (on workspace/environment switch). */
   function reset(): void {
     graph.value = { nodes: [], edges: [] }
     displayGraph.value = { nodes: [], edges: [] }
@@ -388,6 +422,7 @@ export const useDagsterStore = defineStore('dagster', () => {
     runs.value = []
     runLogs.value = {}
     schedules.value = []
+    deployment.value = null
     errorMsg.value = ''
     lineageError.value = ''
     lineageLoading.value = false
@@ -405,6 +440,7 @@ export const useDagsterStore = defineStore('dagster', () => {
     runs,
     runLogs,
     schedules,
+    deployment,
     graphLoading,
     lineageLoading,
     lineageError,
@@ -419,15 +455,17 @@ export const useDagsterStore = defineStore('dagster', () => {
     displayNameFor,
     // Actions
     fetchMode,
+    ensureDeployment,
     loadGraph,
-    reloadCodeLocation,
+    reloadDeployment,
     selectAsset,
     triggerRun,
     refreshRun,
     fetchRunLogs,
     cancelRun,
     fetchSchedules,
-    fetchCodeLocations,
+    fetchDeployments,
+    diffDeployments,
     reset,
   }
 })

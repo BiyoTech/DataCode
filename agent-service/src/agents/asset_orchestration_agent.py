@@ -1,7 +1,8 @@
-"""Data Engineering Agent — SQLMesh data model development specialist.
+"""Asset Orchestration Agent — Dagster asset orchestration code specialist.
 
-Configuration is defined in subagents/data_engineering_agent.yaml (single source of truth).
-This module only registers the factory function with AgentRegistry.
+Configuration is defined in subagents/asset_orchestration_agent.yaml (single
+source of truth). This module only registers the factory function with
+AgentRegistry.
 """
 
 import typing as t
@@ -12,8 +13,8 @@ from src.agents.registry import AgentRegistry
 from src.agents.factory import create_agent
 
 
-@AgentRegistry.register("data_engineering_agent")
-def create_data_engineering_agent(
+@AgentRegistry.register("asset_orchestration_agent")
+def create_asset_orchestration_agent(
     workspace_path: str = "",
     mode: str = "ask",
     rules: t.Optional[t.List[str]] = None,
@@ -24,7 +25,7 @@ def create_data_engineering_agent(
     session_id: str = "",
     **kwargs,
 ) -> Agent:
-    """Create the Data Engineering Agent from YAML configuration.
+    """Create the Asset Orchestration Agent from YAML configuration.
 
     Args:
         workspace_path: Current workspace path.
@@ -38,7 +39,7 @@ def create_data_engineering_agent(
             approval SSE routing in the shell tool).
     """
     return create_agent(
-        name="data_engineering_agent",
+        name="asset_orchestration_agent",
         workspace_path=workspace_path,
         mode=mode,
         rules=rules,

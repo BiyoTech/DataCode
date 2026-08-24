@@ -197,3 +197,25 @@ def _register_analysis_reporting() -> None:
     """No-op — registration is done via decorator side-effect."""
     pass
 
+
+@SkillRegistry.register(
+    "asset_orchestration",
+    description="Step-by-step guide for developing Dagster asset orchestration code "
+                "under {workspace}/asset-dag/ (assets, jobs, schedules, sensors), "
+                "the scheduling gate, and the reload verification loop",
+    trigger_keywords=[
+        "dagster", "asset", "orchestration", "schedule", "sensor", "job",
+        "deployment", "reload", "code location", "asset-dag", "materialize",
+        "cron",
+    ],
+    file_path=str(
+        __import__("pathlib").Path(__file__).parent
+        / "builtin"
+        / "asset_orchestration"
+        / "SKILL.md"
+    ),
+)
+def _register_asset_orchestration() -> None:
+    """No-op — registration is done via decorator side-effect."""
+    pass
+

@@ -40,11 +40,66 @@ class WorkspaceRepository:
             )
             return workspace
 
-    async def get_by_id(self, workspace_id: str) -> t.Optional[WorkspaceModel]:
-        """Get workspace by ID regardless of tenant (internal use only)."""
+    async def reclaim_deleted(self, workspace: WorkspaceModel) -> bool:
+        """Recycle a soft-deleted row so its identifier can be used again.
+
+        A workspace id is DERIVED from ``{tenant}/{name}`` , so the tombstone of
+        a deleted workspace keeps occupying the primary key of every future
+        workspace with that same name. Since a deleted workspace owns no working
+        copy and no live environment, the row is reset to the new workspace's
+        metadata instead of blocking the name forever.
+
+        Guarded by ``status == 'deleted'`` so it can never overwrite a live
+        workspace. Returns False when there was no tombstone to reclaim.
+        """
         async with get_session() as session:
             result = await session.execute(
-                select(WorkspaceModel).where(WorkspaceModel.id == workspace_id)
+                update(WorkspaceModel)
+                .where(
+                    WorkspaceModel.id == workspace.id,
+                    WorkspaceModel.status == "deleted",
+                )
+                .values(
+                    tenant_id=workspace.tenant_id,
+                    owner_user_id=workspace.owner_user_id,
+                    name=workspace.name,
+                    dialect=workspace.dialect,
+                    git_repo_url=workspace.git_repo_url,
+                    production_env=workspace.production_env,
+                    default_env=workspace.default_env,
+                    status="active",
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                    last_active_at=datetime.now(timezone.utc),
+                )
+            )
+            reclaimed = result.rowcount > 0
+
+        if reclaimed:
+            logger.info(
+                "workspace_db_reclaimed",
+                workspace_id=workspace.id,
+                tenant_id=workspace.tenant_id,
+            )
+        return reclaimed
+
+    async def get_by_id(
+        self, workspace_id: str, include_deleted: bool = False
+    ) -> t.Optional[WorkspaceModel]:
+        """Get workspace by ID regardless of tenant (internal use only).
+
+        Soft-deleted rows are hidden by default: a deleted workspace has no
+        working copies and no live environments left, so treating its identifier
+        as taken would make the name unusable forever. Pass
+        ``include_deleted=True`` only to inspect the tombstone itself.
+        """
+        conditions = [WorkspaceModel.id == workspace_id]
+        if not include_deleted:
+            conditions.append(WorkspaceModel.status != "deleted")
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(WorkspaceModel).where(*conditions)
             )
             return result.scalar_one_or_none()
 
@@ -108,22 +163,29 @@ class WorkspaceRepository:
                 .values(last_active_at=datetime.now(timezone.utc))
             )
 
-    async def update_git_repo(
-        self, workspace_id: str, git_repo_url: str, git_branch: str = ""
-    ) -> bool:
-        """Bind a Git repository URL (and optionally default branch)."""
-        values: t.Dict[str, t.Any] = {
-            "git_repo_url": git_repo_url,
-            "updated_at": datetime.now(timezone.utc),
-        }
-        if git_branch:
-            values["git_branch"] = git_branch
-
+    async def update_git_repo(self, workspace_id: str, git_repo_url: str) -> bool:
+        """Bind a remote Git repository URL to a workspace."""
         async with get_session() as session:
             result = await session.execute(
                 update(WorkspaceModel)
                 .where(WorkspaceModel.id == workspace_id)
-                .values(**values)
+                .values(
+                    git_repo_url=git_repo_url,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            return result.rowcount > 0
+
+    async def update_default_env(self, workspace_id: str, default_env: str) -> bool:
+        """Set the environment members land on when opening the workspace."""
+        async with get_session() as session:
+            result = await session.execute(
+                update(WorkspaceModel)
+                .where(WorkspaceModel.id == workspace_id)
+                .values(
+                    default_env=default_env,
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
             return result.rowcount > 0
 

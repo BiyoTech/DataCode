@@ -84,21 +84,38 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
+    # Importing the model modules registers every table on the shared metadata.
+    # The environment registry lives in another package, so it must be imported
+    # explicitly or ``create_all`` would silently skip its tables.
+    from src.environments import models as environment_models  # noqa: F401
+    from src.workspace.models import Base
+
+    engine = get_engine()
+
+    # ``create_all`` owns the BASE tables (0001 is an empty baseline on
+    # purpose: the ORM metadata is their single source of truth). It is
+    # idempotent and never alters existing tables, so it is safe on every
+    # database shape — fresh, legacy, or already migrated.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     if os.getenv("AUTO_MIGRATE", "").lower() in ("1", "true", "yes"):
+        # Migrations EVOLVE whatever ``create_all`` left behind (legacy
+        # columns, backfilled rows) to head. They are idempotent, so this
+        # converges from any bootstrap state; without it a legacy-shaped
+        # ``workspaces`` table would stay behind the ORM forever.
         from alembic import command
         from alembic.config import Config
 
         ini_path = Path(__file__).resolve().parents[2] / "alembic.ini"
         cfg = Config(str(ini_path))
+        # The ini's script_location is relative to the CWD; pin it to the ini
+        # so startup works no matter where the service is launched from.
+        cfg.set_main_option("script_location", str(ini_path.parent / "alembic"))
         command.upgrade(cfg, "head")
         logger.info("database_migrated_via_alembic")
         return
 
-    from src.workspace.models import Base
-
-    engine = get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
     logger.info("database_tables_initialized")
 
 

@@ -20,6 +20,8 @@ from src.core.model_service import get_model_service
 from src.core.plan_service import get_plan_service
 from src.core.query_service import get_query_service
 from src.core.schema_service import get_schema_service
+from agenticdata_common.logging.context import bind_workspace_context
+
 from src.utils.errors import PermissionDeniedError, WorkspacePathInvalidError
 from src.utils.logging import get_logger
 from src.workspace.paths import WorkspacePathLayoutError, parse_workspace_path
@@ -110,15 +112,25 @@ def require_permission(permission: str) -> Callable[..., CallerContext]:
 
 
 def validate_workspace_path(workspace_path: str) -> str:
-    """Validate a workspace working-copy path before any operation uses it.
+    """Validate an environment working-copy path before any operation uses it.
 
     Two independent layers of defence:
     1. containment - the resolved path must live under the configured base
        (``relative_to``, not string prefix matching, so a sibling directory such
        as ``/workspaces-evil`` is rejected);
-    2. layout - it must be exactly ``{base}/{tenant_id}/{workspace_id}/{user_id}``,
-       which stops a caller from reaching the shared root, another tenant's
-       directory, or an arbitrary nested folder.
+    2. layout - it must be exactly
+       ``{base}/{tenant_id}/{workspace_id}/{user_id}/envs/{environment}``, which
+       stops a caller from reaching the shared root, another tenant's directory,
+       the bare object database (``.repo``) or an arbitrary nested folder.
+
+    A valid path therefore identifies the workspace AND the environment, which is
+    what lets every downstream service stay environment-aware without a new
+    parameter.
+
+    This is also where the request's logging context learns which working copy
+    it acts on. Both the query-parameter dependency and the request-body
+    ``WorkspacePathMixin`` funnel through here, so binding once covers every
+    entry point and makes the workspace log sink target the right directory.
     """
     base = Path(settings.workspace_base_path).expanduser().resolve()
     target = Path(workspace_path).expanduser().resolve()
@@ -132,7 +144,9 @@ def validate_workspace_path(workspace_path: str) -> str:
         ) from None
 
     try:
-        parse_workspace_path(str(base), str(target))
+        tenant_id, workspace_id, user_id, environment = parse_workspace_path(
+            str(base), str(target)
+        )
     except WorkspacePathLayoutError as e:
         raise WorkspacePathInvalidError(workspace_path, reason=str(e)) from None
 
@@ -142,7 +156,15 @@ def validate_workspace_path(workspace_path: str) -> str:
             reason="Path does not exist",
         )
 
-    return str(target)
+    resolved = str(target)
+    bind_workspace_context(
+        resolved,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        environment=environment,
+    )
+    return resolved
 
 
 # FastAPI dependency for query-parameter workspace_path validation.

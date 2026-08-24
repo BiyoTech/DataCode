@@ -50,7 +50,8 @@ def _serialize(ws: WorkspaceView) -> t.Dict[str, t.Any]:
         "name": ws.name,
         "dialect": ws.dialect,
         "git_repo_url": ws.git_repo_url,
-        "git_branch": ws.git_branch,
+        "production_env": ws.production_env,
+        "default_env": ws.default_env,
         "status": ws.status,
         "role": ws.role,
         "is_owner": ws.is_owner,
@@ -106,21 +107,25 @@ async def open_workspace(
     req: OpenWorkspaceRequest,
     caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_READ)),
 ):
-    """Materialize the caller's private working copy and return its path.
+    """Materialize the caller's working copy of one environment.
 
-    Clones on first open, otherwise fetches and checks out the branch. Returns
-    409 ``GIT_REPO_NOT_BOUND`` when the workspace has no Git repository yet.
+    The environment (not a branch) decides which code is materialized; an empty
+    request falls back to the workspace's ``default_env``. Returns 409
+    ``GIT_REPO_NOT_BOUND`` when a non-owner opens a workspace whose code has not
+    been pushed yet.
     """
     opened = await get_workspace_manager().open(
         workspace_id=workspace_id,
         tenant_id=caller.tenant_id,
         user_id=caller.user_id,
-        branch=req.branch,
+        environment=req.environment,
     )
     return {
         "workspace_id": opened.workspace_id,
         "workspace_path": opened.workspace_path,
+        "environment": opened.environment,
         "branch": opened.branch,
+        "head_commit": opened.head_commit,
     }
 
 
@@ -129,13 +134,28 @@ async def list_remote_branches(
     workspace_id: str,
     caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_READ)),
 ):
-    """List remote branches available for the workspace repository."""
+    """List remote branches, annotated with the environment each one backs.
+
+    This is a DISCOVERY view, not the environment list: it reports what the
+    remote repository actually contains, which is what makes an unregistered
+    ``env/*`` branch (an orphan left by a failed create, or a branch pushed from
+    outside the platform) visible so it can be adopted. Users pick environments
+    from ``GET /{workspace_id}/environments``, which is served by the registry.
+    """
+    from src.environments.naming import env_of
+
     branches = await get_workspace_manager().remote_branches(
         workspace_id=workspace_id,
         tenant_id=caller.tenant_id,
         user_id=caller.user_id,
     )
-    return {"workspace_id": workspace_id, "branches": branches}
+    return {
+        "workspace_id": workspace_id,
+        "branches": [
+            {"name": branch, "environment": env_of(branch), "managed": env_of(branch) is not None}
+            for branch in branches
+        ],
+    }
 
 
 @router.post("/bind-git")
@@ -158,12 +178,13 @@ async def sync_workspace(
     req: SyncWorkspaceRequest,
     caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_GIT_PUSH)),
 ):
-    """Commit and push the caller's working copy to the remote repository."""
+    """Commit and push one environment working copy to the remote repository."""
     await get_workspace_manager().sync_to_remote(
         workspace_id=req.workspace_id,
         tenant_id=caller.tenant_id,
         user_id=caller.user_id,
         message=req.message,
+        environment=req.environment,
     )
     return {"success": True}
 

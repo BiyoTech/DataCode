@@ -1,7 +1,7 @@
 """Tests for the error archive module.
 
 Verifies that actionable service errors are persisted as structured JSON
-files under ``{workspace}/errors/`` with correct schema, credential
+files under ``{workspace}/logs/errors/`` with correct schema, credential
 redaction, SQL truncation, retention enforcement, and failure tolerance.
 """
 
@@ -26,7 +26,7 @@ from src.utils.errors import ErrorCode, ServiceError, service_error_from_excepti
 
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
-    """A fake workspace directory with an ``errors/`` subfolder."""
+    """A fake workspace root; the archive creates ``logs/errors/`` under it."""
     ws = tmp_path / "ws_test"
     ws.mkdir()
     return ws
@@ -76,7 +76,7 @@ def test_record_writes_json_file(workspace: Path) -> None:
     )
 
     assert error_id is not None
-    errors_dir = workspace / "errors"
+    errors_dir = workspace / "logs" / "errors"
     assert errors_dir.is_dir()
 
     files = list(errors_dir.glob("*.json"))
@@ -112,7 +112,7 @@ def test_record_returns_error_id(workspace: Path) -> None:
         ),
     )
     assert error_id is not None
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     assert payload["error_id"] == error_id
 
@@ -138,7 +138,7 @@ def test_record_redacts_password_in_message(workspace: Path) -> None:
             operation="context.load",
         ),
     )
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     assert "mysecret123" not in payload["message"]
     assert "***REDACTED***" in payload["message"]
@@ -157,7 +157,7 @@ def test_record_redacts_connection_string_in_sql(workspace: Path) -> None:
             sql="SELECT * FROM pg_catalog WHERE url = 'postgresql://admin:s3cr3t@dbhost:5432/prod'",
         ),
     )
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     assert "s3cr3t" not in payload["sql"]
     assert "***" in payload["sql"]
@@ -176,7 +176,7 @@ def test_record_redacts_token_in_context(workspace: Path) -> None:
             context={"auth_token": "token=abc123xyz", "env": "prod"},
         ),
     )
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     ctx = payload["context"]
     assert "abc123xyz" not in ctx["auth_token"]
@@ -202,7 +202,7 @@ def test_record_truncates_long_sql(workspace: Path) -> None:
             sql=long_sql,
         ),
     )
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     assert payload["sql_truncated"] is True
     assert len(payload["sql"]) <= 4096
@@ -222,7 +222,7 @@ def test_record_does_not_truncate_short_sql(workspace: Path) -> None:
             sql=short_sql,
         ),
     )
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     payload = json.loads(files[0].read_text())
     assert payload["sql_truncated"] is False
     assert payload["sql"] == short_sql
@@ -250,7 +250,7 @@ def test_record_enforces_retention(workspace: Path, monkeypatch: pytest.MonkeyPa
             ),
         )
 
-    files = sorted((workspace / "errors").glob("*.json"))
+    files = sorted((workspace / "logs" / "errors").glob("*.json"))
     assert len(files) == 3
     # The newest 3 messages should be present; oldest 2 pruned.
     messages = [json.loads(f.read_text())["message"] for f in files]
@@ -280,7 +280,7 @@ def test_record_disabled_returns_none(workspace: Path, monkeypatch: pytest.Monke
         ),
     )
     assert error_id is None
-    assert not (workspace / "errors").exists()
+    assert not (workspace / "logs" / "errors").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +343,7 @@ def test_record_concurrent_no_collision(workspace: Path) -> None:
     # All error_ids should be distinct.
     assert len(set(results)) == 10
 
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     assert len(files) == 10
     error_ids_in_files = {json.loads(f.read_text())["error_id"] for f in files}
     assert error_ids_in_files == set(results)  # type: ignore[arg-type]
@@ -368,7 +368,7 @@ def test_service_error_from_exception_sets_error_log_id(workspace: Path) -> None
         ),
     )
     assert svc_err.error_log_id is not None
-    files = list((workspace / "errors").glob("*.json"))
+    files = list((workspace / "logs" / "errors").glob("*.json"))
     assert len(files) == 1
     payload = json.loads(files[0].read_text())
     assert payload["error_id"] == svc_err.error_log_id
@@ -383,7 +383,7 @@ def test_service_error_from_exception_without_archive(workspace: Path) -> None:
         fallback_message="Query failed",
     )
     assert svc_err.error_log_id is None
-    assert not (workspace / "errors").exists()
+    assert not (workspace / "logs" / "errors").exists()
 
 
 def test_to_response_dict_includes_error_log_id(workspace: Path) -> None:
@@ -431,5 +431,5 @@ def test_record_no_tmp_files_left(workspace: Path) -> None:
             operation="query.execute",
         ),
     )
-    tmp_files = list((workspace / "errors").glob("*.tmp"))
+    tmp_files = list((workspace / "logs" / "errors").glob("*.tmp"))
     assert len(tmp_files) == 0

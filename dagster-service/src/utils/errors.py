@@ -27,6 +27,10 @@ class ErrorCode(str, Enum):
     CODE_LOCATION_LOAD_FAILED = "CODE_LOCATION_LOAD_FAILED"
     DAGSTER_UNAVAILABLE = "DAGSTER_UNAVAILABLE"
 
+    # Deployment (one environment's code location + run namespace).
+    DEPLOYMENT_NOT_FOUND = "DEPLOYMENT_NOT_FOUND"
+    DEPLOYMENT_INVALID = "DEPLOYMENT_INVALID"
+
     # Dagster domain objects.
     GRAPHQL_ERROR = "GRAPHQL_ERROR"
     RUN_NOT_FOUND = "RUN_NOT_FOUND"
@@ -98,6 +102,40 @@ class CodeLocationLoadError(ServiceError):
             message=f"Failed to load code location for workspace: {workspace_path}",
             detail=detail,
             status_code=500,
+        )
+
+
+class DeploymentNotFoundError(ServiceError):
+    """Raised when a deployment name is not known to this service.
+
+    "Not known" means no code location has been ensured for it in this process —
+    the registry may well have a row for it. Callers that want it running must
+    ensure it rather than treat this as a permanent absence.
+    """
+
+    def __init__(self, deployment_name: str):
+        super().__init__(
+            code=ErrorCode.DEPLOYMENT_NOT_FOUND,
+            message=f"Deployment not found: {deployment_name}",
+            status_code=404,
+        )
+
+
+class DeploymentInvalidError(ServiceError):
+    """Raised when a deployment request contradicts the platform's own naming.
+
+    Typically an ``environment`` or ``env_type`` that does not match the working
+    copy the caller pointed at: honoring it would load one environment's code
+    under another environment's identity, which is the exact failure mode the
+    deployment abstraction exists to prevent.
+    """
+
+    def __init__(self, message: str, detail: Optional[str] = None):
+        super().__init__(
+            code=ErrorCode.DEPLOYMENT_INVALID,
+            message=message,
+            detail=detail,
+            status_code=400,
         )
 
 

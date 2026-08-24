@@ -41,12 +41,23 @@ const (
 
 // Workspace-scoped permission codes.
 const (
-	PermWorkspaceRead           = "workspace:read"
-	PermWorkspaceDelete         = "workspace:delete"
-	PermWorkspaceMemberRead     = "workspace:member:read"
-	PermWorkspaceMemberWrite    = "workspace:member:write"
-	PermWorkspaceGitBind        = "workspace:git:bind"
-	PermWorkspaceGitPush        = "workspace:git:push"
+	PermWorkspaceRead        = "workspace:read"
+	PermWorkspaceDelete      = "workspace:delete"
+	PermWorkspaceMemberRead  = "workspace:member:read"
+	PermWorkspaceMemberWrite = "workspace:member:write"
+	PermWorkspaceGitBind     = "workspace:git:bind"
+	PermWorkspaceGitPush     = "workspace:git:push"
+	// Environment permissions. An environment is the platform's development
+	// line: one Git branch + one SQLMesh virtual environment + one Dagster
+	// deployment. Creating and destroying one therefore touches shared team
+	// resources and is separated from ordinary code writes.
+	PermWorkspaceEnvRead   = "workspace:env:read"
+	PermWorkspaceEnvCreate = "workspace:env:create"
+	PermWorkspaceEnvDelete = "workspace:env:delete"
+	// PermWorkspaceEnvPromote guards actions that make one environment's code
+	// or schedules authoritative for the team: merging into the production
+	// branch, and enabling schedules on a non-production deployment.
+	PermWorkspaceEnvPromote     = "workspace:env:promote"
 	PermWorkspaceCodeRead       = "workspace:code:read"
 	PermWorkspaceCodeWrite      = "workspace:code:write"
 	PermWorkspacePlanPreview    = "workspace:plan:preview"
@@ -57,6 +68,10 @@ const (
 	PermWorkspaceOntologyRead   = "workspace:ontology:read"
 	PermWorkspacePipelineRead   = "workspace:pipeline:read"
 	PermWorkspacePipelineRun    = "workspace:pipeline:run"
+	// PermWorkspaceLogsRead guards the workspace log directory. Kept separate
+	// from code:read because a log line may quote SQL, data values, remote
+	// hosts or agent tool output that reading a model file would not expose.
+	PermWorkspaceLogsRead = "workspace:logs:read"
 )
 
 // Built-in role codes. The literals are kept stable across versions because
@@ -101,6 +116,10 @@ var Catalog = []PermissionDef{
 	{PermWorkspaceMemberWrite, ScopeWorkspace, "member", "write", "Grant and revoke workspace access"},
 	{PermWorkspaceGitBind, ScopeWorkspace, "git", "bind", "Bind or rebind the Git repository"},
 	{PermWorkspaceGitPush, ScopeWorkspace, "git", "push", "Push commits to the remote repository"},
+	{PermWorkspaceEnvRead, ScopeWorkspace, "env", "read", "View environments and their status"},
+	{PermWorkspaceEnvCreate, ScopeWorkspace, "env", "create", "Create environments, including their Git branch"},
+	{PermWorkspaceEnvDelete, ScopeWorkspace, "env", "delete", "Destroy non-production environments"},
+	{PermWorkspaceEnvPromote, ScopeWorkspace, "env", "promote", "Merge into the production branch and enable branch schedules"},
 	{PermWorkspaceCodeRead, ScopeWorkspace, "code", "read", "Read models, files and lineage"},
 	{PermWorkspaceCodeWrite, ScopeWorkspace, "code", "write", "Create, modify and delete files"},
 	{PermWorkspacePlanPreview, ScopeWorkspace, "plan", "preview", "Run plan previews without applying"},
@@ -111,6 +130,7 @@ var Catalog = []PermissionDef{
 	{PermWorkspaceOntologyRead, ScopeWorkspace, "ontology", "read", "Read the semantic ontology"},
 	{PermWorkspacePipelineRead, ScopeWorkspace, "pipeline", "read", "View pipelines, assets and runs"},
 	{PermWorkspacePipelineRun, ScopeWorkspace, "pipeline", "run", "Trigger and cancel pipeline runs"},
+	{PermWorkspaceLogsRead, ScopeWorkspace, "logs", "read", "Read workspace service logs and the error archive"},
 }
 
 // RoleTemplate describes a built-in role and its default permission set.
@@ -169,9 +189,11 @@ var BuiltinRoleTemplates = []RoleTemplate{
 		Permissions: []string{
 			PermWorkspaceRead, PermWorkspaceMemberRead,
 			PermWorkspaceCodeRead, PermWorkspaceCodeWrite, PermWorkspaceGitPush,
+			PermWorkspaceEnvRead, PermWorkspaceEnvCreate, PermWorkspaceEnvDelete,
 			PermWorkspacePlanPreview, PermWorkspacePlanApply, PermWorkspaceQueryRun,
 			PermWorkspaceKnowledgeRead, PermWorkspaceKnowledgeWrite,
 			PermWorkspaceOntologyRead, PermWorkspacePipelineRead, PermWorkspacePipelineRun,
+			PermWorkspaceLogsRead,
 		},
 	},
 	{
@@ -182,7 +204,9 @@ var BuiltinRoleTemplates = []RoleTemplate{
 		Permissions: []string{
 			PermWorkspaceRead, PermWorkspaceMemberRead,
 			PermWorkspaceCodeRead, PermWorkspacePlanPreview, PermWorkspaceQueryRun,
+			PermWorkspaceEnvRead,
 			PermWorkspaceKnowledgeRead, PermWorkspaceOntologyRead, PermWorkspacePipelineRead,
+			PermWorkspaceLogsRead,
 		},
 	},
 	{
@@ -192,6 +216,7 @@ var BuiltinRoleTemplates = []RoleTemplate{
 		Description: "Read-only access to the workspace",
 		Permissions: []string{
 			PermWorkspaceRead, PermWorkspaceMemberRead, PermWorkspaceCodeRead,
+			PermWorkspaceEnvRead,
 			PermWorkspaceKnowledgeRead, PermWorkspaceOntologyRead, PermWorkspacePipelineRead,
 		},
 	},

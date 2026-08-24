@@ -121,12 +121,56 @@ export interface ScheduleInfo {
   status: string | null
 }
 
-/** A managed Code Location (gRPC server). */
-export interface CodeLocationInfo {
+/**
+ * A Dagster deployment: one environment's code location + run namespace.
+ *
+ * ``location_name`` equals ``deployment_name``; both are exposed so callers can
+ * speak either vocabulary. ``schedules_enabled`` tells whether the daemon may
+ * run this environment's schedules — false for every branch deployment unless
+ * the platform granted it explicitly.
+ */
+export interface DeploymentInfo {
+  deployment_name: string
   location_name: string
+  workspace_path: string
+  tenant_id: string
+  workspace_id: string
+  environment: string
+  env_type: 'production' | 'shared' | 'sandbox'
+  schedules_enabled: boolean
   host: string
   port: number
   definitions: string | null
+  alive: boolean
+}
+
+/** Asset-key level difference between two deployments. */
+export interface DeploymentAssetDiff {
+  added: string[]
+  changed: string[]
+  removed: string[]
+}
+
+/** One schedule whose definition differs between two deployments. */
+export interface DeploymentScheduleChange {
+  name: string
+  /** added | removed | modified */
+  change: string
+  cron: string
+  base_cron: string
+  job: string
+}
+
+/**
+ * Orchestration-graph difference between a deployment and its base
+ * (GET /dagster/deployments/diff). Both deployments must be loaded for the
+ * service to read their definition sets.
+ */
+export interface DeploymentDiff {
+  deployment: string
+  base: string
+  assets: DeploymentAssetDiff
+  schedule_changes: DeploymentScheduleChange[]
 }
 
 /** Request body for launching a run. */

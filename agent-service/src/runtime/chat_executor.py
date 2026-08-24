@@ -2,6 +2,8 @@
 
 import asyncio
 
+from agenticdata_common.logging.context import bind_workspace_context
+
 from src.agents.registry import AgentRegistry
 from src.api.schemas import ChatMessageRequest
 from src.context.session import SessionContext, session_manager
@@ -98,6 +100,16 @@ async def execute_chat(session: SessionContext, req: ChatMessageRequest) -> None
         session.environment = req.environment
     if req.workspace_path or req.environment:
         await session_manager.persist_runtime_context_async(session)
+
+    # A chat run is its own asyncio task, so the context bound here covers the
+    # whole agent loop — including tool calls — and lands its log lines in the
+    # workspace the user is actually working in.
+    if session.workspace_path:
+        bind_workspace_context(
+            session.workspace_path,
+            user_id=session.user_id,
+            environment=session.environment,
+        )
 
     await session_manager.add_message_async(session_id, "user", user_content)
     await session_manager.add_timeline_event_async(
