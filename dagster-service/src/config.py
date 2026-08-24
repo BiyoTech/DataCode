@@ -5,7 +5,7 @@ overrides. Priority: env vars > YAML file > defaults.
 
 Shared cross-cutting config (workspace, sqlmesh service URL, logging) is
 sourced from ``conf/platform.yaml`` via
-:mod:`agenticdata_common.config.platform`.
+:mod:`datacode_common.config.platform`.
 
 Key design insight (see package docstring): the Code Location gRPC server is
 ALWAYS local because it loads user Python code from ``asset-dag/``. Only the
@@ -15,8 +15,8 @@ DagsterInstance (daemon + webserver + metadata DB) can be remote.
 import os
 from pathlib import Path
 
-from agenticdata_common.config.platform import platform_config
-from agenticdata_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
+from datacode_common.config.platform import platform_config
+from datacode_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
 from pydantic_settings import BaseSettings
 
 _CONFIG_FILE = Path(__file__)
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     code_location_port: int = 4000
 
     # Local mode only: DagsterInstance + daemon + webserver.
-    dagster_home: str = "~/.agenticdata/dagster_home"
+    dagster_home: str = "~/.datacode/dagster_home"
     dagster_daemon_enabled: bool = True
     dagster_webserver_enabled: bool = True
     dagster_webserver_host: str = "0.0.0.0"

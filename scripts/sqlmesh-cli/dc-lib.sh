@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# dc-lib.sh — shared library for the dc platform CLI (dc = DataCursor).
+# dc-lib.sh — shared library for the dc platform CLI (dc = DataCode).
 # ============================================================================
 # Sourced by dc.sh ONLY. Provides:
 #   _dc_resolve_workspace_path  — workspace (worktree) root resolution
@@ -18,15 +18,15 @@
 # Resolve the workspace (worktree) root.
 #
 # Priority:
-#   1. AGENTICDATA_WORKSPACE_PATH — injected by the agent shell tool.
+#   1. DATACODE_WORKSPACE_PATH — injected by the agent shell tool.
 #   2. Walk up from cwd to the directory whose sql-warehouse/ sub-directory
 #      holds the SQLMesh config (platform dual-directory layout).
 #   3. Walk up to a directory containing config.yaml (bare SQLMesh project).
 # Returns an empty string when nothing matches.
 # -------------------------------------------------------------------
 _dc_resolve_workspace_path() {
-    if [[ -n "${AGENTICDATA_WORKSPACE_PATH:-}" ]]; then
-        echo "${AGENTICDATA_WORKSPACE_PATH}"
+    if [[ -n "${DATACODE_WORKSPACE_PATH:-}" ]]; then
+        echo "${DATACODE_WORKSPACE_PATH}"
         return
     fi
     local d="$PWD"
@@ -51,7 +51,7 @@ _dc_resolve_workspace_path() {
 # -------------------------------------------------------------------
 # Resolve the AUTHORITATIVE active environment.
 #
-# AGENTICDATA_ENVIRONMENT comes from the toolbar selection via the agent
+# DATACODE_ENVIRONMENT comes from the toolbar selection via the agent
 # shell tool. Unlike sqlmesh.sh's _resolve_env there is no CLI positional
 # fallback: dc commands take no environment argument — the working copy
 # (workspace_path) is authoritative on the backend, and the environment
@@ -60,7 +60,7 @@ _dc_resolve_workspace_path() {
 # backend derives the environment from the working copy.
 # -------------------------------------------------------------------
 _dc_resolve_env() {
-    echo "${AGENTICDATA_ENVIRONMENT:-}"
+    echo "${DATACODE_ENVIRONMENT:-}"
 }
 
 # -------------------------------------------------------------------
@@ -85,7 +85,7 @@ _dc_require_workspace() {
     workspace_path=$(_dc_resolve_workspace_path)
     if [[ -z "$workspace_path" ]]; then
         echo "[dc] ERROR: Cannot determine workspace_path." >&2
-        echo "[dc] Set AGENTICDATA_WORKSPACE_PATH or run from within a workspace." >&2
+        echo "[dc] Set DATACODE_WORKSPACE_PATH or run from within a workspace." >&2
         exit 1
     fi
     echo "$workspace_path"

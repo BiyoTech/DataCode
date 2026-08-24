@@ -13,8 +13,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/middleware"
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/middleware"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 // RBACHandler exposes the role management endpoints.

@@ -4,7 +4,7 @@ Loads from YAML file (conf/agent-service.yaml) with environment variable overrid
 Priority: env vars > YAML file > defaults.
 
 Shared cross-cutting config (database, service topology, logging) is sourced
-from ``conf/platform.yaml`` via :mod:`agenticdata_common.config.platform`.
+from ``conf/platform.yaml`` via :mod:`datacode_common.config.platform`.
 This service-specific YAML only carries settings unique to agent-service.
 """
 
@@ -12,9 +12,9 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from agenticdata_common.config.platform import platform_config
-from agenticdata_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
-from agenticdata_common.database.url import build_database_url
+from datacode_common.config.platform import platform_config
+from datacode_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
+from datacode_common.database.url import build_database_url
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
@@ -209,7 +209,7 @@ class Settings(BaseSettings):
                 username=svc.username,
                 password=self.database_password,
                 project_root=project_root,
-                sqlite_default=".data/agenticdata.db",
+                sqlite_default=".data/datacode.db",
             )
         return self.platform.database.url(service="agent")
 
@@ -241,8 +241,12 @@ class Settings(BaseSettings):
         return self.platform.log_level.upper()
 
 
-def _env_id_suffix(model_id: str) -> str:
-    """Normalize a model id into an env-var-safe suffix (UPPER, non-alnum -> '_')."""
+def env_id_suffix(model_id: str) -> str:
+    """Normalize a model id into an env-var-safe suffix (UPPER, non-alnum -> '_').
+
+    Public so other modules (e.g. model_resolver error messages) can render
+    the exact env var name the override loader will read.
+    """
     return "".join(c if c.isalnum() else "_" for c in model_id).upper()
 
 
@@ -263,7 +267,7 @@ def _apply_llm_env_overrides(models: List[LLMModelConfig]) -> None:
     global_key = os.getenv("AGENT_SERVICE_LLM_API_KEY")
 
     for i, model in enumerate(models):
-        id_suffix = _env_id_suffix(model.id)
+        id_suffix = env_id_suffix(model.id)
 
         api_key = (
             os.getenv(f"AGENT_SERVICE_LLM_MODELS__{i}__API_KEY")

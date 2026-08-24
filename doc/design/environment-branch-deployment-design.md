@@ -25,7 +25,7 @@
 2. **分支与环境正交**：切换 Git 分支不会切换 environment，切换 environment 不会切换代码。代码与数据视图可以任意错配，`prod` 环境完全可能是从某个未合并分支 apply 出来的。
 3. **一个 working copy 只能停在一个分支**：布局为 `{base}/{tenant_id}/{workspace_id}/{user_id}`（`src/workspace/paths.py:9-11`，`_LAYOUT_DEPTH = 3`）。切换环境需要 `git checkout`，会阻塞未提交改动，且无法并行 plan 两个环境。
 4. **State 隔离粒度错位**：`workspace_state_schema()` 取路径末段（`config_ops.py:30-33`），末段是 `user_id`，所以 state schema 实际是 `sqlmesh__{user_id}`。后果是 environment 列表是**用户私有**的，团队成员看不到同一份环境清单，环境无法作为共享资产存在。
-5. **Dagster 与 SQLMesh 语义割裂**：~~`SQLMeshResource.plan/apply` 默认 `environment="prod"` 硬编码~~ ✅ Phase 4 修复：改读 `AGENTICDATA_ENVIRONMENT`，缺失即报错；`GET /dagster/assets/graph` 的图现在天然按环境隔离（每环境一个 code location 加载各自分支）。
+5. **Dagster 与 SQLMesh 语义割裂**：~~`SQLMeshResource.plan/apply` 默认 `environment="prod"` 硬编码~~ ✅ Phase 4 修复：改读 `DATACODE_ENVIRONMENT`，缺失即报错；`GET /dagster/assets/graph` 的图现在天然按环境隔离（每环境一个 code location 加载各自分支）。
 6. **Schedule 无环境护栏**：~~任意 code location 加载后其 schedule 均可被 daemon 触发~~ ✅ Phase 4 修复：非生产 deployment 的 schedule/sensor 以 STOPPED 加载（护栏边界见 §7.2）。
 
 ### 1.3 结论
@@ -149,7 +149,7 @@ def deployment_name(workspace_id: str, env: str) -> str:
 |------|------|------|------|
 | SQLMesh `state_schema` | `sqlmesh__{user_id}`（取路径 leaf，`config_ops.py:32`） | `sqlmesh__{workspace_id}` | 环境是 workspace 级共享资产，成员必须看到同一份环境清单；同时 environment 之间的 virtual promote / diff 要求共享 state |
 | 数据视图 schema | `{schema}__{env}`（SQLMesh 原生） | 不变 | 环境间数据隔离由 SQLMesh 虚拟层保证 |
-| Dagster run storage | 单实例共享 | 单实例共享 + `agenticdata/environment` run tag | 开源版 Dagster 无 deployment 隔离，用 tag + location 命名空间模拟 |
+| Dagster run storage | 单实例共享 | 单实例共享 + `datacode/environment` run tag | 开源版 Dagster 无 deployment 隔离，用 tag + location 命名空间模拟 |
 
 `ensure_state_isolation()` 需要显式接收 `workspace_id`，不能再从路径末段推断：
 
@@ -476,7 +476,7 @@ DELETE /api/v1/environments/{env}          # production 拒绝
 | Code location name | 同 deployment name（1:1） |
 | 加载路径 | `{base}/{tenant}/{ws}/{user}/envs/{env}/asset-dag/definitions.py` |
 | gRPC 端口 | dev：进程内递增分配 + 持久化到 `DAGSTER_HOME/code_location_ports.json`；生产：worker pool 共享（见 §7.5） |
-| 注入环境变量 | `AGENTICDATA_ENVIRONMENT`、`AGENTICDATA_DEPLOYMENT`、`AGENTICDATA_DEPLOYMENT_TYPE`、`AGENTICDATA_WORKSPACE_ID`、`AGENTICDATA_TENANT_ID`、`AGENTICDATA_SCHEDULES_ENABLED`、`SQLMESH_GATEWAY`、`SQLMESH_SERVICE_URL`、`DAGSTER_WORKSPACE_PATH` |
+| 注入环境变量 | `DATACODE_ENVIRONMENT`、`DATACODE_DEPLOYMENT`、`DATACODE_DEPLOYMENT_TYPE`、`DATACODE_WORKSPACE_ID`、`DATACODE_TENANT_ID`、`DATACODE_SCHEDULES_ENABLED`、`SQLMESH_GATEWAY`、`SQLMESH_SERVICE_URL`、`DAGSTER_WORKSPACE_PATH` |
 
 `code_location_manager` 不再自己推导名字：deployment 名由 `DeploymentManager` 从平台命名代数派生后下发（路径推断在五层布局下会产出 `ws_envs_{env}` 这类既无 workspace 维度、又跨 workspace 冲突的名字）。
 
@@ -495,13 +495,13 @@ import os
 import dagster as dg
 
 # Deployment identity injected by dagster-service when the code location starts.
-DEPLOYMENT_TYPE = os.getenv("AGENTICDATA_DEPLOYMENT_TYPE", "sandbox")
-ENVIRONMENT = os.getenv("AGENTICDATA_ENVIRONMENT", "")
+DEPLOYMENT_TYPE = os.getenv("DATACODE_DEPLOYMENT_TYPE", "sandbox")
+ENVIRONMENT = os.getenv("DATACODE_ENVIRONMENT", "")
 
 # Only a deployment the platform allows to be scheduled may have running
 # schedules. Branch deployments load the very same code, so without this gate a
 # feature branch would silently drive production data on every tick.
-SCHEDULES_ENABLED = os.getenv("AGENTICDATA_SCHEDULES_ENABLED", "") == "1"
+SCHEDULES_ENABLED = os.getenv("DATACODE_SCHEDULES_ENABLED", "") == "1"
 
 DEFAULT_SCHEDULE_STATUS = (
     dg.DefaultScheduleStatus.RUNNING
@@ -513,15 +513,15 @@ DEFAULT_SENSOR_STATUS = ...  # 同理，sensor 也会自行拉起 run
 
 - 用户在 `defs/schedules/`、`defs/sensors/` 中声明时统一 `default_status=DEFAULT_SCHEDULE_STATUS`（scaffold 的示例文件即以此写法示范）。
 - `defs/deployment.py` 是受管文件（与 `defs/assets/sql_assets.py` 同列），内容漂移即被模板覆盖，所以门禁本身改不掉；示例 schedule/sensor 仍是**用户可编辑**文件 —— 覆盖它们会吃掉用户改的 cron。
-- 允许显式为某个 shared 环境开启：注册表 `schedules_enabled=1` → 注入独立变量 `AGENTICDATA_SCHEDULES_ENABLED=1`，**不复用** `AGENTICDATA_DEPLOYMENT_TYPE=production`（那会污染语义）。API 层同时拒绝把非 prod 环境标成 `production` 类型，避免绕过该分工；开启需 `workspace:env:promote`（✅ 权限点已实现）。
+- 允许显式为某个 shared 环境开启：注册表 `schedules_enabled=1` → 注入独立变量 `DATACODE_SCHEDULES_ENABLED=1`，**不复用** `DATACODE_DEPLOYMENT_TYPE=production`（那会污染语义）。API 层同时拒绝把非 prod 环境标成 `production` 类型，避免绕过该分工；开启需 `workspace:env:promote`（✅ 权限点已实现）。
 - **护栏边界（诚实声明）**：`default_status` 只决定 schedule 在实例里的**初始状态**，开源版 Dagster 的 daemon 只看实例状态。因此这条链路防的是"分支环境加载后默认就被调度"，不能阻止用户在代码里硬写 `RUNNING`、也不能阻止有人在 Dagster UI 里手动启用。真正的强隔离在 §7.5 的生产形态（per-deployment worker + 命名空间）里解决。
 
 ### 7.3 Run 隔离与环境注入
 
 | 隔离点 | 实现 |
 |--------|------|
-| Run 归属 | 每次 launch 注入 run tag `agenticdata/environment`、`agenticdata/workspace_id`、`agenticdata/deployment`（GraphQL `executionParams.executionMetadata.tags`） |
-| SQLMesh 目标环境 | `SQLMeshResource` 不再默认 `"prod"`，改为读 `AGENTICDATA_ENVIRONMENT`；两者都缺时**报错而非兜底**（唯一安全的默认就是本 deployment 自己的环境，读不到说明进程不知道自己在哪运行） |
+| Run 归属 | 每次 launch 注入 run tag `datacode/environment`、`datacode/workspace_id`、`datacode/deployment`（GraphQL `executionParams.executionMetadata.tags`） |
+| SQLMesh 目标环境 | `SQLMeshResource` 不再默认 `"prod"`，改为读 `DATACODE_ENVIRONMENT`；两者都缺时**报错而非兜底**（唯一安全的默认就是本 deployment 自己的环境，读不到说明进程不知道自己在哪运行） |
 | 数据写入 | SQLMesh 虚拟层保证：sandbox 环境写 `{schema}__{env}`，物理表复用 base 快照 |
 | 资源配额 | 生产 K8sRunLauncher 按 deployment type 差异化 requests/limits；sandbox 并发上限低 |
 | UI 过滤 | 前端 asset-dag / run history 按当前 environment 的 deployment name 过滤，不展示他人环境 |
@@ -791,7 +791,7 @@ Reconciler（定时 + 手动触发）产出漂移分类与修复动作：
   - `dagster-service/src/core/code_location_manager.py`（降级为"机制层"：按 `CodeLocationSpec` 收外部下发的名字与 env；端口分配持久化到 `DAGSTER_HOME/code_location_ports.json`；注册 respawn 后的重挂钩子）
   - `dagster-service/src/core/process_manager.py`（后台 supervisor：定期巡检 + respawn + 滑动窗口重启预算，超限则 `abandoned` 上报；`on_restart` 钩子让 code location 自动重挂到 DagsterInstance）
   - `dagster-service/src/core/dagster_client.py`、`core/run_manager.py`（launch 支持 `executionMetadata.tags`）
-  - `dagster-service/src/bridge/sqlmesh_resource.py`（environment 读 `AGENTICDATA_ENVIRONMENT`，缺失即报错而非默认 prod）
+  - `dagster-service/src/bridge/sqlmesh_resource.py`（environment 读 `DATACODE_ENVIRONMENT`，缺失即报错而非默认 prod）
   - `dagster-service/src/templates/defs/deployment.py.tpl`（**新增受管文件**：deployment 身份 + schedule/sensor gating）、`templates/defs/{schedules,sensors}/example_*.tpl`、`templates/{definitions.py,README.md}.tpl`、`core/scaffold.py`（受管文件集合新增 `defs/deployment.py`）
   - **新增** `dagster-service/src/api/rest/deployments.py`（ensure / reload / delete / list / diff），`api/rest/pipelines.py` 删除 code-location 端点并注入 run tag，`api/rest/{assets,schedules}.py` 改走 DeploymentManager
   - `dagster-service/src/api/models/{requests,responses}.py`、`src/api/deps.py`、`src/main.py`、`src/utils/errors.py`（`DEPLOYMENT_NOT_FOUND` / `DEPLOYMENT_INVALID`）、`src/config.py` + `conf/dagster-service.yaml`（supervisor 三项配置）

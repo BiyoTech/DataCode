@@ -8,7 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/auth"
 )
 
 // newTestService builds an RBAC service on a throwaway SQLite database with the

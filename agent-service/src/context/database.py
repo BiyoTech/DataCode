@@ -24,7 +24,7 @@ from sqlalchemy import (
     inspect as sqla_inspect,
     text,
 )
-from agenticdata_common.database.engine import create_async_engine_for_url
+from datacode_common.database.engine import create_async_engine_for_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,

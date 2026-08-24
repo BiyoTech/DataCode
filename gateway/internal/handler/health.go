@@ -8,7 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/config"
+	"github.com/datacode/gateway/internal/config"
 )
 
 type upstreamHealth struct {

@@ -202,7 +202,7 @@ export default {
     forbidden: 'You do not have permission to read this workspace\'s logs',
   },
   common: {
-    appName: 'AgenticData',
+    appName: 'DataCode',
     loading: 'Loading...',
     save: 'Save',
     cancel: 'Cancel',

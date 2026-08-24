@@ -73,7 +73,7 @@ type PlatformLogging struct {
 	Format string `yaml:"format"`
 }
 
-// LoadPlatform reads conf/platform.yaml + optional platform.{AGENTICDATA_ENV}.yaml
+// LoadPlatform reads conf/platform.yaml + optional platform.{DATACODE_ENV}.yaml
 // override, then merges them (env override wins). Returns a zero-value
 // PlatformConfig when no file is found.
 func LoadPlatform() *PlatformConfig {
@@ -97,7 +97,7 @@ func LoadPlatform() *PlatformConfig {
 	}
 
 	// Load optional env override.
-	if env := os.Getenv("AGENTICDATA_ENV"); env != "" {
+	if env := os.Getenv("DATACODE_ENV"); env != "" {
 		if path := resolveConfigPath(fmt.Sprintf("platform.%s.yaml", env)); path != "" {
 			applyYAML(path, cfg)
 		}

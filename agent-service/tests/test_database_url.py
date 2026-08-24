@@ -1,7 +1,7 @@
 """Tests for build_database_url()."""
 
 import pytest
-from agenticdata_common.database.url import build_database_url
+from datacode_common.database.url import build_database_url
 
 
 def test_mysql_uses_aiomysql_driver(monkeypatch):
@@ -10,7 +10,7 @@ def test_mysql_uses_aiomysql_driver(monkeypatch):
         db_type="mysql",
         host="localhost",
         port=3306,
-        name="agenticdata",
+        name="datacode",
         username="u",
         password="p",
     )

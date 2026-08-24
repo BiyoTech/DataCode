@@ -15,7 +15,7 @@ dagster:
   code_location_port: 4000
 
   # Local mode only: DagsterInstance (SQLite) + daemon + webserver.
-  home: "~/.agenticdata/dagster_home"
+  home: "~/.datacode/dagster_home"
   daemon_enabled: true
   webserver_enabled: true
   webserver_host: "0.0.0.0"

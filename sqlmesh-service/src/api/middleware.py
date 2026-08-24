@@ -14,7 +14,7 @@ from __future__ import annotations
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from agenticdata_common.logging.context import (
+from datacode_common.logging.context import (
     TENANT_ID_HEADER,
     TRACE_ID_HEADER,
     USER_ID_HEADER,

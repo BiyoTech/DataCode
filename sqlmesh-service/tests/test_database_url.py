@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from agenticdata_common.database.url import build_database_url
+from datacode_common.database.url import build_database_url
 
 
 def test_sqlite_url_resolves_relative_path(tmp_path, monkeypatch):
@@ -38,11 +38,11 @@ def test_mysql_url_default_port(monkeypatch):
     url = build_database_url(
         db_type="mysql",
         host="localhost",
-        name="agenticdata",
+        name="datacode",
         username="root",
         password="secret",
     )
-    assert "mysql+aiomysql://root:secret@localhost:3306/agenticdata" in url
+    assert "mysql+aiomysql://root:secret@localhost:3306/datacode" in url
     assert "charset=utf8mb4" in url
 
 

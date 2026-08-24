@@ -20,7 +20,7 @@ from dagster import ConfigurableResource
 
 # Deployment identity injected by dagster-service when it launches the code
 # location. Read at import time: the value is fixed for the life of the process.
-_INJECTED_ENVIRONMENT = os.environ.get("AGENTICDATA_ENVIRONMENT", "")
+_INJECTED_ENVIRONMENT = os.environ.get("DATACODE_ENVIRONMENT", "")
 
 
 class SQLMeshResource(ConfigurableResource):
@@ -63,7 +63,7 @@ class SQLMeshResource(ConfigurableResource):
             raise ValueError(
                 "SQLMesh environment is undetermined: set the resource's "
                 "`environment`, or run inside a deployment that injects "
-                "AGENTICDATA_ENVIRONMENT"
+                "DATACODE_ENVIRONMENT"
             )
         return {
             "workspace_path": self.workspace_path,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# dc.sh — DataCursor platform-domain CLI (dc = DataCursor)
+# dc.sh — DataCode platform-domain CLI (dc = DataCode)
 # ============================================================================
 # Command model (all intercepted commands hit the dagster-service REST API):
 #   dc assets [--json]                  → asset dependency graph (GET graph)
@@ -15,7 +15,7 @@
 # directory from PATH, then `command -v dc`, fallback /usr/bin/dc).
 #
 # Environment governance:
-#   AGENTICDATA_ENVIRONMENT, when injected by the shell tool, is sent as the
+#   DATACODE_ENVIRONMENT, when injected by the shell tool, is sent as the
 #   `environment` CONFIRMATION field on deployment ensure/reload — the
 #   backend rejects a mismatch with the working copy (anti-hallucination,
 #   same semantics as sqlmesh.sh). env_type / schedules_enabled are
@@ -23,10 +23,10 @@
 #   and default safely on the backend.
 #
 # Environment variables (injected by shell.py or set manually):
-#   AGENTICDATA_DAGSTER_SERVICE_URL  Dagster service base URL
+#   DATACODE_DAGSTER_SERVICE_URL  Dagster service base URL
 #                                    (default: http://localhost:8004)
-#   AGENTICDATA_WORKSPACE_PATH       Absolute path to the workspace root
-#   AGENTICDATA_ENVIRONMENT          Authoritative active environment
+#   DATACODE_WORKSPACE_PATH       Absolute path to the workspace root
+#   DATACODE_ENVIRONMENT          Authoritative active environment
 #
 # Exit codes: 0 = success, 1 = usage error, 2 = HTTP error, 3 = invalid
 # JSON, 127 = cannot locate the real dc binary.
@@ -42,7 +42,7 @@ source "${SCRIPT_DIR}/dc-lib.sh"
 # -------------------------------------------------------------------
 # Resolve backend API base URL
 # -------------------------------------------------------------------
-API_URL="${AGENTICDATA_DAGSTER_SERVICE_URL:-http://localhost:8004}"
+API_URL="${DATACODE_DAGSTER_SERVICE_URL:-http://localhost:8004}"
 
 # -------------------------------------------------------------------
 # Resolve the REAL system dc binary (avoid self-recursion)
@@ -87,7 +87,7 @@ _dc_usage() {
     cat >&2 <<'EOF'
 Usage: dc <command> [options]
 
-DataCursor platform commands (dagster-service):
+DataCode platform commands (dagster-service):
   assets [--json]                  Asset dependency graph of the active environment
   deployment status [--json]       Dagster deployment state (idempotent ensure)
   deployment reload                Re-import orchestration code after asset-dag/ edits

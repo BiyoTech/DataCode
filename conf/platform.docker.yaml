@@ -1,14 +1,14 @@
 # Platform Docker overrides.
 #
-# Loaded on top of platform.yaml when AGENTICDATA_ENV=docker.
+# Loaded on top of platform.yaml when DATACODE_ENV=docker.
 # Use for Docker infrastructure (e.g. PostgreSQL instead of MySQL).
 
 database:
   type: "postgresql"
   host: "localhost"
   port: 5432
-  name: "agenticdata"
-  username: "agenticdata"
+  name: "datacode"
+  username: "datacode"
   # password: env-only (DB_PASSWORD)
   pool_size: 5
   pool_overflow: 10

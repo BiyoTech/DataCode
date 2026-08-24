@@ -178,31 +178,31 @@ class ShellRuntimeBootstrap:
         env["VIRTUAL_ENV"] = str(self.venv_path)
         env.pop("PYTHONHOME", None)
 
-        # Inject agenticdata platform context for the wrapper script
-        env["AGENTICDATA_WORKSPACE_PATH"] = str(self.agent_path)
-        env["AGENTICDATA_TRIGGER_TYPE"] = "agent"
-        env["AGENTICDATA_USER_ID"] = self._user_id
-        env["AGENTICDATA_SESSION_ID"] = self._session_id
+        # Inject datacode platform context for the wrapper script
+        env["DATACODE_WORKSPACE_PATH"] = str(self.agent_path)
+        env["DATACODE_TRIGGER_TYPE"] = "agent"
+        env["DATACODE_USER_ID"] = self._user_id
+        env["DATACODE_SESSION_ID"] = self._session_id
         # Authoritative active environment (from toolbar). The shim treats this
         # as the single source of truth for plan/apply and overrides any
         # environment the LLM may have hallucinated in the command arguments.
         if self._environment:
-            env["AGENTICDATA_ENVIRONMENT"] = self._environment
+            env["DATACODE_ENVIRONMENT"] = self._environment
 
         try:
             from src.config import settings
-            env["AGENTICDATA_SQLMESH_SERVICE_URL"] = settings.sqlmesh_service_url
+            env["DATACODE_SQLMESH_SERVICE_URL"] = settings.sqlmesh_service_url
         except Exception:
             # Fallback to default if settings not available (e.g. tests)
-            env["AGENTICDATA_SQLMESH_SERVICE_URL"] = "http://localhost:8002"
+            env["DATACODE_SQLMESH_SERVICE_URL"] = "http://localhost:8002"
 
         # Dagster service URL for the dc platform CLI shim (assets /
         # deployment / run commands). Same fallback pattern as above.
         try:
             from src.config import settings
-            env["AGENTICDATA_DAGSTER_SERVICE_URL"] = settings.dagster_service_url
+            env["DATACODE_DAGSTER_SERVICE_URL"] = settings.dagster_service_url
         except Exception:
-            env["AGENTICDATA_DAGSTER_SERVICE_URL"] = "http://localhost:8004"
+            env["DATACODE_DAGSTER_SERVICE_URL"] = "http://localhost:8004"
 
         logger.debug("sqlmesh_shim_injected: shim_dir=%s agent_path=%s user_id=%s", shim_dir, self.agent_path, self._user_id)
         return env
@@ -493,10 +493,10 @@ def create_native_shell_tool(agent_path: Optional[str] = None, user_id: str = ""
 
     Args:
         agent_path: Workspace root directory for shell command execution.
-        user_id: Current user identifier (injected as AGENTICDATA_USER_ID).
-        session_id: Current session identifier (injected as AGENTICDATA_SESSION_ID).
+        user_id: Current user identifier (injected as DATACODE_USER_ID).
+        session_id: Current session identifier (injected as DATACODE_SESSION_ID).
         environment: Active environment selected in the toolbar (injected as
-            AGENTICDATA_ENVIRONMENT; authoritative for sqlmesh plan/apply).
+            DATACODE_ENVIRONMENT; authoritative for sqlmesh plan/apply).
     """
     try:
         from agents import FunctionTool

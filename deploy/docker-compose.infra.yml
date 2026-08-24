@@ -4,25 +4,25 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: agenticdata-postgres
+    container_name: datacode-postgres
     environment:
-      POSTGRES_USER: agenticdata
-      POSTGRES_PASSWORD: agenticdata_dev
-      POSTGRES_DB: agenticdata
+      POSTGRES_USER: datacode
+      POSTGRES_PASSWORD: datacode_dev
+      POSTGRES_DB: datacode
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U agenticdata"]
+      test: ["CMD-SHELL", "pg_isready -U datacode"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: agenticdata-redis
+    container_name: datacode-redis
     profiles: ["reserved"]
     ports:
       - "6379:6379"
@@ -36,13 +36,13 @@ services:
 
   gitea:
     image: gitea/gitea:1.21-rootless
-    container_name: agenticdata-gitea
+    container_name: datacode-gitea
     environment:
       - GITEA__database__DB_TYPE=postgres
       - GITEA__database__HOST=postgres:5432
       - GITEA__database__NAME=gitea
-      - GITEA__database__USER=agenticdata
-      - GITEA__database__PASSWD=agenticdata_dev
+      - GITEA__database__USER=datacode
+      - GITEA__database__PASSWD=datacode_dev
       - GITEA__server__ROOT_URL=http://localhost:3000
       - GITEA__server__HTTP_PORT=3000
     ports:

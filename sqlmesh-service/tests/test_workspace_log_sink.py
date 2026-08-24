@@ -18,7 +18,7 @@ from typing import Any, Dict, List
 
 import pytest
 
-from agenticdata_common.logging.workspace_sink import (
+from datacode_common.logging.workspace_sink import (
     CHANNEL_RUNS,
     WorkspaceLogSink,
     WorkspaceSinkConfig,

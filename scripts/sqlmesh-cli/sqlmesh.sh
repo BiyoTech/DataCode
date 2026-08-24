@@ -34,19 +34,19 @@
 #
 # Designed to be invoked via a thin "sqlmesh" executable placed in PATH
 # before the real sqlmesh binary. The shell tool (shell.py) injects the
-# shim directory at the front of PATH and exports AGENTICDATA_* env vars.
+# shim directory at the front of PATH and exports DATACODE_* env vars.
 #
 # Environment variables (injected by shell.py or set manually):
-#   AGENTICDATA_SQLMESH_SERVICE_URL  Backend API base URL (default: http://localhost:8002)
-#   AGENTICDATA_ONTOLOGY_SERVICE_URL Ontology service base URL (default: http://localhost:8003)
-#   AGENTICDATA_WORKSPACE_PATH       Absolute path to workspace root
-#   AGENTICDATA_ENVIRONMENT          Authoritative active environment (from toolbar).
+#   DATACODE_SQLMESH_SERVICE_URL  Backend API base URL (default: http://localhost:8002)
+#   DATACODE_ONTOLOGY_SERVICE_URL Ontology service base URL (default: http://localhost:8003)
+#   DATACODE_WORKSPACE_PATH       Absolute path to workspace root
+#   DATACODE_ENVIRONMENT          Authoritative active environment (from toolbar).
 #                                    When set, it overrides any environment the LLM
 #                                    passes to plan/apply (anti-hallucination guard).
-#   AGENTICDATA_TRIGGER_TYPE         "agent" or "human" (default: human)
-#   AGENTICDATA_USER_ID              User identifier (default: $USER)
-#   AGENTICDATA_SESSION_ID           Session identifier (agent context only)
-#   AGENTICDATA_REAL_SQLMESH         Optional explicit path to real sqlmesh binary
+#   DATACODE_TRIGGER_TYPE         "agent" or "human" (default: human)
+#   DATACODE_USER_ID              User identifier (default: $USER)
+#   DATACODE_SESSION_ID           Session identifier (agent context only)
+#   DATACODE_REAL_SQLMESH         Optional explicit path to real sqlmesh binary
 # ============================================================================
 
 set -euo pipefail
@@ -55,8 +55,8 @@ set -euo pipefail
 # Resolve the real sqlmesh binary (avoid self-recursion)
 # -------------------------------------------------------------------
 _resolve_real_sqlmesh() {
-    if [[ -n "${AGENTICDATA_REAL_SQLMESH:-}" ]] && command -v "${AGENTICDATA_REAL_SQLMESH}" &>/dev/null; then
-        echo "${AGENTICDATA_REAL_SQLMESH}"
+    if [[ -n "${DATACODE_REAL_SQLMESH:-}" ]] && command -v "${DATACODE_REAL_SQLMESH}" &>/dev/null; then
+        echo "${DATACODE_REAL_SQLMESH}"
         return
     fi
 
@@ -81,7 +81,7 @@ _resolve_real_sqlmesh() {
     if [[ -z "$real_bin" ]]; then
         echo "[sqlmesh.sh] ERROR: Cannot locate the real sqlmesh binary." >&2
         echo "[sqlmesh.sh] Tried PATH (excluding self): ${cleaned_path}" >&2
-        echo "[sqlmesh.sh] Set AGENTICDATA_REAL_SQLMESH to explicitly specify the binary path." >&2
+        echo "[sqlmesh.sh] Set DATACODE_REAL_SQLMESH to explicitly specify the binary path." >&2
         exit 127
     fi
 
@@ -93,17 +93,17 @@ REAL_SQLMESH=$(_resolve_real_sqlmesh)
 # -------------------------------------------------------------------
 # Resolve backend API base URL
 # -------------------------------------------------------------------
-API_URL="${AGENTICDATA_SQLMESH_SERVICE_URL:-http://localhost:8002}"
+API_URL="${DATACODE_SQLMESH_SERVICE_URL:-http://localhost:8002}"
 
 # Ontology Service runs on a separate port (8003) from sqlmesh-service (8002).
-ONTOLOGY_API_URL="${AGENTICDATA_ONTOLOGY_SERVICE_URL:-http://localhost:8003}"
+ONTOLOGY_API_URL="${DATACODE_ONTOLOGY_SERVICE_URL:-http://localhost:8003}"
 
 # -------------------------------------------------------------------
 # Resolve workspace path (required for backend API commands)
 # -------------------------------------------------------------------
 _resolve_workspace_path() {
-    if [[ -n "${AGENTICDATA_WORKSPACE_PATH:-}" ]]; then
-        echo "${AGENTICDATA_WORKSPACE_PATH}"
+    if [[ -n "${DATACODE_WORKSPACE_PATH:-}" ]]; then
+        echo "${DATACODE_WORKSPACE_PATH}"
         return
     fi
     # Preferred: platform layout — walk up to the directory whose
@@ -155,9 +155,9 @@ _resolve_sqlmesh_project_dir() {
 # -------------------------------------------------------------------
 # Resolve user identity
 # -------------------------------------------------------------------
-USER_ID="${AGENTICDATA_USER_ID:-${USER:-unknown}}"
-TRIGGER_TYPE="${AGENTICDATA_TRIGGER_TYPE:-human}"
-SESSION_ID="${AGENTICDATA_SESSION_ID:-}"
+USER_ID="${DATACODE_USER_ID:-${USER:-unknown}}"
+TRIGGER_TYPE="${DATACODE_TRIGGER_TYPE:-human}"
+SESSION_ID="${DATACODE_SESSION_ID:-}"
 
 # -------------------------------------------------------------------
 # Check if an argument list contains a specific flag
@@ -194,16 +194,16 @@ _extract_explicit_env() {
 # Resolve the AUTHORITATIVE environment for plan/apply.
 #
 # Priority (anti-hallucination):
-#   1. AGENTICDATA_ENVIRONMENT — the environment the user selected in the
+#   1. DATACODE_ENVIRONMENT — the environment the user selected in the
 #      toolbar, injected by the agent shell tool. This is the single source
 #      of truth and overrides whatever the LLM passed on the command line.
 #   2. The explicit positional env argument — used only for direct human CLI
-#      usage where AGENTICDATA_ENVIRONMENT is not injected.
+#      usage where DATACODE_ENVIRONMENT is not injected.
 #   3. "dev" — conservative fallback when nothing is available.
 # -------------------------------------------------------------------
 _resolve_env() {
-    if [[ -n "${AGENTICDATA_ENVIRONMENT:-}" ]]; then
-        echo "${AGENTICDATA_ENVIRONMENT}"
+    if [[ -n "${DATACODE_ENVIRONMENT:-}" ]]; then
+        echo "${DATACODE_ENVIRONMENT}"
         return
     fi
     local explicit
@@ -258,7 +258,7 @@ _export_api_env() {
     workspace_path=$(_resolve_workspace_path)
     if [[ -z "$workspace_path" ]]; then
         echo "[sqlmesh.sh] ERROR: Cannot determine workspace_path." >&2
-        echo "[sqlmesh.sh] Set AGENTICDATA_WORKSPACE_PATH or run from within a sqlmesh project." >&2
+        echo "[sqlmesh.sh] Set DATACODE_WORKSPACE_PATH or run from within a sqlmesh project." >&2
         exit 1
     fi
     env_name=$(_resolve_env "$@")
@@ -583,7 +583,7 @@ _handle_plan_command() {
 
     # Warn (and override) when the LLM-supplied env disagrees with the
     # authoritative toolbar environment — guards against hallucinated targets.
-    if [[ -n "${AGENTICDATA_ENVIRONMENT:-}" && -n "$explicit_env" && "$explicit_env" != "$env_name" ]]; then
+    if [[ -n "${DATACODE_ENVIRONMENT:-}" && -n "$explicit_env" && "$explicit_env" != "$env_name" ]]; then
         echo "[sqlmesh.sh] WARNING: requested env '$explicit_env' overridden by active environment '$env_name'" >&2
     fi
 
@@ -605,7 +605,7 @@ _handle_apply_command() {
 
     # Warn (and override) when the LLM-supplied env disagrees with the
     # authoritative toolbar environment — guards against hallucinated targets.
-    if [[ -n "${AGENTICDATA_ENVIRONMENT:-}" && -n "$explicit_env" && "$explicit_env" != "$env_name" ]]; then
+    if [[ -n "${DATACODE_ENVIRONMENT:-}" && -n "$explicit_env" && "$explicit_env" != "$env_name" ]]; then
         echo "[sqlmesh.sh] WARNING: requested env '$explicit_env' overridden by active environment '$env_name'" >&2
     fi
 
@@ -627,7 +627,7 @@ _handle_create_external_models_command() {
     workspace_path=$(_resolve_workspace_path)
     if [[ -z "$workspace_path" ]]; then
         echo "[sqlmesh.sh] ERROR: Cannot determine workspace_path." >&2
-        echo "[sqlmesh.sh] Set AGENTICDATA_WORKSPACE_PATH or run from within a sqlmesh project." >&2
+        echo "[sqlmesh.sh] Set DATACODE_WORKSPACE_PATH or run from within a sqlmesh project." >&2
         exit 1
     fi
 
@@ -749,7 +749,7 @@ _handle_ontology_command() {
     workspace_path=$(_resolve_workspace_path)
     if [[ -z "$workspace_path" ]]; then
         echo "[sqlmesh.sh] ERROR: Cannot determine workspace_path." >&2
-        echo "[sqlmesh.sh] Set AGENTICDATA_WORKSPACE_PATH or run from within a sqlmesh project." >&2
+        echo "[sqlmesh.sh] Set DATACODE_WORKSPACE_PATH or run from within a sqlmesh project." >&2
         exit 1
     fi
 
@@ -808,7 +808,7 @@ _handle_ontology_command() {
             echo "  list              List all available ontologies" >&2
             echo "" >&2
             echo "Environment:" >&2
-            echo "  AGENTICDATA_ONTOLOGY_SERVICE_URL  Ontology service URL (default: http://localhost:8003)" >&2
+            echo "  DATACODE_ONTOLOGY_SERVICE_URL  Ontology service URL (default: http://localhost:8003)" >&2
             exit 0
             ;;
         *)
@@ -1006,12 +1006,12 @@ if [[ "$SUBCOMMAND" == "ontology" ]]; then
 fi
 
 # run → REJECTED. Data refresh is a write operation, and the native binary
-# ignores AGENTICDATA_ENVIRONMENT — it would bypass the environment
+# ignores DATACODE_ENVIRONMENT — it would bypass the environment
 # guardrail, the environment lock, and the audit trail.
 if [[ "$SUBCOMMAND" == "run" ]]; then
     echo "[sqlmesh.sh] ERROR: 'sqlmesh run' is disabled on this platform." >&2
     echo "[sqlmesh.sh] 'run' refreshes data. The native binary does not read" >&2
-    echo "[sqlmesh.sh] AGENTICDATA_ENVIRONMENT, so it would bypass the environment" >&2
+    echo "[sqlmesh.sh] DATACODE_ENVIRONMENT, so it would bypass the environment" >&2
     echo "[sqlmesh.sh] guardrail, the environment lock, and auditing. Use instead:" >&2
     echo "[sqlmesh.sh]   1) sqlmesh plan / sqlmesh apply <env>   # versioned data landing" >&2
     echo "[sqlmesh.sh]   2) dc run <job_name>                    # orchestrated refresh via Dagster" >&2

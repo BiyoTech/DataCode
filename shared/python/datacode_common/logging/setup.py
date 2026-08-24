@@ -21,7 +21,7 @@ def setup_logging(
         basic_format: Format string for the stdlib handler behind structlog.
         workspace_sink: Optional processor mirroring records that carry a
             ``workspace_path`` into that workspace's ``logs/`` directory (see
-            :class:`agenticdata_common.logging.workspace_sink.WorkspaceLogSink`).
+            :class:`datacode_common.logging.workspace_sink.WorkspaceLogSink`).
             It runs just before rendering, so it sees the fully enriched event
             dict while stdout output stays byte-for-byte unchanged.
     """

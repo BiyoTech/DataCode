@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package common.v1;
 
-option go_package = "github.com/agenticdata/proto/common/v1;commonv1";
+option go_package = "github.com/datacode/proto/common/v1;commonv1";
 
 // Pagination request parameters
 message PaginationRequest {

@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from agenticdata_common.logging.redact import redact_string
+from datacode_common.logging.redact import redact_string
 
 from src.config import settings
 from src.utils.errors import ServiceError, extract_root_cause

@@ -21,11 +21,11 @@ def build_database_url(
     sqlite_path: str | None = None,
     host: str = "localhost",
     port: int | None = None,
-    name: str = "agenticdata",
+    name: str = "datacode",
     username: str = "",
     password: str = "",
     project_root: Path | None = None,
-    sqlite_default: str = ".data/agenticdata.db",
+    sqlite_default: str = ".data/datacode.db",
 ) -> str:
     """Return SQLAlchemy async URL for sqlite | postgresql | mysql."""
     normalized = db_type.lower().strip()

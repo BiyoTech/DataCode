@@ -1,4 +1,4 @@
-# AgenticData - AI Native DataOps Platform
+# DataCode - AI Native DataOps Platform
 
 An AI-native Data+AI development platform built on **SQLMesh + Daft + Dagster + OpenAI Agents SDK**,
 enabling conversational data model development and Data+AI pipeline orchestration through natural language.
@@ -66,7 +66,7 @@ accounts during development.
 ## Project Structure
 
 ```
-AgenticData/
+DataCode/
 ├── proto/                 # Protobuf IDL definitions (contract drafts; HTTP REST in use today)
 ├── gateway/               # API Gateway (Go - Chi)
 ├── agent-service/         # Agent Service (Python - openai-agents SDK)
@@ -117,7 +117,7 @@ Configured via `conf/dagster-service.yaml` (`dagster.mode: local | remote`), or 
 
 - **`local`** (default, zero external dependency): `dagster-service` starts three subprocesses —
   `dagster-daemon`, `dagster-webserver` (port `3001`), and the Code Location gRPC server (port `4000`).
-  Metadata is stored in SQLite under `~/.agenticdata/dagster_home`.
+  Metadata is stored in SQLite under `~/.datacode/dagster_home`.
 - **`remote`**: `dagster-service` starts only the Code Location gRPC server (still local). The daemon,
   webserver, and PostgreSQL-backed DagsterInstance run on a remote cluster. Set
   `dagster.remote_graphql_url` to the remote webserver GraphQL endpoint; the auth token is read from
@@ -129,7 +129,7 @@ dagster:
   mode: "local"                 # "local" | "remote"
   code_location_port: 4000      # gRPC server for user code — always local
   webserver_port: 3001          # local mode only
-  home: "~/.agenticdata/dagster_home"
+  home: "~/.datacode/dagster_home"
   remote_graphql_url: ""        # remote mode only, e.g. http://dagster-prod:3000/graphql
 ```
 

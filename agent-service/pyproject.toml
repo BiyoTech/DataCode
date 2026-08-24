@@ -17,7 +17,7 @@ dependencies = [
     "pyyaml>=6.0.0",
     "aiosqlite>=0.20.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "agenticdata-common @ file:../shared/python",
+    "datacode-common @ file:../shared/python",
 ]
 
 [tool.hatch.metadata]

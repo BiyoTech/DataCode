@@ -47,7 +47,7 @@ LEGACY_ERRORS_DIR = "errors"
 # Paths are anchored to the workspace root (leading ``/``) where the entry only
 # makes sense there, so a same-named user directory deeper in the tree is not
 # silently ignored.
-WORKSPACE_GITIGNORE = f"""# AgenticData workspace — generated at creation time.
+WORKSPACE_GITIGNORE = f"""# DataCode workspace — generated at creation time.
 # Runtime artifacts only: everything below is regenerable and must stay untracked.
 
 # Platform runtime logs and error archive

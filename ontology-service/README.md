@@ -1,6 +1,6 @@
 # Ontology Service
 
-Semantic layer core library for the AgenticData platform. Provides structured,
+Semantic layer core library for the DataCode platform. Provides structured,
 on-demand retrieval of business concepts (entities, relationships, metrics)
 defined in per-workspace ontology YAML files, enabling AI agents to generate
 accurate SQL without一次性 loading the full context.

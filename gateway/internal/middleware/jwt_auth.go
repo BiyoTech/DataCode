@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/agenticdata/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/auth"
 )
 
 // publicPaths are the only endpoints reachable without an access token.

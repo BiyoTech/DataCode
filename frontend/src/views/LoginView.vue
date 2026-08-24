@@ -118,7 +118,7 @@ function backToSignIn() {
 
     <div class="login-card" :class="{ 'is-wide': showIdentityPicker }">
       <div class="login-header">
-        <h1 class="app-logo">AgenticData</h1>
+        <h1 class="app-logo">DataCode</h1>
         <p class="app-tagline">{{ t('login.tagline') }}</p>
       </div>
 

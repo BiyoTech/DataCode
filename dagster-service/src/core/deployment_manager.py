@@ -16,7 +16,7 @@ What this module adds on top of :mod:`src.core.code_location_manager`
   process for the scaffold's gate to read (design §7.2). Non-production defaults
   to "no schedules": a branch deployment loads the very same code as production,
   so without the gate a feature branch would drive production data on every tick.
-* **Attribution.** Run tags (``agenticdata/environment``, ``.../workspace_id``,
+* **Attribution.** Run tags (``datacode/environment``, ``.../workspace_id``,
   ``.../deployment``) make every run answerable for which environment produced
   it — the open-source Dagster instance has no deployment isolation of its own,
   so the location namespace plus these tags is what separates environments
@@ -50,9 +50,9 @@ logger = get_logger(__name__)
 
 # Run tag namespace. Prefixed keys keep platform tags apart from user tags in
 # the Dagster UI and in run filters.
-TAG_ENVIRONMENT = "agenticdata/environment"
-TAG_WORKSPACE_ID = "agenticdata/workspace_id"
-TAG_DEPLOYMENT = "agenticdata/deployment"
+TAG_ENVIRONMENT = "datacode/environment"
+TAG_WORKSPACE_ID = "datacode/workspace_id"
+TAG_DEPLOYMENT = "datacode/deployment"
 
 # Default Dagster repository name inside a code location loaded from a single
 # ``definitions.py``.
@@ -83,12 +83,12 @@ class DeploymentSpec:
         available to any user asset that needs to know where it is running.
         """
         return {
-            "AGENTICDATA_ENVIRONMENT": self.environment,
-            "AGENTICDATA_DEPLOYMENT": self.deployment_name,
-            "AGENTICDATA_DEPLOYMENT_TYPE": self.env_type,
-            "AGENTICDATA_WORKSPACE_ID": self.workspace_id,
-            "AGENTICDATA_TENANT_ID": self.tenant_id,
-            "AGENTICDATA_SCHEDULES_ENABLED": "1" if self.schedules_enabled else "0",
+            "DATACODE_ENVIRONMENT": self.environment,
+            "DATACODE_DEPLOYMENT": self.deployment_name,
+            "DATACODE_DEPLOYMENT_TYPE": self.env_type,
+            "DATACODE_WORKSPACE_ID": self.workspace_id,
+            "DATACODE_TENANT_ID": self.tenant_id,
+            "DATACODE_SCHEDULES_ENABLED": "1" if self.schedules_enabled else "0",
         }
 
     def run_tags(self) -> dict[str, str]:

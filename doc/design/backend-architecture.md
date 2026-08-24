@@ -1,16 +1,16 @@
-# 后台架构设计 — AgenticData Data+AI 一体化平台
+# 后台架构设计 — DataCode Data+AI 一体化平台
 
-> AgenticData — Data+AI 一体化 AI 原生开发平台
+> DataCode — Data+AI 一体化 AI 原生开发平台
 > 将传统数据工程（ELT、数据建模、数据质量、血缘）与现代 AI 工程（模型训练/推理、特征工程、RAG 索引构建）统一在一个 AI 原生开发平台中
 > 技术底座：FastAPI 微服务 + SQLMesh ContextPool + Dagster Code Location + openai-agents SDK
 
 ## 0. 平台定位
 
-AgenticData 是一个 **Data+AI 一体化 AI 原生开发平台**。传统数据平台与 AI 平台是割裂的（数据工程师用 dbt/Airflow，AI 工程师用 MLflow/Kubeflow），AgenticData 将两者统一在同一个用户工作区内，由 AI Agent 贯穿全流程。
+DataCode 是一个 **Data+AI 一体化 AI 原生开发平台**。传统数据平台与 AI 平台是割裂的（数据工程师用 dbt/Airflow，AI 工程师用 MLflow/Kubeflow），DataCode 将两者统一在同一个用户工作区内，由 AI Agent 贯穿全流程。
 
 ### 0.1 核心理念
 
-| 维度 | 传统数据平台 | 传统 AI 平台 | AgenticData |
+| 维度 | 传统数据平台 | 传统 AI 平台 | DataCode |
 |------|------------|------------|-------------|
 | 数据建模 | dbt / SQLMesh | 手写 SQL | SQLMesh（SQL Warehouse） |
 | 流水线编排 | Airflow | Kubeflow / Metaflow | Dagster（Asset Dag） |
@@ -23,7 +23,7 @@ AgenticData 是一个 **Data+AI 一体化 AI 原生开发平台**。传统数据
 每个用户工作区（Workspace）包含两个互补的工程子域：
 
 ```
-~/.agenticdata/workspaces/{user_id}/{workspace_name}/
+~/.datacode/workspaces/{user_id}/{workspace_name}/
 │
 ├── SQL Warehouse (SQLMesh)          # ① 数据仓库 / 数据建模
 │   ├── config.yaml                   # SQLMesh 配置 (gateways, state sync)
@@ -93,7 +93,7 @@ AgenticData 是一个 **Data+AI 一体化 AI 原生开发平台**。传统数据
 - **Data+AI 统一**：一个工作区内同时管理数据仓库（SQLMesh）和 AI Pipeline（Dagster），AI Agent 贯穿两者
 - **进程内并发**：FastAPI async + `asyncio.to_thread` 卸载阻塞的 SQLMesh 调用，单进程服务多用户
 - **Context 复用**：SQLMesh Context 按 `(workspace_path, gateway)` 缓存，TTL/LRU 淘汰，dirty flag 延迟刷新
-- **工作区隔离**：每个用户工作区是独立目录 `~/.agenticdata/workspaces/{user_id}/{workspace_name}/`，含独立 Git clone、SQL Warehouse 和 Asset Dag
+- **工作区隔离**：每个用户工作区是独立目录 `~/.datacode/workspaces/{user_id}/{workspace_name}/`，含独立 Git clone、SQL Warehouse 和 Asset Dag
 - **Fail-soft**：数据库不可用时降级为磁盘扫描；sqlmesh-service 不可用时 ontology 跳过外部验证
 - **统一错误格式**：所有服务返回 `{error_code, message, detail?}` 结构化错误
 
@@ -531,7 +531,7 @@ dagster-service/src/
 │   └── defs/ (assets/jobs/resources/schedules/sensors)
 └── utils/
     ├── errors.py              # 类型化异常 + 错误码
-    └── logging.py            # structlog (复用 agenticdata_common)
+    └── logging.py            # structlog (复用 datacode_common)
 ```
 
 ### 5.2 双模式架构
@@ -561,7 +561,7 @@ POST /api/v1/dagster/deployments/ensure { workspace_path[, env_type, schedules_e
       ├─ scaffold 自愈 (fill-missing 模板 + 强制覆盖 sql_assets.py / defs/deployment.py)
       ├─ 生成 definitions.py 检查
       ├─ 分配端口 (从 4000 递增，持久化到 DAGSTER_HOME/code_location_ports.json)
-      ├─ 注入 deployment 身份 (AGENTICDATA_ENVIRONMENT / _DEPLOYMENT / _DEPLOYMENT_TYPE /
+      ├─ 注入 deployment 身份 (DATACODE_ENVIRONMENT / _DEPLOYMENT / _DEPLOYMENT_TYPE /
       │   _WORKSPACE_ID / _SCHEDULES_ENABLED) + SQLMesh 桥接变量
       ├─ 启动 gRPC 服务器子进程
       └─ 等待健康检查通过 → 写 workspace.yaml → 通知 DagsterInstance
@@ -716,7 +716,7 @@ ontology-service/src/
 ### 7.1 目录结构
 
 ```
-~/.agenticdata/workspaces/{user_id}/{workspace_name}/
+~/.datacode/workspaces/{user_id}/{workspace_name}/
 │
 ├── ① SQL Warehouse (SQLMesh)           # 传统数据工程
 │   ├── config.yaml                # SQLMesh 配置 (state isolation)
@@ -802,7 +802,7 @@ result = await asyncio.to_thread(context.plan, ...)
 
 所有服务遵循统一优先级：**环境变量 > YAML 文件 > 默认值**
 
-配置文件位于 `conf/{service-name}.yaml`，通过 `agenticdata_common.config.yaml_loader` 加载。
+配置文件位于 `conf/{service-name}.yaml`，通过 `datacode_common.config.yaml_loader` 加载。
 
 ### 9.2 关键配置项
 
@@ -810,7 +810,7 @@ result = await asyncio.to_thread(context.plan, ...)
 |------|--------|--------|------|
 | SQLMesh | `context_pool_max_size` | 20 | 最大缓存 Context 数 |
 | SQLMesh | `db_type` | sqlite | 元数据 DB 类型 (sqlite/postgres) |
-| SQLMesh | `workspace_base_path` | ~/.agenticdata/workspaces | 工作区根目录 |
+| SQLMesh | `workspace_base_path` | ~/.datacode/workspaces | 工作区根目录 |
 | Dagster | `dagster_mode` | local | local/remote 模式 |
 | Dagster | `sqlmesh_service_url` | http://localhost:8002 | 桥接目标 |
 | Ontology | `ONTOLOGY_SQLMESH_SERVICE_URL` | http://localhost:8002 | 验证目标 |
@@ -847,7 +847,7 @@ result = await asyncio.to_thread(context.plan, ...)
 
 可归因到工作区的日志额外以 NDJSON 镜像到 `{workspace}/logs/service/{service}.{date}.ndjson`，一行一条记录，**级别是字段而非目录**——按级别分目录会把同一次请求的因果链拆散。没有工作区归属的日志（服务启动、鉴权、后台 reaper）只留在 stdout。
 
-写入由 `agenticdata_common.logging.workspace_sink.WorkspaceLogSink` 作为 structlog 处理器完成：单次 `os.write` 追加 `O_APPEND` 描述符（多进程不交错）、文件句柄 LRU、按工作区令牌桶限流、单行截断、按天滚动与保留期清理，且**任何失败都不会抛出**。配置见 `conf/platform.yaml` 的 `logging.workspace_file`。
+写入由 `datacode_common.logging.workspace_sink.WorkspaceLogSink` 作为 structlog 处理器完成：单次 `os.write` 追加 `O_APPEND` 描述符（多进程不交错）、文件句柄 LRU、按工作区令牌桶限流、单行截断、按天滚动与保留期清理，且**任何失败都不会抛出**。配置见 `conf/platform.yaml` 的 `logging.workspace_file`。
 
 请求上下文（`trace_id` / `user_id` / `tenant_id`）由 `LogContextMiddleware` 绑定，工作区上下文（`workspace_path` / `workspace_id` / `environment`）由 `validate_workspace_path` 绑定——它是 query 与 body 两条路径的唯一入口。`trace_id` 由 Gateway 生成并经 `X-Trace-ID` 透传，用于跨服务对齐同一次操作。
 

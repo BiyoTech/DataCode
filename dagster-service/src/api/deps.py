@@ -9,7 +9,7 @@ from typing import Annotated
 
 from fastapi import Depends
 
-from agenticdata_common.logging.context import bind_workspace_context
+from datacode_common.logging.context import bind_workspace_context
 
 from src.config import settings
 from src.core.dagster_client import get_dagster_client

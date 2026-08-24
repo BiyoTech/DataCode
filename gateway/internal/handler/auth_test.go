@@ -13,9 +13,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/agenticdata/gateway/internal/auth"
-	"github.com/agenticdata/gateway/internal/middleware"
-	"github.com/agenticdata/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/middleware"
+	"github.com/datacode/gateway/internal/rbac"
 )
 
 // newTestAuthHandler builds a handler backed by a temporary database.
