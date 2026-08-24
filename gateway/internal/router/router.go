@@ -202,6 +202,11 @@ func Setup(
 			r.Post("/{workspaceID}/open", handler.OpenWorkspace(cfg, logger))
 			r.Get("/{workspaceID}/remote-branches", handler.ListWorkspaceRemoteBranches(cfg, logger))
 
+			// Environment registry — the workspace's development lines. The
+			// backend derives tenant/user from the identity headers, so these
+			// are pure passthrough.
+			r.HandleFunc("/{workspaceID}/environments", handler.GenericProxy(sqlmeshIdentity, logger))
+
 			// Membership management — owned by the gateway, which holds the
 			// role bindings; authorization is enforced by the route map.
 			r.Get("/{workspaceID}/members", handler.ListWorkspaceMembers(authService, rbacService, logger))
@@ -211,6 +216,15 @@ func Setup(
 
 			r.Delete("/{workspaceID}", handler.DeleteWorkspace(cfg, rbacService, logger))
 		})
+
+		// -----------------------------------------------------------------
+		// Environment registry (SQLMesh Service, identity path)
+		// -----------------------------------------------------------------
+		// Addressed by environment id ("{workspace_id}:{environment}"), from
+		// which the route map derives the workspace to authorize against.
+		//   GET    /{envID}          | DELETE /{envID}
+		//   POST   /{envID}/open     | GET    /{envID}/events
+		r.HandleFunc("/environments/*", handler.GenericProxy(sqlmeshIdentity, logger))
 
 		// -----------------------------------------------------------------
 		// Git operations (SQLMesh Service, identity path)
@@ -254,6 +268,19 @@ func Setup(
 		})
 
 		// -----------------------------------------------------------------
+		// Workspace logs (SQLMesh Service, identity path)
+		// -----------------------------------------------------------------
+		r.Route("/logs", func(r chi.Router) {
+			// SSE tail — dedicated handler, the streaming client has no timeout.
+			r.Get("/stream", handler.SSELogs(cfg, logger))
+
+			for _, route := range handler.LogsValidatedRoutes {
+				r.Method(route.Method, route.Pattern,
+					handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
+			}
+		})
+
+		// -----------------------------------------------------------------
 		// Knowledge documents (SQLMesh Service, identity path)
 		// -----------------------------------------------------------------
 		r.Route("/knowledge", func(r chi.Router) {
@@ -290,10 +317,11 @@ func Setup(
 			}
 
 			// Catch-all transparent proxy for pure-passthrough routes:
-			//   GET  /health | /mode | /assets | /pipelines/code-locations
-			//   GET  /runs/{runID} | /runs/{runID}/logs
-			//   POST /pipelines/run | /pipelines/code-location/ensure
-			//   POST /pipelines/code-location/reload | /runs/{runID}/cancel
+			//   GET    /health | /mode | /assets | /deployments | /deployments/diff
+			//   GET    /runs/{runID} | /runs/{runID}/logs
+			//   POST   /pipelines/run | /deployments/ensure | /deployments/reload
+			//   POST   /runs/{runID}/cancel
+			//   DELETE /deployments/{deployment}
 			r.HandleFunc("/*", handler.GenericProxy(dagsterTarget, logger))
 		})
 	})

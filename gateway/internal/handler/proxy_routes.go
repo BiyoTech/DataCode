@@ -8,12 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path"
-	"strings"
 
 	"go.uber.org/zap"
 
 	"github.com/agenticdata/gateway/internal/middleware"
+	"github.com/agenticdata/gateway/internal/rbac"
 )
 
 // ValidatedRoute describes a route that requires certain query parameters
@@ -89,10 +88,11 @@ func MakeValidatedProxy(target ProxyTarget, route ValidatedRoute, logger *zap.Lo
 // assertWorkspacePathOwnership verifies that a `workspace_path` query parameter
 // addresses the caller's own working copy.
 //
-// Working copies live at `{base}/{tenant}/{workspace}/{user}`, so the last path
-// segment must equal the authenticated user ID. Containment and layout are
+// Working copies live at `{base}/{tenant}/{workspace}/{user}/envs/{env}`, so the
+// owning user is encoded in the path itself. Containment and layout are
 // re-validated by the backend; this check only stops one member from operating
-// on another member's checkout. Requests without the parameter are untouched.
+// on another member's checkout, which holds their uncommitted work. Requests
+// without the parameter are untouched.
 func assertWorkspacePathOwnership(
 	w http.ResponseWriter, r *http.Request, logger *zap.Logger,
 ) bool {
@@ -104,7 +104,7 @@ func assertWorkspacePathOwnership(
 	if userID == "" {
 		return true
 	}
-	if path.Base(path.Clean(strings.ReplaceAll(workspacePath, "\\", "/"))) == userID {
+	if rbac.OwnsWorkingCopy(workspacePath, userID) {
 		return true
 	}
 
@@ -145,7 +145,10 @@ func readRequestBody(r *http.Request) ([]byte, error) {
 var SQLMeshValidatedRoutes = []ValidatedRoute{
 	{Method: "GET", Pattern: "/models", Required: []string{"workspace_path"}},
 	{Method: "GET", Pattern: "/lineage", Required: []string{"workspace_path"}},
-	{Method: "GET", Pattern: "/environments", Required: []string{"workspace_path"}},
+	// The engine-side environment view is a reconciliation/troubleshooting read.
+	// The user-facing environment list is served by the registry API under
+	// /api/v1/workspaces/{id}/environments.
+	{Method: "GET", Pattern: "/engine/environments", Required: []string{"workspace_path"}},
 	{Method: "GET", Pattern: "/test", Required: []string{"workspace_path"}},
 	{Method: "GET", Pattern: "/table-diff", Required: []string{"workspace_path", "source", "target"}},
 	{Method: "GET", Pattern: "/apply/history", Required: []string{"workspace_path"}},
@@ -177,6 +180,16 @@ var GitValidatedRoutes = []ValidatedRoute{
 // FilesValidatedRoutes defines validated routes under the /files route group.
 var FilesValidatedRoutes = []ValidatedRoute{
 	{Method: "GET", Pattern: "/read", Required: []string{"workspace_path", "file_path"}},
+}
+
+// LogsValidatedRoutes defines the workspace log reads under /logs. Every one
+// requires workspace_path: a log query without a resolvable workspace has no
+// legitimate meaning, and letting one through would hand the caller whichever
+// workspace the backend happened to pick.
+var LogsValidatedRoutes = []ValidatedRoute{
+	{Method: "GET", Pattern: "/", Required: []string{"workspace_path"}},
+	{Method: "GET", Pattern: "/errors", Required: []string{"workspace_path"}},
+	{Method: "GET", Pattern: "/errors/{errorID}", Required: []string{"workspace_path"}},
 }
 
 // KnowledgeValidatedRoutes defines validated GET routes under the /knowledge

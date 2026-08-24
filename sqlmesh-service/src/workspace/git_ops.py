@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import threading
 import typing as t
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import quote, urlparse
 
 import asyncio
@@ -59,8 +59,6 @@ _DEFAULT_TOKEN_USERNAME = "oauth2"
 #
 # Branch: must start alphanumeric, then a conservative ref character set.
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
-# Remote-qualified start point, e.g. "origin/feature/x".
-_START_POINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 # Abbreviated or full object name.
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -72,11 +70,6 @@ RESET_MODES = ("soft", "mixed", "hard")
 def is_valid_branch_name(name: str) -> bool:
     """Whether ``name`` is a branch name safe to pass to git."""
     return bool(_BRANCH_RE.match(name or ""))
-
-
-def is_valid_start_point(ref: str) -> bool:
-    """Whether ``ref`` is a start point (possibly ``remote/branch``) safe for git."""
-    return bool(_START_POINT_RE.match(ref or ""))
 
 
 def is_valid_commit_hash(value: str) -> bool:
@@ -170,12 +163,119 @@ class WorktreeChange:
 
 
 @dataclass
+class BranchDiffFile:
+    """One file that differs between two branches.
+
+    ``status`` is the raw ``git diff --name-status`` letter, so the frontend
+    decorates a branch diff exactly like it decorates a commit or the working
+    tree.
+    """
+
+    path: str
+    status: str
+    original_path: str = ""
+
+
+@dataclass
+class MergeProbe:
+    """Result of a three-way merge computed WITHOUT a working tree.
+
+    ``tree`` is the merged tree object name and is only meaningful when the
+    merge is clean; ``conflicts`` lists the paths git could not resolve on its
+    own. ``ok`` reports that the probe itself ran, not that the merge is clean.
+    """
+
+    ok: bool
+    tree: str = ""
+    conflicts: t.List[str] = field(default_factory=list)
+    detail: str = ""
+
+    @property
+    def clean(self) -> bool:
+        """Whether the merge can be created without human intervention."""
+        return self.ok and not self.conflicts
+
+
+@dataclass
+class WorktreeMergeResult:
+    """Outcome of a merge performed inside one working copy.
+
+    A conflict is NOT a failure here: the conflicted state is left in the
+    working tree on purpose, which is where the user resolves it. ``ok`` is
+    therefore False only when git refused to start the merge at all.
+    """
+
+    ok: bool
+    conflicts: t.List[str] = field(default_factory=list)
+    merge_commit: str = ""
+    already_up_to_date: bool = False
+    detail: str = ""
+
+
+# How a pull ended. Reported explicitly instead of being flattened into a
+# boolean, because the caller has to react differently to each case: only a
+# working tree that actually changed invalidates the SQLMesh context, and a
+# conflicted merge is a SUCCESSFUL start of a resolution the user finishes in
+# the editor.
+PULL_UP_TO_DATE = "up_to_date"
+PULL_FAST_FORWARD = "fast_forward"
+PULL_MERGED = "merged"
+PULL_CONFLICTED = "conflicted"
+# Integration could not even be started because tracked files are uncommitted.
+# Not a remote failure: nothing was contacted or written, the user just has to
+# commit or discard first.
+PULL_BLOCKED = "blocked"
+
+# Paths listed in a log line when a pull is refused; the full list would turn a
+# log entry into a file dump without adding diagnostic value.
+_MAX_LOGGED_DIRTY_PATHS = 5
+
+
+@dataclass
+class PullResult:
+    """Outcome of integrating a remote branch into its local counterpart.
+
+    ``outcome`` is one of the ``PULL_*`` constants. ``reason`` is only set for a
+    genuine remote failure (``ok`` False, ``outcome`` empty) and is then one of
+    :class:`GitRemoteReason`.
+    """
+
+    ok: bool
+    outcome: str = ""
+    reason: str = ""
+    detail: str = ""
+    # Paths git could not merge on its own; they stay in the working tree.
+    conflicts: t.List[str] = field(default_factory=list)
+    # HEAD after the integration (empty when nothing was written).
+    commit: str = ""
+    # Commits the remote branch brought in (0 when already up to date).
+    integrated_commits: int = 0
+
+
+@dataclass
 class GitRepoInfo:
     """Remote Git repository metadata."""
     clone_url: str
     html_url: str
     name: str
     default_branch: str = "main"
+
+
+@dataclass
+class WorktreeEntry:
+    """One entry of ``git worktree list``.
+
+    ``branch`` is the short branch name, empty for a detached or bare entry.
+    The bare entry is the shared object database itself (``.repo``), never a
+    working copy, which is why callers filter it out.
+    """
+
+    path: str
+    branch: str = ""
+    bare: bool = False
+    detached: bool = False
+    locked: bool = False
+    prunable: bool = False
 
 
 def validate_git_repo_url(url: str) -> str:
@@ -532,44 +632,6 @@ class GitOperations:
         return branches
 
     @staticmethod
-    def fetch_and_checkout(
-        workspace_path: str,
-        branch: str,
-        auth: t.Optional[GitAuth] = None,
-        remote: str = "origin",
-    ) -> GitCommandResult:
-        """Fetch from ``remote`` and check out ``branch`` in an existing clone.
-
-        Used when a member re-opens a workspace they already have locally and
-        possibly switches branch.
-        """
-        _ensure_clean_remote(workspace_path, remote)
-
-        fetch = _run_git(workspace_path, ["fetch", remote, "--prune"], auth)
-        if fetch.returncode != 0:
-            return _failed_result(
-                "git_fetch_failed", fetch.stderr, auth, workspace=workspace_path
-            )
-
-        checkout = _run_git(workspace_path, ["checkout", branch])
-        if checkout.returncode != 0:
-            # Branch not present locally yet: create it tracking the remote.
-            checkout = _run_git(
-                workspace_path, ["checkout", "-B", branch, f"{remote}/{branch}"]
-            )
-        if checkout.returncode != 0:
-            return _failed_result(
-                "git_checkout_failed",
-                checkout.stderr,
-                auth,
-                workspace=workspace_path,
-                branch=branch,
-            )
-
-        logger.info("git_checked_out", workspace=workspace_path, branch=branch)
-        return GitCommandResult(ok=True)
-
-    @staticmethod
     def add_remote(
         workspace_path: str, remote_url: str, remote_name: str = "origin"
     ) -> bool:
@@ -613,21 +675,219 @@ class GitOperations:
         branch: str = "main",
         remote: str = "origin",
         auth: t.Optional[GitAuth] = None,
-    ) -> GitCommandResult:
-        """Pull latest from ``remote``."""
+        allow_merge: bool = True,
+    ) -> PullResult:
+        """Integrate ``remote/branch`` into the checked-out branch.
+
+        Deliberately NOT ``git pull``: since Git 2.27 that command REFUSES to
+        run on divergent branches unless ``pull.rebase`` is configured, so a
+        plain ``git pull`` makes the platform's behaviour depend on ambient user
+        or machine configuration — and fails outright for every environment
+        branch that has both local and remote commits.
+
+        The integration is therefore explicit and configuration-independent:
+
+        1. fetch the ONE branch into its remote-tracking ref;
+        2. classify the relation between ``HEAD`` and that ref;
+        3. fast-forward when possible, otherwise create a real merge commit
+           (never a rebase: an environment branch is shared, and rewriting
+           published commits under a teammate is not something a pull may do).
+
+        Conflicts are left in the working tree — that is where the user resolves
+        them, exactly like after a "sync with base". Uncommitted tracked changes
+        block the integration BEFORE anything is fetched into the working tree,
+        because a half-applied merge over dirty files is the worst state to hand
+        a user.
+        """
+        if not is_valid_branch_name(branch):
+            return PullResult(
+                ok=False,
+                reason=GitRemoteReason.BRANCH_NOT_FOUND,
+                detail=f"invalid branch name {branch!r}",
+            )
+
         _ensure_clean_remote(workspace_path, remote)
 
-        result = _run_git(workspace_path, ["pull", remote, branch], auth)
-        if result.returncode == 0:
-            logger.info("git_pulled", workspace=workspace_path, branch=branch)
-            return GitCommandResult(ok=True)
-        return _failed_result(
-            "git_pull_failed",
-            result.stderr,
+        # An explicit refspec keeps the remote-tracking ref authoritative: the
+        # integration below reasons about `refs/remotes/<remote>/<branch>`, never
+        # about FETCH_HEAD, so a later `git status` reports the same ahead/behind
+        # the pull acted on.
+        tracking_ref = f"refs/remotes/{remote}/{branch}"
+        fetch = _run_git(
+            workspace_path,
+            ["fetch", remote, f"+refs/heads/{branch}:{tracking_ref}"],
             auth,
+        )
+        if fetch.returncode != 0:
+            failed = _failed_result(
+                "git_pull_fetch_failed",
+                fetch.stderr,
+                auth,
+                workspace=workspace_path,
+                branch=branch,
+            )
+            return PullResult(ok=False, reason=failed.reason, detail=failed.detail)
+
+        target = GitWorktreeOperations.head_commit_of(workspace_path, tracking_ref)
+        if not target:
+            return PullResult(
+                ok=False,
+                reason=GitRemoteReason.BRANCH_NOT_FOUND,
+                detail=f"branch {branch!r} does not exist on {remote}",
+            )
+
+        head = GitWorktreeOperations.head_commit(workspace_path)
+        if not head:
+            # Unborn HEAD: there is no local history to integrate INTO. Every
+            # platform working copy is created from a commit, so this only
+            # happens in a hand-made repository — reported rather than guessed.
+            return PullResult(
+                ok=False,
+                reason=GitRemoteReason.UNKNOWN,
+                detail="this working copy has no commit checked out",
+            )
+
+        # Nothing to integrate when the remote tip is already an ancestor of
+        # HEAD: either identical, or the local branch is simply ahead. Both are
+        # "up to date" from a pull's point of view.
+        if GitWorktreeOperations.is_ancestor(workspace_path, target, head):
+            logger.info(
+                "git_pulled",
+                workspace=workspace_path,
+                branch=branch,
+                outcome=PULL_UP_TO_DATE,
+            )
+            return PullResult(ok=True, outcome=PULL_UP_TO_DATE, commit=head)
+
+        dirty, unresolved = GitOperations._integration_blockers(workspace_path)
+        if dirty:
+            logger.warning(
+                "git_pull_blocked_by_worktree",
+                workspace=workspace_path,
+                branch=branch,
+                dirty_count=len(dirty),
+                unresolved_count=len(unresolved),
+                dirty_paths=dirty[:_MAX_LOGGED_DIRTY_PATHS],
+            )
+            detail = (
+                f"{len(unresolved)} file(s) of an earlier merge are still unresolved"
+                if unresolved
+                else f"{len(dirty)} uncommitted change(s) in the working copy"
+            )
+            return PullResult(
+                ok=False,
+                outcome=PULL_BLOCKED,
+                detail=detail,
+                conflicts=unresolved,
+            )
+
+        incoming = GitMergeOperations.count_commits(workspace_path, head, target)
+
+        # Fast-forward whenever history allows it: no merge commit is created for
+        # a branch that only fell behind.
+        if GitWorktreeOperations.is_ancestor(workspace_path, head, target):
+            result = _run_git(workspace_path, ["merge", "--ff-only", tracking_ref])
+            if result.returncode != 0:
+                failed = _failed_result(
+                    "git_pull_fast_forward_failed",
+                    result.stderr,
+                    auth,
+                    workspace=workspace_path,
+                    branch=branch,
+                )
+                return PullResult(ok=False, reason=failed.reason, detail=failed.detail)
+            commit = GitWorktreeOperations.head_commit(workspace_path)
+            logger.info(
+                "git_pulled",
+                workspace=workspace_path,
+                branch=branch,
+                outcome=PULL_FAST_FORWARD,
+                commit=commit[:8],
+                integrated_commits=incoming,
+            )
+            return PullResult(
+                ok=True,
+                outcome=PULL_FAST_FORWARD,
+                commit=commit,
+                integrated_commits=incoming,
+            )
+
+        # Divergent: local and remote both advanced.
+        if not allow_merge:
+            return PullResult(
+                ok=False,
+                reason=GitRemoteReason.NON_FAST_FORWARD,
+                detail=(
+                    f"branch {branch!r} has diverged from {remote}/{branch} and "
+                    f"cannot be fast-forwarded"
+                ),
+            )
+
+        merge = GitMergeOperations.merge_in_worktree(
+            workspace_path,
+            tracking_ref,
+            # Mirrors git's own wording for an integration merge, so the history
+            # of an environment branch reads the same as a hand-run pull.
+            f"Merge remote-tracking branch '{remote}/{branch}' into '{branch}'",
+        )
+        if not merge.ok:
+            return PullResult(
+                ok=False,
+                reason=GitRemoteReason.UNKNOWN,
+                detail=merge.detail or "merge failed",
+            )
+        if merge.conflicts:
+            logger.info(
+                "git_pulled",
+                workspace=workspace_path,
+                branch=branch,
+                outcome=PULL_CONFLICTED,
+                conflict_count=len(merge.conflicts),
+            )
+            return PullResult(
+                ok=True,
+                outcome=PULL_CONFLICTED,
+                conflicts=merge.conflicts,
+                integrated_commits=incoming,
+            )
+
+        logger.info(
+            "git_pulled",
             workspace=workspace_path,
             branch=branch,
+            outcome=PULL_MERGED,
+            commit=merge.merge_commit[:8],
+            integrated_commits=incoming,
         )
+        return PullResult(
+            ok=True,
+            outcome=PULL_MERGED,
+            commit=merge.merge_commit,
+            integrated_commits=incoming,
+        )
+
+    @staticmethod
+    def _integration_blockers(
+        workspace_path: str,
+    ) -> t.Tuple[t.List[str], t.List[str]]:
+        """Tracked changes that must not be merged over.
+
+        Returns ``(dirty, unresolved)``: ``dirty`` is every tracked path with
+        uncommitted content (untracked files never block a merge, so they are
+        excluded), ``unresolved`` is the subset left conflicted by an earlier
+        merge. Separating them lets the caller say "finish the merge you started"
+        instead of the misleading "you have uncommitted changes".
+        """
+        changes = GitOperations.list_changes(workspace_path)
+        dirty: t.List[str] = []
+        unresolved: t.List[str] = []
+        for change in changes:
+            if change.status == "?":
+                continue
+            dirty.append(change.path)
+            if change.status == "U":
+                unresolved.append(change.path)
+        return dirty, unresolved
 
     @staticmethod
     def fetch(
@@ -649,44 +909,6 @@ class GitOperations:
             return GitCommandResult(ok=True)
         return _failed_result(
             "git_fetch_failed", result.stderr, auth, workspace=workspace_path
-        )
-
-    @staticmethod
-    def checkout(
-        workspace_path: str,
-        branch: str,
-        create: bool = False,
-        start_point: str = "",
-        track: bool = False,
-    ) -> GitCommandResult:
-        """Check out ``branch``, optionally creating it.
-
-        With ``start_point`` (e.g. ``origin/dev``) and ``track`` the new local
-        branch is wired to its remote counterpart, which is what "materialize a
-        remote branch locally" means: subsequent pull/push need no arguments.
-        """
-        if create:
-            args = ["checkout", "-b", branch]
-            if track and start_point:
-                args += ["--track", start_point]
-            elif start_point:
-                args.append(start_point)
-        else:
-            args = ["checkout", branch]
-
-        result = _run_git(workspace_path, args)
-        if result.returncode == 0:
-            logger.info(
-                "git_checked_out",
-                workspace=workspace_path,
-                branch=branch,
-                created=create,
-                start_point=start_point,
-            )
-            return GitCommandResult(ok=True)
-        return _failed_result(
-            "git_checkout_failed", result.stderr, None,
-            workspace=workspace_path, branch=branch,
         )
 
     @staticmethod
@@ -865,6 +1087,645 @@ class GitOperations:
             return False
 
 
+class GitWorktreeOperations:
+    """Bare-repository and worktree primitives.
+
+    The platform stores one BARE repository per user
+    (``{user_root}/.repo``) and materializes every environment as a linked
+    worktree under ``{user_root}/envs/{env}``. Consequences:
+
+    * objects are shared, so N environments cost O(1) disk instead of O(N);
+    * Git refuses to check out one branch in two worktrees, which enforces the
+      Environment <-> Branch 1:1 invariant for free;
+    * no ``checkout`` is ever needed to switch environment, so uncommitted work
+      in one environment never blocks another.
+
+    Every ref reaching the command line is validated by the caller through
+    :func:`is_valid_branch_name`.
+    """
+
+    # Identity used for commits the platform creates itself (bootstrap commit).
+    # Never a user identity: those commits carry no user content.
+    COMMITTER_NAME = "AgenticData"
+    COMMITTER_EMAIL = "agenticdata@localhost"
+
+    @staticmethod
+    def init_bare(repo_path: str, default_branch: str = "main") -> bool:
+        """Create (idempotently) the bare repository holding shared objects."""
+        os.makedirs(repo_path, exist_ok=True)
+        if os.path.exists(os.path.join(repo_path, "HEAD")):
+            return True
+
+        result = _run_git(repo_path, ["init", "--bare"])
+        if result.returncode != 0:
+            logger.error("git_bare_init_failed", repo=repo_path, stderr=result.stderr)
+            return False
+
+        # Pin HEAD explicitly instead of relying on ``init.defaultBranch``, whose
+        # value depends on the host's git configuration.
+        _run_git(repo_path, ["symbolic-ref", "HEAD", f"refs/heads/{default_branch}"])
+        logger.info("git_bare_initialized", repo=repo_path, default_branch=default_branch)
+        return True
+
+    @staticmethod
+    def create_empty_root_commit(repo_path: str, branch: str) -> str:
+        """Create an empty root commit on ``branch`` and return its hash.
+
+        Bootstrap-only: a worktree cannot be added for an unborn branch, so a
+        workspace created without a remote needs one commit to exist first. Uses
+        plumbing (``write-tree``/``commit-tree``) because a bare repository has
+        no working tree to commit from.
+        """
+        tree = _run_git(repo_path, ["write-tree"])
+        if tree.returncode != 0:
+            logger.error("git_write_tree_failed", repo=repo_path, stderr=tree.stderr)
+            return ""
+
+        commit = _run_git(
+            repo_path,
+            [
+                "-c",
+                f"user.name={GitWorktreeOperations.COMMITTER_NAME}",
+                "-c",
+                f"user.email={GitWorktreeOperations.COMMITTER_EMAIL}",
+                "commit-tree",
+                tree.stdout.strip(),
+                "-m",
+                "Initial commit",
+            ],
+        )
+        if commit.returncode != 0:
+            logger.error("git_commit_tree_failed", repo=repo_path, stderr=commit.stderr)
+            return ""
+
+        commit_hash = commit.stdout.strip()
+        update = _run_git(
+            repo_path, ["update-ref", f"refs/heads/{branch}", commit_hash]
+        )
+        if update.returncode != 0:
+            logger.error("git_update_ref_failed", repo=repo_path, stderr=update.stderr)
+            return ""
+
+        logger.info(
+            "git_root_commit_created",
+            repo=repo_path,
+            branch=branch,
+            commit=commit_hash[:8],
+        )
+        return commit_hash
+
+    @staticmethod
+    def ref_exists(repo_path: str, ref: str) -> bool:
+        """Whether ``ref`` resolves in ``repo_path``."""
+        result = _run_git(repo_path, ["rev-parse", "--verify", "--quiet", ref])
+        return result.returncode == 0
+
+    @staticmethod
+    def local_branch_exists(repo_path: str, branch: str) -> bool:
+        """Whether a local branch exists."""
+        return GitWorktreeOperations.ref_exists(repo_path, f"refs/heads/{branch}")
+
+    @staticmethod
+    def remote_branch_exists(
+        repo_path: str, branch: str, remote: str = "origin"
+    ) -> bool:
+        """Whether a remote-tracking branch exists."""
+        return GitWorktreeOperations.ref_exists(
+            repo_path, f"refs/remotes/{remote}/{branch}"
+        )
+
+    @staticmethod
+    def head_commit(path: str) -> str:
+        """Resolve HEAD of a repository or worktree (empty when unborn)."""
+        result = _run_git(path, ["rev-parse", "HEAD"])
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    @staticmethod
+    def head_commit_of(path: str, ref: str) -> str:
+        """Resolve an arbitrary ref to its commit (empty when it does not exist)."""
+        result = _run_git(path, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    @staticmethod
+    def is_ancestor(path: str, ancestor: str, descendant: str) -> bool:
+        """Whether ``ancestor`` is reachable from ``descendant``.
+
+        This is the fast-forward test: exit code 0 means yes, 1 means no, and
+        anything else (unrelated histories, unknown ref) is reported as "no" so
+        callers fall back to a real merge instead of assuming a safe update.
+        """
+        result = _run_git(
+            path, ["merge-base", "--is-ancestor", ancestor, descendant]
+        )
+        return result.returncode == 0
+
+    @staticmethod
+    def list_branch_refs(repo_path: str, remote: str = "origin") -> t.List[str]:
+        """List branch names known to a repository, local and remote-tracking.
+
+        The remote name is stripped, so a branch present only on the remote is
+        reported under the same name as a local one — callers reconciling against
+        a registry care that the branch EXISTS, not where it is currently
+        mirrored. Duplicates are removed, order is stable.
+        """
+        result = _run_git(
+            repo_path,
+            [
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads",
+                f"refs/remotes/{remote}",
+            ],
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "git_for_each_ref_failed", repo=repo_path, stderr=result.stderr
+            )
+            return []
+
+        local_prefix = "refs/heads/"
+        remote_prefix = f"refs/remotes/{remote}/"
+        names: t.List[str] = []
+        for line in result.stdout.splitlines():
+            ref = line.strip()
+            if ref.startswith(local_prefix):
+                name = ref[len(local_prefix):]
+            elif ref.startswith(remote_prefix):
+                name = ref[len(remote_prefix):]
+            else:
+                continue
+            # HEAD is a symbolic ref to the default branch, not a branch itself.
+            if name and name != "HEAD" and name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def worktree_list(repo_path: str) -> t.List[WorktreeEntry]:
+        """List the worktrees attached to ``repo_path``.
+
+        Parses ``--porcelain`` output: records are separated by a blank line and
+        every record starts with a ``worktree <path>`` line.
+        """
+        result = _run_git(repo_path, ["worktree", "list", "--porcelain"])
+        if result.returncode != 0:
+            logger.warning(
+                "git_worktree_list_failed", repo=repo_path, stderr=result.stderr
+            )
+            return []
+
+        entries: t.List[WorktreeEntry] = []
+        current: t.Optional[WorktreeEntry] = None
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                current = WorktreeEntry(path=line[len("worktree "):].strip())
+                entries.append(current)
+            elif current is None:
+                continue
+            elif line.startswith("branch "):
+                current.branch = line[len("branch "):].strip().replace(
+                    "refs/heads/", "", 1
+                )
+            elif line == "bare":
+                current.bare = True
+            elif line == "detached":
+                current.detached = True
+            elif line.startswith("locked"):
+                current.locked = True
+            elif line.startswith("prunable"):
+                current.prunable = True
+        return entries
+
+    @staticmethod
+    def worktree_add(
+        repo_path: str,
+        worktree_path: str,
+        branch: str,
+        start_point: str = "",
+        track_remote: bool = False,
+    ) -> GitCommandResult:
+        """Materialize ``branch`` as a worktree at ``worktree_path``.
+
+        Three cases, in order of preference:
+
+        1. the branch already exists locally -> attach the worktree to it;
+        2. ``track_remote`` -> create it from ``start_point`` (a remote ref) and
+           wire the upstream, so later pull/push need no arguments;
+        3. otherwise -> create it from ``start_point`` without an upstream.
+        """
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+
+        if GitWorktreeOperations.local_branch_exists(repo_path, branch):
+            args = ["worktree", "add", worktree_path, branch]
+        elif track_remote and start_point:
+            args = ["worktree", "add", "--track", "-b", branch, worktree_path, start_point]
+        elif start_point:
+            args = ["worktree", "add", "-b", branch, worktree_path, start_point]
+        else:
+            return GitCommandResult(
+                ok=False,
+                reason=GitRemoteReason.BRANCH_NOT_FOUND,
+                detail=f"branch {branch!r} does not exist and no start point was given",
+            )
+
+        result = _run_git(repo_path, args)
+        if result.returncode == 0:
+            logger.info(
+                "git_worktree_added",
+                repo=repo_path,
+                worktree=worktree_path,
+                branch=branch,
+                start_point=start_point,
+            )
+            return GitCommandResult(ok=True)
+        return _failed_result(
+            "git_worktree_add_failed",
+            result.stderr,
+            None,
+            repo=repo_path,
+            worktree=worktree_path,
+            branch=branch,
+        )
+
+    @staticmethod
+    def worktree_remove(
+        repo_path: str, worktree_path: str, force: bool = True
+    ) -> GitCommandResult:
+        """Detach and delete a worktree directory.
+
+        ``force`` is the default because a worktree is a disposable resource:
+        the environment's durable state is its branch, not the checkout.
+        """
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(worktree_path)
+
+        result = _run_git(repo_path, args)
+        if result.returncode == 0:
+            logger.info(
+                "git_worktree_removed", repo=repo_path, worktree=worktree_path
+            )
+            return GitCommandResult(ok=True)
+        return _failed_result(
+            "git_worktree_remove_failed",
+            result.stderr,
+            None,
+            repo=repo_path,
+            worktree=worktree_path,
+        )
+
+    @staticmethod
+    def worktree_prune(repo_path: str) -> None:
+        """Drop administrative records of worktrees whose directory is gone."""
+        _run_git(repo_path, ["worktree", "prune"])
+
+
+class GitMergeOperations:
+    """Branch comparison and the platform's two merge primitives.
+
+    The two merges are deliberately NOT unified into one "promote" operation,
+    because a conflict is an intermediate state that only a human with a working
+    tree can leave:
+
+    * :meth:`merge_in_bare` — the PROMOTIONAL merge (``env/dev`` into ``main``).
+      It is computed with plumbing inside the shared bare repository and
+      published by pushing the resulting commit straight to the remote, so no
+      working copy is ever touched: another member holding the target branch
+      checked out cannot be desynchronized by someone else's promotion. A
+      conflict aborts it without writing anything.
+    * :meth:`merge_in_worktree` — "sync with base": merges the base branch INTO
+      the caller's own environment branch, inside their own working copy. A
+      conflict is LEFT in the working tree on purpose — that is where the user
+      resolves it, with the editor and the Git panel they already use.
+
+    Consequence: resolving a promotion conflict is always "sync in the source
+    environment, fix, commit, retry the promotion", so the platform never needs
+    a three-way merge editor of its own.
+
+    Every ref reaching the command line is validated by the caller through
+    :func:`is_valid_branch_name`.
+    """
+
+    # Identity of a merge commit the platform creates on the user's behalf. The
+    # ACTOR is recorded in ``environment_events``; the commit itself is
+    # platform-authored because it carries no user-written content.
+    COMMITTER_NAME = GitWorktreeOperations.COMMITTER_NAME
+    COMMITTER_EMAIL = GitWorktreeOperations.COMMITTER_EMAIL
+
+    @staticmethod
+    def resolve_ref(
+        path: str, branch: str, remote: str = "origin", prefer_remote: bool = True
+    ) -> str:
+        """Resolve a branch NAME to a ref that exists in ``path``.
+
+        Both merges reason about the state that is shared with the team, so the
+        remote-tracking ref wins by default: promoting a stale local copy of a
+        branch someone else has advanced is never what the user meant. Returns
+        an empty string when the branch is unknown on both sides.
+        """
+        local = f"refs/heads/{branch}"
+        tracking = f"refs/remotes/{remote}/{branch}"
+        order = (tracking, local) if prefer_remote else (local, tracking)
+        for ref in order:
+            if GitWorktreeOperations.ref_exists(path, ref):
+                return ref
+        return ""
+
+    @staticmethod
+    def merge_base(path: str, base_ref: str, head_ref: str) -> str:
+        """Best common ancestor of two refs (empty when they are unrelated)."""
+        result = _run_git(path, ["merge-base", base_ref, head_ref])
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    @staticmethod
+    def count_commits(path: str, base_ref: str, head_ref: str) -> int:
+        """Number of commits reachable from ``head_ref`` but not ``base_ref``."""
+        result = _run_git(path, ["rev-list", "--count", f"{base_ref}..{head_ref}"])
+        if result.returncode != 0:
+            return 0
+        try:
+            return int(result.stdout.strip())
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def list_commits(
+        path: str, base_ref: str, head_ref: str, limit: int = 50
+    ) -> t.List[t.Dict[str, str]]:
+        """Commits that ``head_ref`` would bring into ``base_ref``.
+
+        Dates are ISO 8601 with offset (``%aI``): the platform stores and
+        transports UTC, the frontend renders the user's timezone.
+        """
+        pretty = "--pretty=format:%H%x1f%h%x1f%an%x1f%aI%x1f%s%x1e"
+        result = _run_git(
+            path,
+            ["log", pretty, f"--max-count={max(1, int(limit))}",
+             f"{base_ref}..{head_ref}"],
+        )
+        if result.returncode != 0:
+            return []
+
+        commits: t.List[t.Dict[str, str]] = []
+        for record in result.stdout.split("\x1e"):
+            fields = record.strip("\n").split("\x1f")
+            if len(fields) < 5:
+                continue
+            commits.append({
+                "hash": fields[0],
+                "short_hash": fields[1],
+                "author_name": fields[2],
+                "date": fields[3],
+                "message": fields[4],
+            })
+        return commits
+
+    @staticmethod
+    def diff_files(
+        path: str, target_ref: str, source_ref: str
+    ) -> t.List[BranchDiffFile]:
+        """Files ``source_ref`` changes relative to their common ancestor.
+
+        Uses the three-dot form (``target...source``), i.e. the diff against the
+        MERGE BASE rather than against the target tip: that is what the merge
+        would actually apply, so commits the target gained meanwhile are not
+        reported as if the source had reverted them.
+        """
+        result = _run_git(
+            path,
+            ["diff", "--name-status", "--find-renames", "-z",
+             f"{target_ref}...{source_ref}"],
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "git_branch_diff_failed",
+                target=target_ref,
+                source=source_ref,
+                stderr=result.stderr,
+            )
+            return []
+
+        # ``-z`` layout: status NUL path NUL [rename/copy: NUL new_path].
+        fields = [item for item in result.stdout.split("\0") if item != ""]
+        files: t.List[BranchDiffFile] = []
+        index = 0
+        while index + 1 < len(fields):
+            status = fields[index][:1]
+            first = fields[index + 1]
+            index += 2
+            if status in ("R", "C") and index < len(fields):
+                files.append(BranchDiffFile(fields[index], status, first))
+                index += 1
+            else:
+                files.append(BranchDiffFile(first, status))
+        return files
+
+    @staticmethod
+    def diff_file_patch(
+        path: str, target_ref: str, source_ref: str, file_path: str
+    ) -> str:
+        """Patch of ONE file between the merge base and ``source_ref``."""
+        result = _run_git(
+            path,
+            ["diff", "--find-renames", f"{target_ref}...{source_ref}",
+             "--", file_path],
+        )
+        return result.stdout if result.returncode == 0 else ""
+
+    @staticmethod
+    def probe_merge(repo_path: str, target_ref: str, source_ref: str) -> MergeProbe:
+        """Dry-run the merge with ``git merge-tree`` (no working tree needed).
+
+        This is what makes a merge pre-flight honest: the conflict verdict comes
+        from the real merge machinery, not from a heuristic over changed paths.
+        Exit code 0 means clean, 1 means conflicts, anything else is an error.
+        """
+        result = _run_git(
+            repo_path,
+            ["merge-tree", "--write-tree", "--name-only", target_ref, source_ref],
+        )
+        if result.returncode not in (0, 1):
+            detail = result.stderr.strip() or "merge-tree failed"
+            logger.error(
+                "git_merge_tree_failed",
+                repo=repo_path,
+                target=target_ref,
+                source=source_ref,
+                stderr=detail,
+            )
+            return MergeProbe(ok=False, detail=detail)
+
+        # Output layout: tree object name, then (on conflict) the conflicted
+        # paths, then a blank line followed by informational messages.
+        lines = result.stdout.splitlines()
+        tree = lines[0].strip() if lines else ""
+        conflicts: t.List[str] = []
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            conflicts.append(line.strip())
+        return MergeProbe(ok=True, tree=tree, conflicts=conflicts)
+
+    @staticmethod
+    def merge_in_bare(
+        repo_path: str,
+        target_ref: str,
+        source_ref: str,
+        message: str,
+        tree: str,
+    ) -> str:
+        """Create the merge commit of ``source_ref`` into ``target_ref``.
+
+        ``tree`` comes from :meth:`probe_merge`, so the commit is only ever
+        built from an already-verified conflict-free merge. Always a real merge
+        commit (two parents, never a fast-forward): a promotion must stay
+        identifiable and revertible as one unit in the history.
+        """
+        target_commit = GitWorktreeOperations.head_commit_of(repo_path, target_ref)
+        source_commit = GitWorktreeOperations.head_commit_of(repo_path, source_ref)
+        if not target_commit or not source_commit:
+            logger.error(
+                "git_merge_commit_refs_unresolved",
+                repo=repo_path,
+                target=target_ref,
+                source=source_ref,
+            )
+            return ""
+
+        result = _run_git(
+            repo_path,
+            [
+                "-c", f"user.name={GitMergeOperations.COMMITTER_NAME}",
+                "-c", f"user.email={GitMergeOperations.COMMITTER_EMAIL}",
+                "commit-tree", tree,
+                "-p", target_commit,
+                "-p", source_commit,
+                "-m", message,
+            ],
+        )
+        if result.returncode != 0:
+            logger.error(
+                "git_commit_tree_failed", repo=repo_path, stderr=result.stderr
+            )
+            return ""
+        return result.stdout.strip()
+
+    @staticmethod
+    def push_commit(
+        repo_path: str,
+        commit: str,
+        target_branch: str,
+        remote: str = "origin",
+        auth: t.Optional[GitAuth] = None,
+    ) -> GitCommandResult:
+        """Publish ``commit`` as the new tip of ``target_branch`` on the remote.
+
+        Pushing the object directly (``<sha>:refs/heads/<branch>``) instead of
+        moving a local branch first is what keeps every working copy untouched:
+        the remote becomes the single place where the promotion exists, and each
+        environment picks it up with its own explicit pull + reload.
+
+        Never forced: a rejection means the target advanced meanwhile, and the
+        merge must be recomputed against the new tip.
+        """
+        _ensure_clean_remote(repo_path, remote)
+
+        result = _run_git(
+            repo_path,
+            ["push", remote, f"{commit}:refs/heads/{target_branch}"],
+            auth,
+        )
+        if result.returncode == 0:
+            logger.info(
+                "git_merge_pushed",
+                repo=repo_path,
+                branch=target_branch,
+                commit=commit[:8],
+            )
+            return GitCommandResult(ok=True)
+        return _failed_result(
+            "git_merge_push_failed",
+            result.stderr,
+            auth,
+            repo=repo_path,
+            branch=target_branch,
+        )
+
+    @staticmethod
+    def unmerged_paths(worktree_path: str) -> t.List[str]:
+        """Paths currently in a conflicted state in a working copy."""
+        result = _run_git(
+            worktree_path, ["diff", "--name-only", "--diff-filter=U", "-z"]
+        )
+        if result.returncode != 0:
+            return []
+        return [path for path in result.stdout.split("\0") if path]
+
+    @staticmethod
+    def merge_in_worktree(
+        worktree_path: str, source_ref: str, message: str
+    ) -> WorktreeMergeResult:
+        """Merge ``source_ref`` into the branch checked out at ``worktree_path``.
+
+        Conflicts are left in the working tree so the user resolves them where
+        their editor already is; the caller reports the conflicted paths and the
+        Git panel shows them as ``U`` entries, exactly like any other change.
+        """
+        result = _run_git(
+            worktree_path,
+            [
+                "-c", f"user.name={GitMergeOperations.COMMITTER_NAME}",
+                "-c", f"user.email={GitMergeOperations.COMMITTER_EMAIL}",
+                "merge", "--no-edit", "-m", message, source_ref,
+            ],
+        )
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+
+        if result.returncode == 0:
+            head = GitWorktreeOperations.head_commit(worktree_path)
+            up_to_date = "already up to date" in combined
+            logger.info(
+                "git_worktree_merged",
+                worktree=worktree_path,
+                source=source_ref,
+                up_to_date=up_to_date,
+            )
+            return WorktreeMergeResult(
+                ok=True, merge_commit=head, already_up_to_date=up_to_date
+            )
+
+        conflicts = GitMergeOperations.unmerged_paths(worktree_path)
+        if conflicts:
+            logger.info(
+                "git_worktree_merge_conflicted",
+                worktree=worktree_path,
+                source=source_ref,
+                conflict_count=len(conflicts),
+            )
+            return WorktreeMergeResult(ok=True, conflicts=conflicts)
+
+        detail = result.stderr.strip() or result.stdout.strip() or "merge failed"
+        logger.error(
+            "git_worktree_merge_failed",
+            worktree=worktree_path,
+            source=source_ref,
+            stderr=detail,
+        )
+        return WorktreeMergeResult(ok=False, detail=detail)
+
+    @staticmethod
+    def abort_merge(worktree_path: str) -> bool:
+        """Abandon an in-progress merge and restore the pre-merge state."""
+        result = _run_git(worktree_path, ["merge", "--abort"])
+        if result.returncode == 0:
+            logger.info("git_merge_aborted", worktree=worktree_path)
+            return True
+        logger.warning(
+            "git_merge_abort_failed", worktree=worktree_path, stderr=result.stderr
+        )
+        return False
+
+
 # ---- Internal helpers ----
 
 # GIT_ASKPASS helper. It holds no secret itself: the credential is passed per
@@ -1014,15 +1875,6 @@ async def ls_remote_branches_async(
     return await asyncio.to_thread(GitOperations.ls_remote_branches, repo_url, auth)
 
 
-async def fetch_and_checkout_async(
-    workspace_path: str, branch: str, auth: t.Optional[GitAuth] = None
-) -> GitCommandResult:
-    """Off-thread fetch + checkout."""
-    return await asyncio.to_thread(
-        GitOperations.fetch_and_checkout, workspace_path, branch, auth
-    )
-
-
 async def push_async(
     workspace_path: str,
     branch: str = "main",
@@ -1040,10 +1892,11 @@ async def pull_async(
     branch: str = "main",
     remote: str = "origin",
     auth: t.Optional[GitAuth] = None,
-) -> GitCommandResult:
-    """Off-thread ``git pull``."""
+    allow_merge: bool = True,
+) -> PullResult:
+    """Off-thread branch integration (see :meth:`GitOperations.pull`)."""
     return await asyncio.to_thread(
-        GitOperations.pull, workspace_path, branch, remote, auth
+        GitOperations.pull, workspace_path, branch, remote, auth, allow_merge
     )
 
 

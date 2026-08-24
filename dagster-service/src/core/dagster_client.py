@@ -301,9 +301,15 @@ class DagsterGraphQLClient:
         repository_name: str,
         job_name: str,
         run_config: Optional[dict[str, Any]] = None,
+        tags: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
-        """Launch a job run. Returns ``{run_id, status}`` on success."""
-        variables = {
+        """Launch a job run. Returns ``{run_id, status}`` on success.
+
+        ``tags`` become Dagster run tags through ``executionMetadata``: this is
+        how a run stays attributable to its deployment in an instance whose run
+        storage is shared by every environment.
+        """
+        variables: dict[str, Any] = {
             "executionParams": {
                 "selector": {
                     "repositoryLocationName": repository_location_name,
@@ -313,6 +319,10 @@ class DagsterGraphQLClient:
                 "runConfigData": run_config or {},
             }
         }
+        if tags:
+            variables["executionParams"]["executionMetadata"] = {
+                "tags": [{"key": key, "value": value} for key, value in tags.items()]
+            }
         data = await self.execute(_LAUNCH_RUN_MUTATION, variables)
         result = data.get("launchPipelineExecution", {})
         typename = result.get("__typename")

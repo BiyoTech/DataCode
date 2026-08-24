@@ -23,9 +23,11 @@ import time
 from typing import Any, Dict, List, Optional
 
 from src.core.context_pool import get_context_pool
+from src.core.env_locks import check_environment_lock, environment_lock
 from src.core.event_bus import EventTopic, SSEEvent, get_event_bus
 from src.core.format import format_lint_violations, format_plan_result, format_test_failure_summary
 from src.core.task_tracker import get_task_tracker
+from src.environments.guard import mark_applied, require_registered_environment
 from src.utils.errors import (
     ConflictError,
     ErrorCode,
@@ -154,7 +156,7 @@ class PlanService:
     async def preview(
         self,
         workspace_path: str,
-        environment: str = "dev",
+        environment: str = "",
         gateway: Optional[str] = None,
         *,
         plan_dates: Optional[dict] = None,
@@ -162,9 +164,14 @@ class PlanService:
     ) -> Dict[str, Any]:
         """Create a plan preview without applying.
 
-        Returns plan diff info + state fingerprint for optimistic locking.
-        This runs synchronously since the frontend needs the full result.
+        The target must be the registered environment this working copy is
+        checked out to (see :mod:`src.environments.guard`). Preview is a read
+        operation, so it takes no environment lock: the returned
+        ``state_fingerprint`` is what protects the follow-up apply.
         """
+        resolved = await require_registered_environment(workspace_path, environment)
+        environment = resolved.name
+
         pool = get_context_pool()
         entry = await pool.get_context(workspace_path, gateway)
 
@@ -329,7 +336,7 @@ class PlanService:
     async def apply(
         self,
         workspace_path: str,
-        environment: str = "dev",
+        environment: str = "",
         gateway: Optional[str] = None,
         *,
         plan_dates: Optional[dict] = None,
@@ -340,7 +347,73 @@ class PlanService:
         session_id: str = "",
         trigger_type: str = "human",
     ) -> Dict[str, Any]:
-        """Create and apply a plan.
+        """Create and apply a plan for a registered environment.
+
+        Guards, then serializes:
+
+        * the target must be the registered environment of this working copy, so
+          an environment can never come into existence as a side effect of apply;
+        * only ONE state-mutating operation may run per environment across all
+          members, because they share a single SQLMesh state schema (see
+          :mod:`src.core.env_locks`). A busy environment answers 409 immediately.
+
+        On success the registry records the applied commit, which is what makes
+        "code and data are in sync" observable for the UI and the reconciler.
+        """
+        resolved = await require_registered_environment(workspace_path, environment)
+
+        async with environment_lock(workspace_path, operation="apply"):
+            # Snapshot code identity under the lock, BEFORE the plan runs: what
+            # gets applied is the state of the files at this instant. Reading
+            # HEAD afterwards would attribute the data to a commit that landed
+            # DURING the apply, and ignoring dirtiness would attribute it to a
+            # commit whose content never ran — either way the "code and data
+            # share one source" signal would be forged.
+            #
+            # A dirty tree is NOT rejected: iterating before committing is the
+            # normal sandbox workflow. It is recorded instead, and surfaces as
+            # drift until the user commits and re-applies.
+            head_commit = await self._get_workspace_fingerprint(workspace_path)
+            dirty = await self._workspace_is_dirty(workspace_path)
+
+            result = await self._apply(
+                workspace_path=workspace_path,
+                environment=resolved.name,
+                gateway=gateway,
+                plan_dates=plan_dates,
+                plan_options=plan_options,
+                categories=categories,
+                expected_fingerprint=expected_fingerprint,
+                user_id=user_id,
+                session_id=session_id,
+                trigger_type=trigger_type,
+            )
+
+            if result.get("applied"):
+                await mark_applied(
+                    resolved.environment_id,
+                    commit_hash=head_commit,
+                    dirty=dirty,
+                )
+                result["applied_commit"] = head_commit
+                result["applied_from_dirty_worktree"] = dirty
+        return result
+
+    async def _apply(
+        self,
+        workspace_path: str,
+        environment: str,
+        gateway: Optional[str] = None,
+        *,
+        plan_dates: Optional[dict] = None,
+        plan_options: Optional[dict] = None,
+        categories: Optional[dict] = None,
+        expected_fingerprint: Optional[str] = None,
+        user_id: str = "",
+        session_id: str = "",
+        trigger_type: str = "human",
+    ) -> Dict[str, Any]:
+        """Run the apply itself; callers must already hold the environment lock.
 
         If expected_fingerprint is provided, verifies workspace hasn't changed
         since the plan preview (optimistic locking for multi-user).
@@ -669,7 +742,7 @@ class PlanService:
     async def apply_async(
         self,
         workspace_path: str,
-        environment: str = "dev",
+        environment: str = "",
         gateway: Optional[str] = None,
         *,
         plan_dates: Optional[dict] = None,
@@ -683,8 +756,15 @@ class PlanService:
         """Launch plan apply as a background task (non-blocking).
 
         Returns immediately with task status. Progress is delivered via SSE.
-        Used when the frontend prefers async execution with real-time updates.
+        The environment is validated BEFORE the task is spawned so an invalid
+        target answers with a normal HTTP error instead of an SSE failure the
+        caller has to subscribe to.
         """
+        resolved = await require_registered_environment(workspace_path, environment)
+        # Fail fast on a busy environment so the caller gets a normal 409
+        # instead of a started task that fails over SSE. Advisory only: the
+        # task still acquires the real lock, which is what serializes.
+        check_environment_lock(workspace_path, operation="apply")
         tracker = get_task_tracker()
         key = f"{workspace_path}:{gateway or 'default'}"
 
@@ -699,7 +779,7 @@ class PlanService:
         task = asyncio.create_task(
             self.apply(
                 workspace_path=workspace_path,
-                environment=environment,
+                environment=resolved.name,
                 gateway=gateway,
                 plan_dates=plan_dates,
                 plan_options=plan_options,
@@ -834,12 +914,18 @@ class PlanService:
     def _build_plan(
         self,
         context,
-        environment: str = "dev",
+        environment: str,
         plan_options: Optional[dict] = None,
         plan_dates: Optional[dict] = None,
         categories: Optional[dict] = None,
     ):
-        """Build a PlanBuilder synchronously (runs in thread)."""
+        """Build a PlanBuilder synchronously (runs in thread).
+
+        ``create_from`` is deliberately NOT forwarded: creating an environment is
+        a registry operation (branch + worktree + virtual environment +
+        deployment), never a side effect of a plan. The registry's SQLMesh binder
+        is the only caller allowed to use it.
+        """
         plan_options = plan_options or {}
         plan_dates = plan_dates or {}
 
@@ -854,8 +940,6 @@ class PlanService:
             "no_auto_categorization": plan_options.get("no_auto_categorization", False),
         }
 
-        if plan_options.get("create_from"):
-            kwargs["create_from"] = plan_options["create_from"]
         if plan_options.get("restate_models"):
             kwargs["restate_models"] = plan_options["restate_models"]
         if plan_dates.get("start"):
@@ -933,6 +1017,31 @@ class PlanService:
             return result.stdout.strip() if result.returncode == 0 else ""
         except Exception:
             return ""
+
+    async def _workspace_is_dirty(self, workspace_path: str) -> bool:
+        """Whether the working copy carries changes that are not in Git.
+
+        Untracked files are deliberately EXCLUDED (``-uno``): a working copy
+        materialized from a repository without the platform's ``.gitignore``
+        accumulates regenerable runtime output (``sql-warehouse/.cache/``,
+        logs, engine files) that no user considers a change. Only tracked
+        modifications and staged content make the applied data
+        non-reproducible from the recorded commit.
+        """
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", workspace_path, "status", "--porcelain", "-uno"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0 and bool(result.stdout.strip())
+        except Exception:
+            # A probe failure must not turn into a false "clean" claim, but it
+            # must not block the apply either: report clean and let the commit
+            # marker carry the (correct) HEAD.
+            return False
 
     async def _publish_plan_stage(
         self,

@@ -241,7 +241,6 @@ _export_api_env() {
     export _AD_FORWARD_ONLY="false"
     export _AD_NO_AUTO_CAT="false"
     export _AD_INCLUDE_UNMOD="false"
-    export _AD_CREATE_FROM=""
     local restate_list='['
     local prev=""
     for arg in "$@"; do
@@ -254,7 +253,6 @@ _export_api_env() {
             --include-unmodified)       export _AD_INCLUDE_UNMOD="true" ;;
         esac
         case "$prev" in
-            --create-from)   export _AD_CREATE_FROM="$arg" ;;
             --restate-model) restate_list+="\"$arg\"," ;;
         esac
         prev="$arg"
@@ -371,7 +369,6 @@ no_gaps        = os.environ.get('_AD_NO_GAPS', 'false') == 'true'
 forward_only   = os.environ.get('_AD_FORWARD_ONLY', 'false') == 'true'
 no_auto_cat    = os.environ.get('_AD_NO_AUTO_CAT', 'false') == 'true'
 include_unmod  = os.environ.get('_AD_INCLUDE_UNMOD', 'false') == 'true'
-create_from    = os.environ.get('_AD_CREATE_FROM', '')
 restate_raw    = os.environ.get('_AD_RESTATE_MODELS', '')
 auto_apply     = os.environ.get('_AD_AUTO_APPLY', 'false') == 'true'
 endpoint       = os.environ.get('_AD_ENDPOINT', '/api/v1/apply')
@@ -395,9 +392,6 @@ payload = {
 
 if auto_apply:
     payload['plan_options']['auto_apply'] = True
-
-if create_from:
-    payload['plan_options']['create_from'] = create_from
 
 if restate_raw:
     try:

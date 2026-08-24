@@ -34,10 +34,15 @@ class ErrorCode(str, Enum):
     MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
     WORKSPACE_NOT_FOUND = "WORKSPACE_NOT_FOUND"
     WORKSPACE_PATH_INVALID = "WORKSPACE_PATH_INVALID"
+    ENVIRONMENT_NOT_FOUND = "ENVIRONMENT_NOT_FOUND"
+    ENVIRONMENT_STATE_INVALID = "ENVIRONMENT_STATE_INVALID"
+    ENVIRONMENT_BUSY = "ENVIRONMENT_BUSY"
+    STATE_SCHEMA_MISMATCH = "STATE_SCHEMA_MISMATCH"
     GIT_REPO_NOT_BOUND = "GIT_REPO_NOT_BOUND"
     GIT_REPO_URL_INVALID = "GIT_REPO_URL_INVALID"
     GIT_OPERATION_FAILED = "GIT_OPERATION_FAILED"
     GIT_REMOTE_ACCESS_DENIED = "GIT_REMOTE_ACCESS_DENIED"
+    GIT_MERGE_CONFLICT = "GIT_MERGE_CONFLICT"
     INVALID_REQUEST = "INVALID_REQUEST"
     TIMEOUT = "TIMEOUT"
     CONFLICT = "CONFLICT"
@@ -146,17 +151,30 @@ class ContextConfigError(ServiceError):
 
     Typically a client-fixable problem (e.g. a gateway with missing connection
     credentials), so it maps to 422 rather than a raw 500. The public message
-    references only the workspace name; the underlying validation reason is
-    passed as ``detail`` (SQLMesh config errors report offending field names,
-    not secret values) and the full error is logged server-side.
+    identifies the workspace and environment (never the on-disk path, which
+    exposes the platform's private layout); the underlying validation reason is
+    passed as ``detail`` (SQLMesh config errors report offending field names, not
+    secret values) and the full error is logged server-side.
     """
 
-    def __init__(self, workspace_path: str, detail: Optional[str] = None):
-        name = os.path.basename(os.path.normpath(workspace_path)) or workspace_path
+    def __init__(
+        self,
+        workspace_path: str,
+        detail: Optional[str] = None,
+        *,
+        workspace_id: str = "",
+        environment: str = "",
+    ):
+        if workspace_id:
+            target = f"'{workspace_id}' (environment '{environment or 'unknown'}')"
+        else:
+            # Fallback for callers that only hold a path.
+            name = os.path.basename(os.path.normpath(workspace_path)) or workspace_path
+            target = f"'{name}'"
         super().__init__(
             code=ErrorCode.CONTEXT_CONFIG_INVALID,
             message=(
-                f"Invalid SQLMesh configuration for workspace '{name}'. "
+                f"Invalid SQLMesh configuration for workspace {target}. "
                 f"Check its config.yaml connection settings."
             ),
             detail=detail,
@@ -189,6 +207,98 @@ class WorkspacePathInvalidError(ServiceError):
             message=f"Invalid workspace path: {path}",
             detail=reason,
             status_code=400,
+        )
+
+
+class EnvironmentNotFoundError(ServiceError):
+    """Raised when an environment is absent from the platform registry.
+
+    The registry is the source of truth: an environment that only exists as a
+    Git branch or as a SQLMesh state entry is NOT an environment yet, it is
+    drift, and it must be adopted through the reconciler first.
+    """
+
+    def __init__(self, environment: str):
+        super().__init__(
+            code=ErrorCode.ENVIRONMENT_NOT_FOUND,
+            message=f"Environment not found: {environment}",
+            status_code=404,
+        )
+
+
+class EnvironmentStateError(ServiceError):
+    """Raised when an environment's lifecycle state forbids the operation.
+
+    Examples: opening an environment that is still being created, destroying
+    production, branching from an archived environment.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(
+            code=ErrorCode.ENVIRONMENT_STATE_INVALID,
+            message=message,
+            status_code=409,
+        )
+
+
+class EnvironmentBusyError(ServiceError):
+    """Raised when another state-mutating operation holds the environment lock.
+
+    Every environment of a workspace shares one SQLMesh state schema, so two
+    concurrent applies would race on the same state rows. Rejecting immediately
+    with an explicit "busy" answer is far more actionable than letting the two
+    operations collide half-way through a backfill.
+    """
+
+    def __init__(self, environment: str, operation: str = ""):
+        held_by = f" (held by: {operation})" if operation else ""
+        super().__init__(
+            code=ErrorCode.ENVIRONMENT_BUSY,
+            message=(
+                f"Environment '{environment}' is busy: another operation is "
+                f"already modifying its state{held_by}. Retry once it finishes."
+            ),
+            status_code=409,
+        )
+
+
+class StateSchemaMismatchError(ServiceError):
+    """Raised when a workspace config declares a non-managed ``state_schema``.
+
+    The SQLMesh state (snapshots, environments, external models) is a
+    WORKSPACE-level shared asset: every environment and every member must read
+    and write the same state schema, otherwise promoting between environments
+    loses snapshot lineage and the next plan rebuilds everything from scratch.
+
+    The platform therefore GENERATES ``state_schema`` into ``config.yaml`` (at
+    workspace creation, and for any gateway added later) and from then on the
+    FILE is the truth: the value is never silently rewritten at runtime. A
+    deviating value is rejected here instead, so what the config says and what
+    actually happens can never diverge.
+
+    The structured ``detail`` is inlined at the top level of the response body
+    (see ``ServiceError.to_response_dict``) so the frontend can render the
+    mismatch and offer the one-click repair endpoint without string parsing.
+    """
+
+    def __init__(self, *, gateway: str, expected: str, actual: str, config_path: str):
+        super().__init__(
+            code=ErrorCode.STATE_SCHEMA_MISMATCH,
+            message=(
+                f"config.yaml declares state_schema '{actual}' for gateway "
+                f"'{gateway}', but this workspace's SQLMesh state lives in "
+                f"'{expected}'. Set the gateway's state_schema to '{expected}' "
+                f"in config.yaml (or remove the key and let the platform "
+                f"regenerate it), then retry."
+            ),
+            detail={
+                "gateway": gateway,
+                "expected": expected,
+                "actual": actual,
+                "config_file": "config.yaml",
+                "repair_endpoint": "/api/v1/sqlmesh/config/state-schema/repair",
+            },
+            status_code=409,
         )
 
 
@@ -294,6 +404,41 @@ class GitRemoteAccessError(ServiceError):
                 "git_detail": detail,
             },
             status_code=422,
+        )
+
+
+class GitMergeConflictError(ServiceError):
+    """A promotional merge cannot be created because it conflicts.
+
+    Refusing is the whole point: a conflict is an intermediate state that only a
+    human with a working tree can resolve, so the platform never writes a half
+    merge. The structured ``detail`` is inlined at the top level of the response
+    (see :meth:`ServiceError.to_response_dict`) so the frontend lists the
+    conflicted files and points the user at the resolution path — sync the base
+    branch INTO the source environment, resolve there, commit, then retry.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_branch: str,
+        target_branch: str,
+        conflicts: list,
+    ):
+        super().__init__(
+            code=ErrorCode.GIT_MERGE_CONFLICT,
+            message=(
+                f"Merging '{source_branch}' into '{target_branch}' conflicts in "
+                f"{len(conflicts)} file(s). Sync '{target_branch}' into "
+                f"'{source_branch}' first, resolve the conflicts there, commit, "
+                f"then merge again."
+            ),
+            detail={
+                "conflicts": conflicts,
+                "source_branch": source_branch,
+                "target_branch": target_branch,
+            },
+            status_code=409,
         )
 
 

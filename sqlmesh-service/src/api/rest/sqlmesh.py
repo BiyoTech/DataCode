@@ -12,8 +12,7 @@ Route layout matches the SQLMesh web server API structure:
 - /query        - Execute ad-hoc SQL
 - /lineage      - Model lineage
 - /lineage/{model}/{column} - Column lineage
-- /environments - List environments
-- /environments/{name} - Delete environment
+- /engine/environments - Engine-side environment list (reconciliation only)
 - /test         - Run tests
 - /table-diff   - Table diff
 - /schema/discover - Schema discovery
@@ -45,6 +44,7 @@ from src.api.models.requests import (
     PlanPreviewRequest,
     QueryRequest,
     RenderModelRequest,
+    RepairStateSchemaRequest,
     SchemaDiscoverRequest,
     TableDiffRequest,
     TestRequest,
@@ -137,6 +137,43 @@ async def plan_cancel(req: PlanCancelRequest):
             workspace_path=req.workspace_path,
             gateway=req.gateway,
     )
+
+
+@router.post("/config/state-schema/repair")
+async def repair_config_state_schema(req: RepairStateSchemaRequest):
+    """Rewrite every gateway's ``state_schema`` in config.yaml to the managed value.
+
+    The explicit counterpart to the 409 a mismatched config triggers on every
+    plan/apply: the user has seen the divergence (the error carries gateway /
+    expected / actual) and confirmed the fix, so the managed value is written
+    back — the file returns to being the single truth.
+
+    Only the caller's own working copy is rewritten. Other members pick the
+    fix up through Git once it is committed; until then their copies keep
+    failing the reconciliation with the same actionable 409.
+    """
+    from src.core.context_pool import get_context_pool
+    from src.workspace.config_ops import repair_state_schema
+    from src.workspace.identity import resolve_workspace_identity
+    from src.workspace.layout import sqlmesh_root
+
+    identity = resolve_workspace_identity(req.workspace_path)
+    project_root = sqlmesh_root(req.workspace_path)
+    result = repair_state_schema(project_root, identity.workspace_id)
+
+    if result.changed:
+        # The pooled context was built from the OLD config: drop it (and the
+        # local .cache, which may hold snapshots from the wrong state schema)
+        # so the very next plan reloads with the corrected value.
+        pool = get_context_pool()
+        await pool.invalidate_all_for_workspace(req.workspace_path)
+        pool.clear_workspace_cache(project_root)
+
+    return {
+        "changed": result.changed,
+        "state_schema": result.expected,
+        "repaired_gateways": list(result.generated_for),
+    }
 
 
 
@@ -359,35 +396,19 @@ async def get_column_lineage(
 
 
 # ---------------------------------------------------------------------------
-# Environments
+# Engine-side environments (read-only)
+#
+# This is the ENGINE's view of SQLMesh environments, not the platform registry
+# (see src/api/rest/environments.py). It exists for reconciliation and
+# troubleshooting only: creating or deleting an environment here would leave an
+# orphan Git branch and an orphan Dagster deployment behind.
 # ---------------------------------------------------------------------------
 
-@router.get("/environments")
-async def list_environments(workspace_path: WorkspacePath, gateway: str = ""):
-    """Get the environments.
-
-    Matches SQLMesh web server's GET /environments behavior.
-    """
+@router.get("/engine/environments")
+async def list_engine_environments(workspace_path: WorkspacePath, gateway: str = ""):
+    """List the environments that actually exist in the SQLMesh state."""
     return await get_environment_service().list_environments(
             workspace_path=workspace_path,
-            gateway=gateway or None,
-    )
-
-
-
-@router.delete("/environments/{environment}")
-async def delete_environment(
-    environment: str,
-    workspace_path: WorkspacePath = Query(..., description="Workspace root path"),
-    gateway: str = "",
-):
-    """Invalidate and delete an environment.
-
-    Matches SQLMesh web server's DELETE /environments/{environment} behavior.
-    """
-    return await get_environment_service().delete_environment(
-            workspace_path=workspace_path,
-            environment=environment,
             gateway=gateway or None,
     )
 

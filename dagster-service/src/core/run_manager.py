@@ -33,19 +33,28 @@ class RunManager:
         repository_name: str,
         job_name: str,
         run_config: Optional[dict[str, Any]] = None,
+        tags: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
-        """Launch a job run and return ``{run_id, status}``."""
+        """Launch a job run and return ``{run_id, status}``.
+
+        ``tags`` carry the deployment attribution (environment, workspace,
+        deployment). They are the only thing separating one environment's runs
+        from another's in the shared open-source run store, so they are logged
+        with the launch as well.
+        """
         result = await self._client.launch_run(
             repository_location_name=repository_location_name,
             repository_name=repository_name,
             job_name=job_name,
             run_config=run_config,
+            tags=tags,
         )
         logger.info(
             "run_launched",
             run_id=result["run_id"],
             job_name=job_name,
             location=repository_location_name,
+            tags=tags or {},
         )
         return result
 

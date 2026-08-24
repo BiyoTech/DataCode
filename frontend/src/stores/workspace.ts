@@ -27,7 +27,15 @@ export interface WorkspaceInfo {
   status: string
   dialect: string
   gitRepoUrl: string    // Remote Git repo URL (empty = no remote)
-  gitBranch: string     // Branch checked out / default branch
+  /**
+   * Environment opened by default. A branch is no longer a workspace attribute:
+   * it belongs to an environment, which owns it 1:1.
+   */
+  defaultEnv: string
+  /** Name of this workspace's production environment (usually `prod`). */
+  productionEnv: string
+  /** Branch of the environment currently open; empty until opened. */
+  currentBranch: string
   role: string          // Caller's role inside this workspace
   isOwner: boolean
   /**
@@ -61,8 +69,13 @@ export interface GitCredentialInfo {
   serverUrl: string
 }
 
-/** Map an API workspace payload onto the store model. */
-function toWorkspaceInfo(ws: any, path = ''): WorkspaceInfo {
+/**
+ * Map an API workspace payload onto the store model.
+ *
+ * `currentBranch` is not part of the listing: it only becomes known once an
+ * environment has been opened, so it is carried over from the previous state.
+ */
+function toWorkspaceInfo(ws: any, path = '', currentBranch = ''): WorkspaceInfo {
   return {
     id: ws.workspace_id,
     name: ws.name,
@@ -70,7 +83,9 @@ function toWorkspaceInfo(ws: any, path = ''): WorkspaceInfo {
     status: ws.status || 'active',
     dialect: ws.dialect || 'duckdb',
     gitRepoUrl: ws.git_repo_url || '',
-    gitBranch: ws.git_branch || 'main',
+    defaultEnv: ws.default_env || 'prod',
+    productionEnv: ws.production_env || 'prod',
+    currentBranch,
     role: ws.role || '',
     isOwner: Boolean(ws.is_owner),
     permissions: Array.isArray(ws.permissions) ? ws.permissions : [],
@@ -106,20 +121,65 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
+  // ---- Environment memory ----
+  //
+  // The last environment opened per workspace, so a page refresh returns the
+  // user to the development line they were working on instead of the workspace
+  // default. This is a RESTORE HINT only: the current environment is always
+  // derived from the working-copy path, never from this value — a stale hint
+  // can at worst cost one rejected open before the default is used.
+
+  const ENV_MEMORY_PREFIX = 'workspace_environment:'
+
+  function _rememberEnvironment(workspaceId: string, environment: string): void {
+    if (!workspaceId || !environment) return
+    try {
+      localStorage.setItem(ENV_MEMORY_PREFIX + workspaceId, environment)
+    } catch {
+      // Storage may be unavailable (private mode); memory is best-effort.
+    }
+  }
+
+  function _forgetEnvironment(workspaceId: string): void {
+    try {
+      localStorage.removeItem(ENV_MEMORY_PREFIX + workspaceId)
+    } catch {
+      // Ignore: nothing to clean up when storage is unavailable.
+    }
+  }
+
+  /** Last environment opened in a workspace, or '' when unknown. */
+  function rememberedEnvironment(workspaceId: string): string {
+    if (!workspaceId) return ''
+    try {
+      return localStorage.getItem(ENV_MEMORY_PREFIX + workspaceId) || ''
+    } catch {
+      return ''
+    }
+  }
+
   /**
    * Fetch workspaces the caller may access, then restore/auto-select one.
    *
    * A workspace is only selected after `openWorkspace` succeeds, so the local
    * working copy always exists before any file/plan/git call uses its path.
+   * The restore reopens the workspace's LAST USED environment (see
+   * `rememberedEnvironment`); when that environment is gone — destroyed or
+   * archived since — the memory is dropped and the workspace default opens.
    */
   async function fetchWorkspaces(): Promise<void> {
     isLoading.value = true
     try {
       const { data } = await api.get('/workspaces')
-      const previousPaths = new Map(workspaces.value.map((ws) => [ws.id, ws.path]))
-      workspaces.value = (data.workspaces || []).map((ws: any) =>
-        toWorkspaceInfo(ws, previousPaths.get(ws.workspace_id) || '')
+      // The listing carries no working-copy state, so what the caller already
+      // materialized is preserved instead of being dropped on every refresh.
+      const previous = new Map(
+        workspaces.value.map((ws) => [ws.id, { path: ws.path, branch: ws.currentBranch }])
       )
+      workspaces.value = (data.workspaces || []).map((ws: any) => {
+        const local = previous.get(ws.workspace_id)
+        return toWorkspaceInfo(ws, local?.path || '', local?.branch || '')
+      })
 
       const desiredId =
         (currentWorkspaceId.value ?? storedId) || null
@@ -134,7 +194,22 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         return
       }
       if (candidate.id !== currentWorkspaceId.value || !candidate.path) {
-        await openWorkspace(candidate.id)
+        const remembered = rememberedEnvironment(candidate.id)
+        if (remembered) {
+          try {
+            await openWorkspace(candidate.id, remembered)
+          } catch (e: any) {
+            // Keep the memory for transport failures so a later boot can still
+            // restore the line; only a definitive refusal (the environment no
+            // longer exists or cannot be opened) discards it.
+            const status = e?.response?.status
+            if (status !== 404 && status !== 409) throw e
+            _forgetEnvironment(candidate.id)
+            await openWorkspace(candidate.id)
+          }
+        } else {
+          await openWorkspace(candidate.id)
+        }
       }
     } catch (e) {
       notifyError(e, 'Failed to fetch workspaces')
@@ -145,11 +220,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Materialize the caller's working copy (clone or fetch + checkout) and make
-   * the workspace current. Rejects locally when the backend already reported the
-   * workspace as not openable.
+   * Materialize the caller's working copy of one ENVIRONMENT and make the
+   * workspace current. Passing no environment adopts the workspace default.
+   *
+   * Rejects locally when the backend already reported the workspace as not
+   * openable.
    */
-  async function openWorkspace(workspaceId: string, branch = ''): Promise<WorkspaceInfo> {
+  async function openWorkspace(workspaceId: string, environment = ''): Promise<WorkspaceInfo> {
     const ws = workspaces.value.find((w) => w.id === workspaceId)
     if (!ws) {
       throw new Error(`Unknown workspace: ${workspaceId}`)
@@ -157,10 +234,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
     isOpening.value = true
     try {
-      const { data } = await api.post(`/workspaces/${workspaceId}/open`, { branch })
+      const { data } = await api.post(`/workspaces/${workspaceId}/open`, { environment })
       ws.path = data.workspace_path
-      ws.gitBranch = data.branch || ws.gitBranch
+      ws.currentBranch = data.branch || ''
       currentWorkspaceId.value = ws.id
+      // Remember which environment was opened so a refresh restores it. The
+      // backend echoes the resolved name (the request may have been empty).
+      _rememberEnvironment(ws.id, data.environment || environment)
       _persistSelection()
       return ws
     } finally {
@@ -168,10 +248,44 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
-  /** List remote branches so the user can pick one before opening. */
-  async function fetchRemoteBranches(workspaceId: string): Promise<string[]> {
-    const { data } = await api.get(`/workspaces/${workspaceId}/remote-branches`)
-    return data.branches || []
+  /**
+   * Adopt the working copy returned by an environment switch.
+   *
+   * Switching environment changes WHICH worktree is active, not which workspace,
+   * so only the path and the derived branch move. The environment itself is
+   * never stored here as state: it is derived from the path by the environment
+   * store, which keeps the two from ever disagreeing. It IS remembered (restore
+   * hint only) so the next page refresh reopens the same line.
+   */
+  function applyOpenedEnvironment(
+    workspacePath: string,
+    branch: string,
+    environment = ''
+  ): void {
+    const ws = currentWorkspace.value
+    if (!ws || !workspacePath) return
+    ws.path = workspacePath
+    ws.currentBranch = branch || ws.currentBranch
+    if (environment) _rememberEnvironment(ws.id, environment)
+  }
+
+  /**
+   * List the environments a workspace offers, so the user can pick one before
+   * opening it. Read from the platform registry: it is the same list for every
+   * member, unlike the branches a member happens to hold locally.
+   */
+  async function fetchOpenableEnvironments(
+    workspaceId: string
+  ): Promise<{ environmentId: string; name: string; envType: string; status: string }[]> {
+    const { data } = await api.get(`/workspaces/${workspaceId}/environments`)
+    return (data?.environments || [])
+      .filter((env: any) => env.status !== 'archived')
+      .map((env: any) => ({
+        environmentId: env.environment_id,
+        name: env.name,
+        envType: env.env_type,
+        status: env.status,
+      }))
   }
 
   /**
@@ -215,11 +329,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Sync workspace changes to remote Git.
+   * Commit and push one environment's working copy to the remote.
+   *
+   * The environment must be passed explicitly: each environment is a separate
+   * worktree, so omitting it would push the workspace default rather than what
+   * the user is looking at.
    */
-  async function syncToRemote(workspaceId: string, message = 'Auto-save'): Promise<void> {
+  async function syncToRemote(
+    workspaceId: string,
+    environment: string,
+    message = 'Auto-save'
+  ): Promise<void> {
     await api.post('/workspaces/sync', {
       workspace_id: workspaceId,
+      environment,
       message,
     })
   }
@@ -275,13 +398,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   /**
-   * Switch to a workspace by opening the caller's working copy first.
+   * Switch to a workspace by opening one of its environments first.
    */
-  async function selectWorkspace(id: string, branch = ''): Promise<void> {
-    if (id === currentWorkspaceId.value && !branch && currentWorkspace.value?.path) {
+  async function selectWorkspace(id: string, environment = ''): Promise<void> {
+    if (id === currentWorkspaceId.value && !environment && currentWorkspace.value?.path) {
       return
     }
-    await openWorkspace(id, branch)
+    await openWorkspace(id, environment)
   }
 
   /**
@@ -293,6 +416,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       currentWorkspaceId.value = null
       _persistSelection()
     }
+    _forgetEnvironment(id)
   }
 
   // ---- Git Credentials (Multi-credential) ----
@@ -392,7 +516,9 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     isLoadingCredentials,
     fetchWorkspaces,
     openWorkspace,
-    fetchRemoteBranches,
+    applyOpenedEnvironment,
+    rememberedEnvironment,
+    fetchOpenableEnvironments,
     createWorkspace,
     bindGitRepo,
     syncToRemote,

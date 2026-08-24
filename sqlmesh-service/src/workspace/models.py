@@ -27,6 +27,10 @@ class WorkspaceModel(Base):
     of its code, therefore NO local filesystem path is stored here: each user's
     working copy path is derived at runtime (see ``src.workspace.paths``).
 
+    Branches are NOT a workspace attribute: a branch belongs to an
+    ``Environment`` (see ``src.environments``). The workspace only names which
+    environment is its production one and which one is opened by default.
+
     Membership and roles are NOT stored here: authorization is centralized in
     the gateway, which owns the role bindings and tells this service what the
     caller may do (see ``src.api.deps.CallerContext``).
@@ -40,7 +44,10 @@ class WorkspaceModel(Base):
     name = Column(String(128), nullable=False)
     dialect = Column(String(32), nullable=False, default="duckdb")
     git_repo_url = Column(String(512), nullable=True)
-    git_branch = Column(String(64), nullable=False, default="main")
+    # Production environment name (Git ``main``); every workspace has exactly one.
+    production_env = Column(String(40), nullable=False, default="prod")
+    # Environment a member lands on when opening the workspace.
+    default_env = Column(String(40), nullable=False, default="prod")
     status = Column(String(32), nullable=False, default="active")
     created_at = Column(
         DateTime(timezone=True),

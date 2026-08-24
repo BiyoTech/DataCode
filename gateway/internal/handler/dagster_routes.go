@@ -5,9 +5,9 @@
 // (same strategy as the Ontology Service).
 //
 // Only GET endpoints that require workspace isolation are declared here as
-// validated routes; every other Dagster route (POST run/reload/ensure, run
-// status/logs/cancel, health, mode) is transparently forwarded by the
-// catch-all GenericProxy registered in router.go.
+// validated routes; every other Dagster route (deployment ensure/reload/delete,
+// run launch, run status/logs/cancel, health, mode) is transparently forwarded
+// by the catch-all GenericProxy registered in router.go.
 package handler
 
 // DagsterValidatedRoutes defines validated GET routes under the /dagster route

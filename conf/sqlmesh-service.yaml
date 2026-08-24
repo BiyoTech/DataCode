@@ -27,6 +27,19 @@ concurrency:
   workspace_write_lock_ttl: 600   # Workspace write lock timeout (seconds)
   environment_lock_ttl: 900       # Environment lock timeout (seconds)
 
+# Platform environments (Git branch + SQLMesh env + Dagster deployment).
+# Each environment consumes a branch, virtual environment, schemas and a
+# deployment, so live environments are capped and sandboxes always expire.
+environments:
+  max_per_workspace: 20
+  sandbox_default_ttl_hours: 168   # 7 days
+
+# Dagster deployment linkage (create/destroy orchestration + reconcile).
+# The URL comes from platform.yaml services.dagster.rest_url; only the
+# timeout lives here because ensure may spawn a code-location subprocess.
+dagster:
+  request_timeout: 60
+
 # ── Shared config (from platform.yaml) ──────────────────────────────────
 # database:      → platform.yaml → database (password: env DB_PASSWORD)
 # workspace:     → platform.yaml → workspace.base_path

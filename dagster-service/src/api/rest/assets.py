@@ -9,8 +9,8 @@ from fastapi import APIRouter, Query
 from src.api.deps import WorkspacePath
 from src.api.models.responses import AssetDagGraph, AssetInfo
 from src.bridge.sqlmesh_bridge import SQLMESH_ASSET_PREFIX
-from src.core.code_location_manager import get_code_location_manager
 from src.core.dagster_client import get_dagster_client
+from src.core.deployment_manager import DeploymentSpec, get_deployment_manager
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,17 +35,21 @@ def _display_name(key_path: list[str]) -> str:
     return _key_str(key_path)
 
 
-async def _location_assets(workspace_path: str, repository_name: str) -> list[dict]:
-    """Fetch asset nodes scoped to a single workspace's code location.
+async def _deployment_assets(
+    workspace_path: str, repository_name: str
+) -> tuple[DeploymentSpec, list[dict]]:
+    """Ensure this working copy's deployment and fetch its asset nodes.
 
-    Ensuring the location first is idempotent (no respawn when already alive)
-    and guarantees the webserver knows this workspace's repository before we
-    query it — otherwise a freshly switched-to workspace would resolve to
+    Ensuring first is idempotent (no respawn when already alive) and guarantees
+    the webserver knows this environment's repository before we query it —
+    otherwise a freshly opened environment would resolve to
     ``RepositoryNotFoundError`` and render as empty.
     """
-    location_name = get_code_location_manager().location_name_for(workspace_path)
-    await get_code_location_manager().ensure_location(workspace_path)
-    return await get_dagster_client().list_assets(location_name, repository_name)
+    manager = get_deployment_manager()
+    spec = manager.resolve(workspace_path)
+    await manager.ensure(spec)
+    nodes = await get_dagster_client().list_assets(spec.deployment_name, repository_name)
+    return spec, nodes
 
 
 @router.get("", response_model=list[AssetInfo])
@@ -53,8 +57,8 @@ async def list_assets(
     workspace_path: WorkspacePath,
     repository_name: str = Query("__repository__", description="Repository name"),
 ) -> list[AssetInfo]:
-    """List asset nodes for the given workspace's code location."""
-    nodes = await _location_assets(workspace_path, repository_name)
+    """List asset nodes for the deployment backing this working copy."""
+    _, nodes = await _deployment_assets(workspace_path, repository_name)
     result: list[AssetInfo] = []
     for node in nodes:
         key_path = node.get("assetKey", {}).get("path", [])
@@ -76,23 +80,21 @@ async def asset_graph(
     workspace_path: WorkspacePath,
     repository_name: str = Query("__repository__", description="Repository name"),
     environment: str = Query(
-        "", description="SQLMesh virtual environment (prod/dev/…) the view is scoped to"
+        "", description="Environment the view is scoped to (defaults to the working copy's)"
     ),
 ) -> AssetDagGraph:
-    """Return the asset dependency graph (nodes + edges) for one workspace.
+    """Return the asset dependency graph (nodes + edges) for one environment.
 
-    The graph is scoped to ``workspace_path``'s code location so switching the
-    active workspace in the UI yields that workspace's own assets rather than a
-    shared instance-wide graph.
+    The graph is scoped to the deployment of ``workspace_path``. Since a working
+    copy is per-environment and each environment has its own deployment loading
+    its own branch, native Dagster assets now DO vary by environment — the graph
+    is the branch's own orchestration view, not a shared instance-wide one.
 
-    ``environment`` names the selected SQLMesh virtual environment. Native
-    Dagster assets are defined at the code-location level and do not vary by
-    environment; the SQLMesh-bridged lineage subgraph (fetched lazily by the
-    frontend from /api/v1/sqlmesh/lineage) is what actually reflects the chosen
-    environment. The parameter is accepted here so the contract is explicit and
-    the scope is captured in logs.
+    ``environment`` is accepted so the requested scope is explicit and captured
+    in logs; the working copy remains authoritative, and the SQLMesh-bridged
+    lineage subgraph the frontend fetches lazily reflects the same environment.
     """
-    nodes = await _location_assets(workspace_path, repository_name)
+    spec, nodes = await _deployment_assets(workspace_path, repository_name)
 
     graph_nodes: list[AssetInfo] = []
     edges: list[dict[str, str]] = []
@@ -115,8 +117,9 @@ async def asset_graph(
 
     logger.info(
         "asset_graph_built",
-        workspace_path=workspace_path,
-        environment=environment or "local",
+        deployment=spec.deployment_name,
+        environment=spec.environment,
+        requested_environment=environment or spec.environment,
         nodes=len(graph_nodes),
         edges=len(edges),
     )

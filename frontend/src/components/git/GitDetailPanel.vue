@@ -2,14 +2,22 @@
 /**
  * GitDetailPanel - IntelliJ-style horizontal Git panel (State C).
  * Layout: [Branches | Commit history | Changed-files tree]
- * - Left pane: branch tree + create-branch input.
+ * - Left pane: branch tree, merge / sync entry points.
  * - Center pane: commit history of the current branch.
  * - Right pane: directory tree of files changed in the selected commit.
  * Designed for bottom panel placement.
+ *
+ * This panel owns STEP 1 of promoting code between environments: the Git merge.
+ * Step 2 (plan & apply on the target environment, then reload its code
+ * location) lives on the Plan & Apply page. They are deliberately separate
+ * actions: a merge conflict is an intermediate state only a human with a
+ * working copy can resolve, so wrapping both steps in one "promote" button
+ * would only hide that fact behind a black box.
  */
 import { computed, ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useGitStore, type CommitFile, type CommitInfo } from '@/stores/git'
+import { useEnvironmentStore } from '@/stores/environment'
 import { useFileStore } from '@/stores/files'
 import { formatLocalTime } from '@/utils/timezone'
 import { baseName, kindOfStatus, letterOfStatus } from '@/utils/gitDecoration'
@@ -17,10 +25,10 @@ import IconButton from '@/components/common/IconButton.vue'
 
 const { t } = useI18n()
 const gitStore = useGitStore()
+const environmentStore = useEnvironmentStore()
 const fileStore = useFileStore()
 
 // UI state
-const newBranchName = ref('')
 // Collapsed directory paths in the changed-files tree.
 const collapsedDirs = ref<Set<string>>(new Set())
 
@@ -140,39 +148,7 @@ function toggleDir(path: string) {
 
 // ---- Actions ----
 
-async function handleCreateBranch() {
-  if (!newBranchName.value.trim()) return
-  await gitStore.checkout(newBranchName.value.trim(), true)
-  newBranchName.value = ''
-}
-
-async function handleSwitchBranch(branchName: string) {
-  if (branchName === gitStore.currentBranch) return
-  await gitStore.checkout(branchName)
-}
-
 // ---- Branch-level Git operations ----
-
-/** Local name a remote ref maps to: "origin/dev" → "dev". */
-function localNameOf(remoteRef: string): string {
-  return remoteRef.split('/').slice(1).join('/')
-}
-
-/** Delete confirmation target; null when the dialog is closed. */
-const deleteTarget = ref<string | null>(null)
-const forceDelete = ref(false)
-
-function openDeleteBranch(branchName: string) {
-  deleteTarget.value = branchName
-  forceDelete.value = false
-}
-
-async function confirmDeleteBranch() {
-  const branchName = deleteTarget.value
-  if (!branchName) return
-  deleteTarget.value = null
-  await gitStore.deleteBranch(branchName, forceDelete.value)
-}
 
 /** Reset dialog state. `hard` is destructive, so it is never the default. */
 const resetTarget = ref<CommitInfo | null>(null)
@@ -217,6 +193,139 @@ async function handleTreeRowClick(row: TreeRow) {
   })
 }
 
+// ---- Branch merge / sync ----
+
+/** Fallback production branch when the environment registry is not loaded yet. */
+const DEFAULT_PRODUCTION_BRANCH = 'main'
+
+/** Strip the remote prefix so `origin/env/dev` and `env/dev` are one branch. */
+function plainBranchName(name: string, isRemote: boolean): string {
+  return isRemote ? name.split('/').slice(1).join('/') : name
+}
+
+/**
+ * Branch names the platform manages, deduplicated across local and remote refs.
+ * Platform-external branches are excluded: they are read-only until adopted as
+ * an environment, so they can take part in neither side of a merge.
+ */
+const mergeableBranches = computed<string[]>(() => {
+  const names: string[] = []
+  for (const branch of gitStore.branches) {
+    if (!branch.managed) continue
+    const name = plainBranchName(branch.name, branch.is_remote)
+    if (name && !names.includes(name)) names.push(name)
+  }
+  return names
+})
+
+/** The workspace's production branch — the usual promotion target. */
+const productionBranch = computed(
+  () =>
+    environmentStore.environments.find((env) => env.isProduction)?.branch ||
+    DEFAULT_PRODUCTION_BRANCH
+)
+
+const mergeDialogOpen = ref(false)
+const mergeSource = ref('')
+const mergeTarget = ref('')
+const mergeMessage = ref('')
+
+const syncDialogOpen = ref(false)
+const syncBase = ref('')
+
+const preview = computed(() => gitStore.mergePreview)
+
+const mergeTargetOptions = computed(() =>
+  mergeableBranches.value.filter((name) => name !== mergeSource.value)
+)
+
+const syncBaseOptions = computed(() =>
+  mergeableBranches.value.filter((name) => name !== gitStore.currentBranch)
+)
+
+/** Preview is only trustworthy while it describes the selected pair. */
+const previewMatchesSelection = computed(
+  () =>
+    preview.value !== null &&
+    preview.value.source_branch === mergeSource.value &&
+    preview.value.target_branch === mergeTarget.value
+)
+
+function openMerge(source: string) {
+  mergeSource.value = source
+  const candidates = mergeableBranches.value.filter((name) => name !== source)
+  mergeTarget.value = candidates.includes(productionBranch.value)
+    ? productionBranch.value
+    : candidates[0] || ''
+  mergeMessage.value = ''
+  mergeDialogOpen.value = true
+  refreshPreview()
+}
+
+/** Load the pre-flight verdict for the selected branch pair. */
+async function refreshPreview() {
+  if (!mergeSource.value || !mergeTarget.value) return
+  await gitStore.loadMergePreview(mergeSource.value, mergeTarget.value)
+}
+
+async function confirmMerge() {
+  if (!previewMatchesSelection.value || !preview.value?.can_merge) return
+  const merged = await gitStore.mergeBranches(
+    mergeSource.value,
+    mergeTarget.value,
+    mergeMessage.value
+  )
+  if (merged) mergeDialogOpen.value = false
+}
+
+/** Open one file of the branch diff as a read-only editor tab. */
+async function openBranchFileDiff(path: string) {
+  const diff = await gitStore.fetchBranchFileDiff(
+    mergeSource.value,
+    mergeTarget.value,
+    path
+  )
+  fileStore.openVirtualFile({
+    path: `git-diff://${mergeTarget.value}...${mergeSource.value}/${path}`,
+    name: `${fileName(path)} (${mergeSource.value} → ${mergeTarget.value}).diff`,
+    content: diff,
+    language: 'diff',
+    readOnly: true,
+  })
+}
+
+function openSync(base = '') {
+  syncBase.value =
+    base ||
+    (syncBaseOptions.value.includes(productionBranch.value)
+      ? productionBranch.value
+      : syncBaseOptions.value[0] || '')
+  syncDialogOpen.value = true
+}
+
+async function confirmSync() {
+  if (!syncBase.value) return
+  const result = await gitStore.syncWithBase(syncBase.value)
+  if (!result) return
+  syncDialogOpen.value = false
+  // A conflicted sync is the expected path when a promotion was refused: the
+  // conflicted files are now in the working tree, waiting to be resolved.
+  if (!result.conflicted) await gitStore.fetchCommits()
+}
+
+/**
+ * Pull the remote branch into this working copy.
+ *
+ * A divergent branch is integrated with a merge commit, so a pull can end
+ * conflicted — that is a normal outcome, not an error: the conflicted paths are
+ * listed by the panel's conflict bar and resolved in the editor. The history is
+ * only refreshed when the merge actually completed.
+ */
+async function pullCurrent() {
+  const result = await gitStore.pull()
+  if (result && !result.conflicted) await gitStore.fetchCommits()
+}
+
 onMounted(async () => {
   await gitStore.fetchStatus()
   await gitStore.fetchBranches()
@@ -241,9 +350,15 @@ onMounted(async () => {
           ><t-icon name="download" size="14px" /></IconButton>
           <IconButton
             class="pane-action"
+            :label="t('git.syncWithBase')"
+            :disabled="gitStore.isLoading || gitStore.isSyncing || !syncBaseOptions.length"
+            @click="openSync()"
+          ><t-icon name="swap" size="14px" /></IconButton>
+          <IconButton
+            class="pane-action"
             :label="t('git.pullCurrent')"
             :disabled="gitStore.isLoading"
-            @click="gitStore.pull()"
+            @click="pullCurrent()"
           ><t-icon name="arrow-down" size="14px" /></IconButton>
           <IconButton
             class="pane-action"
@@ -280,7 +395,20 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- Branch tree -->
+      <!-- Conflicted paths left by a refused merge or a conflicted sync. The
+           resolution happens in the editor, so the panel only points at it. -->
+      <div v-if="gitStore.mergeConflicts.length" class="conflict-bar">
+        <div class="conflict-title">
+          {{ t('git.conflictsTitle', { count: gitStore.mergeConflicts.length }) }}
+        </div>
+        <div v-for="path in gitStore.mergeConflicts" :key="path" class="conflict-file">
+          {{ path }}
+        </div>
+        <div class="conflict-hint">{{ t('git.conflictsHint') }}</div>
+      </div>
+
+      <!-- Branch tree — lifecycle is read-only (a branch is an environment's
+           code carrier), but merging between environments starts here. -->
       <div class="branch-tree">
         <!-- Local branches -->
         <div class="branch-section">
@@ -290,25 +418,26 @@ onMounted(async () => {
             :key="branch.name"
             class="branch-node"
             :class="{ current: branch.name === gitStore.currentBranch }"
-            :title="t('git.switchBranch')"
-            @click="handleSwitchBranch(branch.name)"
+            :title="branch.managed ? t('git.branchOfEnvironment', { environment: branch.environment }) : t('git.unmanagedBranch')"
           >
             <span class="branch-leaf">🌿</span>
             <span class="branch-label">{{ branch.name }}</span>
+            <span v-if="branch.managed" class="branch-env-tag">{{ branch.environment }}</span>
+            <span v-else class="branch-env-tag unmanaged">{{ t('git.unmanaged') }}</span>
             <div class="branch-actions">
+              <IconButton
+                v-if="branch.managed && mergeableBranches.length > 1"
+                class="pane-action"
+                :label="t('git.mergeInto')"
+                :disabled="gitStore.isLoading || gitStore.isMerging"
+                @click.stop="openMerge(branch.name)"
+              ><t-icon name="git-merge" size="13px" /></IconButton>
               <IconButton
                 class="pane-action"
                 :label="t('git.pushBranch')"
                 :disabled="gitStore.isLoading"
                 @click.stop="gitStore.push(branch.name)"
               ><t-icon name="arrow-up" size="13px" /></IconButton>
-              <IconButton
-                v-if="branch.name !== gitStore.currentBranch"
-                class="pane-action danger"
-                :label="t('git.deleteBranch')"
-                :disabled="gitStore.isLoading"
-                @click.stop="openDeleteBranch(branch.name)"
-              ><t-icon name="delete" size="13px" /></IconButton>
             </div>
           </div>
         </div>
@@ -321,41 +450,25 @@ onMounted(async () => {
             :key="branch.name"
             class="branch-node remote"
             :class="{ linked: gitStore.hasLocalCounterpart(branch.name) }"
-            :title="
-              gitStore.hasLocalCounterpart(branch.name)
-                ? t('git.alreadyLocal')
-                : t('git.checkoutRemote')
-            "
-            @click="
-              gitStore.hasLocalCounterpart(branch.name)
-                ? handleSwitchBranch(localNameOf(branch.name))
-                : gitStore.checkoutRemoteBranch(branch.name)
-            "
+            :title="branch.managed ? t('git.branchOfEnvironment', { environment: branch.environment }) : t('git.unmanagedBranch')"
           >
             <span class="branch-leaf">☁</span>
             <span class="branch-label">{{ branch.name }}</span>
+            <span v-if="branch.managed" class="branch-env-tag">{{ branch.environment }}</span>
             <div class="branch-actions">
               <IconButton
-                v-if="!gitStore.hasLocalCounterpart(branch.name)"
+                v-if="branch.managed && mergeableBranches.length > 1"
                 class="pane-action"
-                :label="t('git.checkoutRemote')"
-                :disabled="gitStore.isLoading"
-                @click.stop="gitStore.checkoutRemoteBranch(branch.name)"
-              ><t-icon name="download" size="13px" /></IconButton>
+                :label="t('git.mergeInto')"
+                :disabled="gitStore.isLoading || gitStore.isMerging"
+                @click.stop="openMerge(plainBranchName(branch.name, true))"
+              ><t-icon name="git-merge" size="13px" /></IconButton>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Create branch input -->
-      <div class="create-branch">
-        <input
-          v-model="newBranchName"
-          class="branch-input"
-          :placeholder="t('git.newBranchPlaceholder')"
-          @keydown.enter="handleCreateBranch"
-        />
-      </div>
+      <div class="branch-hint">{{ t('git.branchesManagedByEnvironment') }}</div>
     </div>
 
     <!-- Center: commit history -->
@@ -435,6 +548,163 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- Merge dialog — step 1 of promoting code between environments. The
+         conflict verdict comes from git's own merge machinery, so the user
+         confirms knowing whether the merge can land at all. -->
+    <Teleport to="body">
+      <div v-if="mergeDialogOpen" class="dialog-overlay" @click.self="mergeDialogOpen = false">
+        <div class="dialog dialog-wide">
+          <h4 class="dialog-title">{{ t('git.mergeTitle') }}</h4>
+
+          <div class="dialog-row">
+            <label class="dialog-field">
+              <span class="dialog-label">{{ t('git.mergeSource') }}</span>
+              <select v-model="mergeSource" class="dialog-select" @change="refreshPreview">
+                <option v-for="name in mergeableBranches" :key="name" :value="name">
+                  {{ name }}
+                </option>
+              </select>
+            </label>
+            <span class="dialog-arrow">→</span>
+            <label class="dialog-field">
+              <span class="dialog-label">{{ t('git.mergeTarget') }}</span>
+              <select v-model="mergeTarget" class="dialog-select" @change="refreshPreview">
+                <option v-for="name in mergeTargetOptions" :key="name" :value="name">
+                  {{ name }}
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <div v-if="gitStore.isPreviewLoading" class="dialog-text">
+            {{ t('common.loading') }}
+          </div>
+
+          <template v-else-if="previewMatchesSelection && preview">
+            <p v-if="preview.up_to_date" class="dialog-text">
+              {{ t('git.mergeUpToDate', { target: mergeTarget, source: mergeSource }) }}
+            </p>
+            <p v-else class="dialog-text">
+              {{
+                t('git.mergeSummary', {
+                  commits: preview.commits_ahead,
+                  files: preview.files.length,
+                })
+              }}
+            </p>
+
+            <p v-if="!preview.remote_synced" class="dialog-warning">
+              {{ t('git.mergeRemoteStale') }}
+            </p>
+            <p v-if="preview.source_unpushed > 0" class="dialog-warning">
+              {{ t('git.mergeUnpushed', { count: preview.source_unpushed }) }}
+            </p>
+            <p v-if="preview.conflicts.length" class="dialog-warning">
+              {{ t('git.mergeConflictWarning', { count: preview.conflicts.length }) }}
+            </p>
+
+            <!-- Changed files: clicking one opens the branch diff as a tab, the
+                 same way a commit's files already do. -->
+            <div v-if="preview.files.length" class="dialog-files">
+              <div
+                v-for="file in preview.files"
+                :key="file.path"
+                class="dialog-file"
+                @click="openBranchFileDiff(file.path)"
+              >
+                <span class="tree-status" :class="statusClass(file.status)">
+                  {{ statusIcon(file.status) }}
+                </span>
+                <span class="dialog-file-path">{{ file.path }}</span>
+                <span
+                  v-if="preview.conflicts.includes(file.path)"
+                  class="dialog-file-conflict"
+                >{{ t('git.conflictTag') }}</span>
+              </div>
+            </div>
+
+            <label class="dialog-field">
+              <span class="dialog-label">{{ t('git.mergeMessage') }}</span>
+              <input
+                v-model="mergeMessage"
+                class="dialog-input"
+                :placeholder="t('git.mergeMessagePlaceholder', {
+                  source: mergeSource,
+                  target: mergeTarget,
+                })"
+              />
+            </label>
+
+            <p class="dialog-hint">{{ t('git.mergeNextStepHint') }}</p>
+          </template>
+
+          <div class="dialog-actions">
+            <button
+              v-if="previewMatchesSelection && preview?.conflicts.length"
+              class="btn-cancel"
+              @click="mergeDialogOpen = false; openSync(mergeTarget)"
+            >
+              {{ t('git.resolveViaSync') }}
+            </button>
+            <button class="btn-cancel" @click="mergeDialogOpen = false">
+              {{ t('common.cancel') }}
+            </button>
+            <button
+              class="btn-primary"
+              :disabled="
+                gitStore.isMerging ||
+                gitStore.isPreviewLoading ||
+                !previewMatchesSelection ||
+                !preview?.can_merge
+              "
+              @click="confirmMerge"
+            >
+              {{ gitStore.isMerging ? t('git.merging') : t('git.confirmMerge') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Sync dialog — brings the base branch INTO this working copy, which is
+         where a conflict is resolved (editor + staging, no web merge tool). -->
+    <Teleport to="body">
+      <div v-if="syncDialogOpen" class="dialog-overlay" @click.self="syncDialogOpen = false">
+        <div class="dialog">
+          <h4 class="dialog-title">{{ t('git.syncTitle') }}</h4>
+          <p class="dialog-text">
+            {{ t('git.syncDescription', { branch: gitStore.currentBranch }) }}
+          </p>
+
+          <label class="dialog-field">
+            <span class="dialog-label">{{ t('git.syncBase') }}</span>
+            <select v-model="syncBase" class="dialog-select">
+              <option v-for="name in syncBaseOptions" :key="name" :value="name">
+                {{ name }}
+              </option>
+            </select>
+          </label>
+
+          <p v-if="!gitStore.isClean" class="dialog-warning">
+            {{ t('git.syncDirtyWarning') }}
+          </p>
+
+          <div class="dialog-actions">
+            <button class="btn-cancel" @click="syncDialogOpen = false">
+              {{ t('common.cancel') }}
+            </button>
+            <button
+              class="btn-primary"
+              :disabled="gitStore.isSyncing || !syncBase || !gitStore.isClean"
+              @click="confirmSync"
+            >
+              {{ gitStore.isSyncing ? t('git.syncing') : t('git.confirmSync') }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
     <!-- Reset dialog: mode must be chosen explicitly because `hard` is
          irreversible for uncommitted work. -->
     <Teleport to="body">
@@ -478,32 +748,6 @@ onMounted(async () => {
               @click="confirmReset"
             >
               {{ t('git.confirmReset') }}
-            </button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
-    <!-- Delete branch dialog -->
-    <Teleport to="body">
-      <div v-if="deleteTarget" class="dialog-overlay" @click.self="deleteTarget = null">
-        <div class="dialog">
-          <h4 class="dialog-title">
-            {{ t('git.confirmDeleteBranch', { branch: deleteTarget }) }}
-          </h4>
-          <p class="dialog-text">{{ t('git.forceDeleteBranchHint') }}</p>
-
-          <label class="dialog-option">
-            <input type="checkbox" v-model="forceDelete" />
-            <span>{{ t('git.forceDelete') }}</span>
-          </label>
-
-          <div class="dialog-actions">
-            <button class="btn-cancel" @click="deleteTarget = null">
-              {{ t('common.cancel') }}
-            </button>
-            <button class="btn-primary danger" @click="confirmDeleteBranch">
-              {{ t('common.delete') }}
             </button>
           </div>
         </div>
@@ -604,6 +848,36 @@ onMounted(async () => {
   margin-left: auto;
 }
 
+/* Conflicted paths surfaced after a refused merge or a conflicted sync. */
+.conflict-bar {
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--error-subtle);
+  font-size: 11px;
+  color: var(--text-secondary);
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.conflict-title {
+  font-weight: 600;
+  color: var(--error);
+  margin-bottom: 2px;
+}
+
+.conflict-file {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conflict-hint {
+  margin-top: 4px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
 .branch-tree {
   flex: 1;
   overflow-y: auto;
@@ -662,6 +936,22 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
+/* Which environment a branch backs. Un-managed branches are read-only: they
+   cannot be planned or applied until adopted as an environment. */
+.branch-env-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+  color: var(--text-secondary);
+}
+
+.branch-env-tag.unmanaged {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* Row actions stay hidden until hover so the list reads as a branch list. */
 .branch-actions {
   display: flex;
@@ -675,24 +965,13 @@ onMounted(async () => {
   opacity: 1;
 }
 
-.create-branch {
+/* Explains why the branch list has no create/switch/delete affordances. */
+.branch-hint {
   padding: 6px 8px;
   border-top: 1px solid var(--border);
-}
-
-.branch-input {
-  width: 100%;
-  background: var(--input-bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 4px 8px;
-  color: var(--text-primary);
-  font-size: 11px;
-  outline: none;
-}
-
-.branch-input:focus {
-  border-color: var(--accent);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
 }
 
 /* === Center: Commit history pane === */
@@ -927,6 +1206,94 @@ onMounted(async () => {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+/* Merge dialog needs room for the branch pair and the changed-file list. */
+.dialog-wide {
+  min-width: 520px;
+  max-width: 720px;
+}
+
+.dialog-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.dialog-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.dialog-arrow {
+  padding-bottom: 6px;
+  color: var(--text-muted);
+}
+
+.dialog-select,
+.dialog-input {
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.dialog-select:focus,
+.dialog-input:focus {
+  border-color: var(--accent);
+}
+
+.dialog-files {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 0;
+}
+
+.dialog-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.dialog-file:hover {
+  background: var(--bg-hover);
+}
+
+.dialog-file-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.dialog-file-conflict {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--error);
+  text-transform: uppercase;
+}
+
+.dialog-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
 }
 
 .dialog-text {

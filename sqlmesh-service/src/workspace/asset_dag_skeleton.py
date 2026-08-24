@@ -36,8 +36,14 @@ Auto-discovery rules (Dagster ``dg`` convention):
   ``Definitions(resources={...})`` from a ``@dg.definitions`` function (see
   ``defs/resources/example_resource.py``).
 
-NOTE: SQLMESH_SERVICE_URL / DAGSTER_WORKSPACE_PATH / SQLMESH_GATEWAY are injected
-as env vars by the dagster-service when it launches this code location.
+This code location serves ONE environment: dagster-service launches one per
+environment, each loading that environment's own Git branch. The deployment
+identity is injected as environment variables (``AGENTICDATA_ENVIRONMENT``,
+``AGENTICDATA_DEPLOYMENT``, ``AGENTICDATA_DEPLOYMENT_TYPE``,
+``AGENTICDATA_WORKSPACE_ID``, ``AGENTICDATA_SCHEDULES_ENABLED``) alongside the
+SQLMesh bridge settings (``SQLMESH_SERVICE_URL``, ``DAGSTER_WORKSPACE_PATH``,
+``SQLMESH_GATEWAY``); read it through ``defs/deployment.py``, which also gates
+schedule and sensor statuses on it.
 """
 
 import os
@@ -76,6 +82,10 @@ This is the Dagster project for your Data+AI pipeline. It follows the modern
 Dagster (`dg`) layout: a single `definitions.py` entrypoint auto-discovers all
 definitions under the `defs/` package.
 
+This working copy belongs to ONE environment. Every environment of the workspace
+runs its own Dagster deployment from its own Git branch, all loading this same
+project — which is why the code must never assume it is running in production.
+
 ## Layout
 
 ```
@@ -83,6 +93,7 @@ asset-dag/
 ├── definitions.py        # entrypoint: auto-discovers defs/ into Definitions
 ├── pyproject.toml        # project metadata; [tool.dagster] module_name
 ├── defs/                 # ALL definitions live here (auto-discovery root)
+│   ├── deployment.py     # MANAGED: deployment identity + schedule gate
 │   ├── assets/           # asset definitions (SQLMesh bridge + Daft example)
 │   ├── resources/        # resources, wired via @dg.definitions
 │   ├── jobs/             # asset jobs
@@ -95,6 +106,13 @@ asset-dag/
 
 - **Everything under `defs/` is auto-discovered.** Add a new module with a
   top-level `@asset`, job, schedule, or sensor and it shows up automatically.
+- **Gate schedules and sensors on the deployment.** Use
+  `default_status=DEFAULT_SCHEDULE_STATUS` (or `DEFAULT_SENSOR_STATUS`) from
+  `defs.deployment`. Only a deployment the platform allows to be scheduled runs
+  them; hard-coding `RUNNING` makes a branch drive production data on every tick.
+- **`defs/deployment.py` is platform-managed.** It is regenerated whenever it
+  drifts from the template, so edits there are lost. It also exposes the current
+  `ENVIRONMENT`, `DEPLOYMENT_NAME` and `WORKSPACE_ID` for your own code.
 - **Resources are wired explicitly.** Auto-discovery does not pick up bare
   resource objects; return them from a `@dg.definitions` function that yields a
   `Definitions(resources={...})` (see `defs/resources/example_resource.py`).
@@ -109,10 +127,12 @@ asset-dag/
 The dagster-service launches this as a gRPC code location with:
 
 ```
-dagster api grpc -f definitions.py --location-name <name>
+dagster api grpc -f definitions.py --location-name <deployment>
 ```
 
-with `cwd` set to this directory, so `import defs` resolves.
+with `cwd` set to this directory (so `import defs` resolves) and the deployment
+identity injected as environment variables. The location name is the deployment
+name, `{workspace_id}__{environment}`.
 """
 
 _DEFS_INIT_PY = '''"""Auto-discovery root for workspace {{ workspace_name }}'s Dagster definitions.
@@ -120,6 +140,94 @@ _DEFS_INIT_PY = '''"""Auto-discovery root for workspace {{ workspace_name }}'s D
 Every module under this package is scanned by ``load_defs`` in ``definitions.py``.
 Organize definitions by concept: assets/, resources/, jobs/, schedules/, sensors/.
 """
+'''
+
+_DEPLOYMENT_PY = '''"""Deployment identity and scheduling gate for workspace {{ workspace_name }}.
+
+PLATFORM-MANAGED FILE. dagster-service regenerates it whenever its content
+drifts from the platform template, so local edits are lost. Put your own code in
+the sibling packages (``defs/assets``, ``defs/jobs``, ``defs/schedules``, ...).
+
+What this module is for
+-----------------------
+Every environment of a workspace runs its own Dagster deployment, and all of
+them load THE SAME code from their own Git branch. Nothing in the code itself can
+therefore tell production apart from a feature branch — that distinction is
+injected by dagster-service as environment variables when it launches the code
+location, and this module is where the code reads it.
+
+The consequence that matters is scheduling: without a gate, a sandbox
+environment's schedule would be picked up by the daemon and drive production data
+on every tick. Declare schedules and sensors with the statuses exported here::
+
+    import dagster as dg
+
+    from defs.deployment import DEFAULT_SCHEDULE_STATUS
+
+    daily = dg.ScheduleDefinition(
+        name="daily_refresh",
+        job=my_job,
+        cron_schedule="0 2 * * *",
+        execution_timezone="UTC",
+        default_status=DEFAULT_SCHEDULE_STATUS,
+    )
+
+Enabling schedules for a non-production environment is a platform decision, not a
+code one: the environment registry sets it on the environment and dagster-service
+injects it here. Hard-coding ``RUNNING`` bypasses that decision.
+
+Why this lives under ``defs/`` and not in ``definitions.py``: ``definitions.py``
+imports the ``defs`` package, so a module under ``defs`` cannot import back from
+it without a circular import.
+"""
+
+import os
+
+import dagster as dg
+
+# ── Deployment identity (injected by dagster-service) ──────────────────
+# Empty values mean the code was loaded outside a platform deployment (a local
+# `dagster dev`, a unit test); the gate then falls back to the safest behavior.
+ENVIRONMENT = os.getenv("AGENTICDATA_ENVIRONMENT", "")
+DEPLOYMENT_NAME = os.getenv("AGENTICDATA_DEPLOYMENT", "")
+DEPLOYMENT_TYPE = os.getenv("AGENTICDATA_DEPLOYMENT_TYPE", "sandbox")
+WORKSPACE_ID = os.getenv("AGENTICDATA_WORKSPACE_ID", "")
+TENANT_ID = os.getenv("AGENTICDATA_TENANT_ID", "")
+
+# Whether this deployment is the workspace's production line.
+IS_PRODUCTION = DEPLOYMENT_TYPE == "production"
+
+# Whether the daemon may run this deployment's schedules and sensors. Granted to
+# production automatically; to any other environment only explicitly.
+SCHEDULES_ENABLED = os.getenv("AGENTICDATA_SCHEDULES_ENABLED", "") == "1"
+
+# ── Scheduling gate ────────────────────────────────────────────────────
+DEFAULT_SCHEDULE_STATUS = (
+    dg.DefaultScheduleStatus.RUNNING
+    if SCHEDULES_ENABLED
+    else dg.DefaultScheduleStatus.STOPPED
+)
+
+DEFAULT_SENSOR_STATUS = (
+    dg.DefaultSensorStatus.RUNNING
+    if SCHEDULES_ENABLED
+    else dg.DefaultSensorStatus.STOPPED
+)
+
+
+def run_tags() -> dict[str, str]:
+    """Platform tags identifying this deployment, for runs launched from code.
+
+    Runs launched through the platform API already carry these; use this helper
+    when your own code launches a run (a sensor's ``RunRequest``) so it stays
+    attributable to the environment that produced it.
+    """
+    tags = {
+        "agenticdata/environment": ENVIRONMENT,
+        "agenticdata/workspace_id": WORKSPACE_ID,
+        "agenticdata/deployment": DEPLOYMENT_NAME,
+    }
+    return {key: value for key, value in tags.items() if value}
 '''
 
 _ASSETS_INIT_PY = '"""Asset definitions for workspace {{ workspace_name }}."""\n'
@@ -313,12 +421,18 @@ Runs ``example_job`` once a day. The cron expression is interpreted in UTC
 (``execution_timezone="UTC"``) to keep scheduling consistent with the backend's
 UTC-only policy; presentation-layer timezone conversion happens in the UI.
 
+``default_status`` comes from ``defs.deployment``: this schedule runs only in a
+deployment the platform allows to be scheduled. Every environment loads this same
+code from its own branch, so a hard-coded ``RUNNING`` would let a sandbox drive
+production data on every tick.
+
 Auto-discovered by ``definitions.py``: the top-level schedule object is picked
 up directly.
 """
 
 import dagster as dg
 
+from defs.deployment import DEFAULT_SCHEDULE_STATUS
 from defs.jobs.example_job import example_job
 
 # 00:00 UTC every day. Adjust the cron string to your cadence.
@@ -327,7 +441,7 @@ daily_schedule = dg.ScheduleDefinition(
     job=example_job,
     cron_schedule="0 0 * * *",
     execution_timezone="UTC",
-    default_status=dg.DefaultScheduleStatus.STOPPED,
+    default_status=DEFAULT_SCHEDULE_STATUS,
 )
 '''
 
@@ -339,16 +453,21 @@ Sensors poll for external conditions and can launch runs when they are met.
 This scaffold always skips; replace the body with your trigger logic (e.g. a
 new file in object storage, an upstream table refresh, a webhook cursor).
 
+``default_status`` comes from ``defs.deployment`` for the same reason schedules
+gate on it: a sensor in a branch deployment would otherwise launch runs against
+production on its own.
+
 Auto-discovered by ``definitions.py``: the top-level sensor object is picked up
 directly.
 """
 
 import dagster as dg
 
+from defs.deployment import DEFAULT_SENSOR_STATUS
 from defs.jobs.example_job import example_job
 
 
-@dg.sensor(job=example_job, default_status=dg.DefaultSensorStatus.STOPPED)
+@dg.sensor(job=example_job, default_status=DEFAULT_SENSOR_STATUS)
 def example_sensor(context: dg.SensorEvaluationContext) -> dg.SkipReason:
     """Skip by default; implement a real trigger condition here."""
     context.log.info("example_sensor evaluated (scaffold: always skips)")
@@ -389,6 +508,7 @@ _SKELETON_FILES = {
     "README.md": _README_MD,
     # defs/ auto-discovery root
     os.path.join("defs", "__init__.py"): _DEFS_INIT_PY,
+    os.path.join("defs", "deployment.py"): _DEPLOYMENT_PY,
     os.path.join("defs", "assets", "__init__.py"): _ASSETS_INIT_PY,
     os.path.join("defs", "assets", "sql_assets.py"): _SQL_ASSETS_PY,
     os.path.join("defs", "assets", "daft_assets.py"): _DAFT_ASSETS_PY,

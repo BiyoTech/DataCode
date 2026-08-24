@@ -49,6 +49,13 @@ export interface BranchInfo {
   is_remote: boolean
   last_commit_hash: string
   last_commit_message: string
+  /**
+   * Environment this branch backs, or null for a branch outside the platform's
+   * `env/` namespace (e.g. brought in from an external repository).
+   */
+  environment: string | null
+  /** Whether the platform owns the branch's lifecycle. */
+  managed: boolean
 }
 
 export interface CommitInfo {
@@ -65,6 +72,71 @@ export interface CommitFile {
   status: string // M | A | D | R ...
 }
 
+/** One file that differs between two branches. */
+export interface BranchDiffFile {
+  path: string
+  status: string
+  original_path?: string
+}
+
+/** A commit a merge would bring in (no email: the preview list stays compact). */
+export interface MergeCommit {
+  hash: string
+  short_hash: string
+  author_name: string
+  date: string // ISO 8601; rendered in the user's timezone
+  message: string
+}
+
+/**
+ * Everything needed to confirm a branch merge, including the conflict verdict
+ * from git's own merge machinery — so the dialog states whether the merge can
+ * land instead of guessing from changed paths.
+ */
+export interface MergePreview {
+  source_branch: string
+  target_branch: string
+  source_ref: string
+  target_ref: string
+  /** False when remote-tracking refs could not be refreshed (no credential). */
+  remote_synced: boolean
+  merge_base: string
+  commits: MergeCommit[]
+  commits_ahead: number
+  files: BranchDiffFile[]
+  conflicts: string[]
+  can_merge: boolean
+  up_to_date: boolean
+  /** Commits the source branch holds locally but has not pushed yet. */
+  source_unpushed: number
+}
+
+/** Outcome of merging a base branch into the current working copy. */
+export interface SyncResult {
+  branch: string
+  base_branch: string
+  conflicted: boolean
+  conflicts: string[]
+  merge_commit: string
+  up_to_date: boolean
+}
+
+/**
+ * How the backend integrated the remote branch. `conflicted` is a SUCCESSFUL
+ * outcome: the conflicted files are in the working tree waiting to be resolved.
+ */
+export type PullOutcome = 'up_to_date' | 'fast_forward' | 'merged' | 'conflicted'
+
+/** Outcome of pulling the remote branch into this working copy. */
+export interface PullResult {
+  branch: string
+  outcome: PullOutcome
+  conflicted: boolean
+  conflicts: string[]
+  commit: string
+  integrated_commits: number
+}
+
 export type GitPanelState = 'auth' | 'init' | 'detail'
 
 export const useGitStore = defineStore('git', () => {
@@ -77,6 +149,11 @@ export const useGitStore = defineStore('git', () => {
   // Git status
   const isInitialized = ref(false)
   const currentBranch = ref('main')
+  /**
+   * Environment the checked-out branch backs, derived by the backend from the
+   * branch name. Empty for a branch the platform does not manage.
+   */
+  const currentEnvironment = ref('')
   const remoteUrl = ref<string | null>(null)
   const ahead = ref(0)
   const behind = ref(0)
@@ -115,6 +192,18 @@ export const useGitStore = defineStore('git', () => {
 
   // Commit message input
   const commitMessage = ref('')
+
+  // ---- Branch merge (code promotion, step 1 of 2) ----
+  //
+  // Promotion is split into two explicit user actions: merge the code here,
+  // then plan & apply + reload the code location on the target environment.
+  // A conflict cannot be automated away, so it is surfaced instead of hidden.
+  const mergePreview = ref<MergePreview | null>(null)
+  const isPreviewLoading = ref(false)
+  const isMerging = ref(false)
+  const isSyncing = ref(false)
+  /** Conflicted paths of the last refused merge or of a conflicted sync. */
+  const mergeConflicts = ref<string[]>([])
 
   /**
    * Determine panel state based on credentials + git init status.
@@ -312,22 +401,35 @@ export const useGitStore = defineStore('git', () => {
 
   /**
    * Pull from remote into the checked-out branch (or ``branch`` when given).
+   *
+   * The backend picks the integration strategy (fast-forward, else a real merge
+   * commit), so a divergent environment branch pulls cleanly instead of failing
+   * on git's "specify how to reconcile" refusal. A CONFLICTED result is
+   * returned as a success: the conflicted files are now in the working tree and
+   * are listed in `mergeConflicts`, exactly like after a sync. Returns `null`
+   * when the pull was rejected (no workspace, dirty working copy, remote error).
    */
-  async function pull(branch?: string): Promise<void> {
+  async function pull(branch?: string): Promise<PullResult | null> {
     const workspaceStore = useWorkspaceStore()
     const ws = workspaceStore.currentWorkspace
-    if (!ws) return
+    if (!ws) return null
 
     isLoading.value = true
+    error.value = null
+    mergeConflicts.value = []
     try {
-      await api.post('/git/pull', {
+      const { data } = await api.post('/git/pull', {
         workspace_path: ws.path,
         user_id: currentUserId(),
         branch: branch || '',
       })
+      const result = data as PullResult
+      mergeConflicts.value = result.conflicts || []
       await refreshRepoState()
+      return result
     } catch (e) {
       error.value = reportGitError(e, 'git.pullFailed')
+      return null
     } finally {
       isLoading.value = false
     }
@@ -352,60 +454,6 @@ export const useGitStore = defineStore('git', () => {
       await refreshRepoState()
     } catch (e) {
       error.value = reportGitError(e, 'git.fetchFailed')
-    } finally {
-      isLoading.value = false
-    }
-  }
-
-  /**
-   * Materialize a remote branch locally, tracking its upstream.
-   * ``remoteRef`` is the full remote name, e.g. "origin/dev".
-   */
-  async function checkoutRemoteBranch(remoteRef: string): Promise<void> {
-    const workspaceStore = useWorkspaceStore()
-    const ws = workspaceStore.currentWorkspace
-    if (!ws) return
-
-    const localName = remoteRef.split('/').slice(1).join('/')
-    if (!localName) return
-
-    isLoading.value = true
-    try {
-      await api.post('/git/checkout', {
-        workspace_path: ws.path,
-        branch: localName,
-        create: true,
-        start_point: remoteRef,
-        track: true,
-      })
-      currentBranch.value = localName
-      await refreshRepoState()
-      await fetchCommits(localName)
-    } catch (e) {
-      error.value = reportGitError(e, 'git.checkoutFailed')
-    } finally {
-      isLoading.value = false
-    }
-  }
-
-  /**
-   * Delete a local branch. Without ``force`` Git refuses to drop unmerged work.
-   */
-  async function deleteBranch(branch: string, force = false): Promise<void> {
-    const workspaceStore = useWorkspaceStore()
-    const ws = workspaceStore.currentWorkspace
-    if (!ws) return
-
-    isLoading.value = true
-    try {
-      await api.post('/git/branch/delete', {
-        workspace_path: ws.path,
-        branch,
-        force,
-      })
-      await refreshRepoState()
-    } catch (e) {
-      error.value = reportGitError(e, 'git.deleteBranchFailed')
     } finally {
       isLoading.value = false
     }
@@ -456,7 +504,10 @@ export const useGitStore = defineStore('git', () => {
   }
 
   /**
-   * Fetch branches.
+   * Fetch branches, each annotated with the environment it backs.
+   *
+   * Read-only: branches are created, switched and deleted through the
+   * environment registry, never here.
    */
   async function fetchBranches(): Promise<void> {
     const workspaceStore = useWorkspaceStore()
@@ -468,28 +519,7 @@ export const useGitStore = defineStore('git', () => {
     })
     branches.value = data.branches || []
     currentBranch.value = data.current_branch || 'main'
-  }
-
-  /**
-   * Checkout branch.
-   */
-  async function checkout(branch: string, create = false): Promise<void> {
-    const workspaceStore = useWorkspaceStore()
-    const ws = workspaceStore.currentWorkspace
-    if (!ws) return
-
-    isLoading.value = true
-    try {
-      await api.post('/git/checkout', { workspace_path: ws.path, branch, create })
-      currentBranch.value = branch
-      await refreshRepoState()
-      // Refresh commit history for the newly checked-out branch
-      await fetchCommits(branch)
-    } catch (e) {
-      error.value = reportGitError(e, 'git.checkoutFailed')
-    } finally {
-      isLoading.value = false
-    }
+    currentEnvironment.value = data.current_environment || ''
   }
 
   /**
@@ -566,6 +596,139 @@ export const useGitStore = defineStore('git', () => {
     }
   }
 
+  /**
+   * Load the pre-flight preview of merging `source` into `target`.
+   * Read-only: it refreshes remote-tracking refs but never the working tree.
+   */
+  async function loadMergePreview(
+    source: string,
+    target: string
+  ): Promise<MergePreview | null> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return null
+
+    isPreviewLoading.value = true
+    mergePreview.value = null
+    mergeConflicts.value = []
+    try {
+      const { data } = await api.get('/git/branch-diff', {
+        params: {
+          workspace_path: ws.path,
+          user_id: currentUserId(),
+          source,
+          target,
+        },
+      })
+      mergePreview.value = data as MergePreview
+      return mergePreview.value
+    } catch (e) {
+      error.value = reportGitError(e, 'git.mergePreviewFailed')
+      return null
+    } finally {
+      isPreviewLoading.value = false
+    }
+  }
+
+  /** Fetch one file's patch between two branches (merge-base diff). */
+  async function fetchBranchFileDiff(
+    source: string,
+    target: string,
+    filePath: string
+  ): Promise<string> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return ''
+
+    try {
+      const { data } = await api.get('/git/branch-diff', {
+        params: {
+          workspace_path: ws.path,
+          user_id: currentUserId(),
+          source,
+          target,
+          file_path: filePath,
+        },
+      })
+      return data.diff || ''
+    } catch (e) {
+      error.value = reportGitError(e, 'git.mergePreviewFailed')
+      return ''
+    }
+  }
+
+  /**
+   * Merge `source` into `target` and publish the result on the remote.
+   *
+   * No working copy is modified: the target environment picks the merge up with
+   * its own explicit pull + reload. A conflict is reported back as the list of
+   * conflicted paths, since it can only be resolved in a working copy.
+   */
+  async function mergeBranches(
+    source: string,
+    target: string,
+    message = ''
+  ): Promise<boolean> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return false
+
+    isMerging.value = true
+    mergeConflicts.value = []
+    try {
+      await api.post('/git/merge', {
+        workspace_path: ws.path,
+        user_id: currentUserId(),
+        source_branch: source,
+        target_branch: target,
+        message,
+      })
+      await refreshRepoState()
+      return true
+    } catch (e: any) {
+      // The backend inlines the conflicted paths at the top level of the error
+      // body, so the panel can list them without parsing a message.
+      mergeConflicts.value = e?.response?.data?.conflicts ?? []
+      error.value = reportGitError(e, 'git.mergeFailed')
+      return false
+    } finally {
+      isMerging.value = false
+    }
+  }
+
+  /**
+   * Merge `base` into the branch of the current working copy.
+   *
+   * This is where a merge conflict is meant to be resolved: the conflicted
+   * files stay in the working tree and appear as `U` entries, so the user fixes
+   * them in the editor and commits.
+   */
+  async function syncWithBase(base: string, message = ''): Promise<SyncResult | null> {
+    const workspaceStore = useWorkspaceStore()
+    const ws = workspaceStore.currentWorkspace
+    if (!ws) return null
+
+    isSyncing.value = true
+    mergeConflicts.value = []
+    try {
+      const { data } = await api.post('/git/sync', {
+        workspace_path: ws.path,
+        user_id: currentUserId(),
+        base_branch: base,
+        message,
+      })
+      const result = data as SyncResult
+      mergeConflicts.value = result.conflicts || []
+      await refreshRepoState()
+      return result
+    } catch (e) {
+      error.value = reportGitError(e, 'git.syncFailed')
+      return null
+    } finally {
+      isSyncing.value = false
+    }
+  }
+
   /** Clear workspace-scoped git state (used on workspace switch). */
   function reset() {
     panelState.value = 'auth'
@@ -574,6 +737,7 @@ export const useGitStore = defineStore('git', () => {
     error.value = null
     isInitialized.value = false
     currentBranch.value = 'main'
+    currentEnvironment.value = ''
     remoteUrl.value = null
     ahead.value = 0
     behind.value = 0
@@ -585,6 +749,11 @@ export const useGitStore = defineStore('git', () => {
     commitFiles.value = []
     isLoadingCommitFiles.value = false
     commitMessage.value = ''
+    mergePreview.value = null
+    isPreviewLoading.value = false
+    isMerging.value = false
+    isSyncing.value = false
+    mergeConflicts.value = []
   }
 
   return {
@@ -595,6 +764,7 @@ export const useGitStore = defineStore('git', () => {
     error,
     isInitialized,
     currentBranch,
+    currentEnvironment,
     remoteUrl,
     ahead,
     behind,
@@ -609,6 +779,11 @@ export const useGitStore = defineStore('git', () => {
     selectedCommitHash,
     commitFiles,
     isLoadingCommitFiles,
+    mergePreview,
+    isPreviewLoading,
+    isMerging,
+    isSyncing,
+    mergeConflicts,
     // Actions
     refreshPanelState,
     fetchStatus,
@@ -623,15 +798,16 @@ export const useGitStore = defineStore('git', () => {
     pull,
     fetchFromRemote,
     fetchBranches,
-    checkout,
-    checkoutRemoteBranch,
-    deleteBranch,
     resetTo,
     hasLocalCounterpart,
     refreshRepoState,
     fetchCommits,
     selectCommit,
     fetchCommitFileDiff,
+    loadMergePreview,
+    fetchBranchFileDiff,
+    mergeBranches,
+    syncWithBase,
     reset,
   }
 })

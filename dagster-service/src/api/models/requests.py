@@ -8,9 +8,9 @@ from pydantic import BaseModel, Field
 
 
 class TriggerRunRequest(BaseModel):
-    """Launch a job run in a workspace's code location."""
+    """Launch a job run in a deployment's code location."""
 
-    workspace_path: str = Field(..., description="Workspace root path")
+    workspace_path: str = Field(..., description="Environment working-copy path")
     job_name: str = Field(..., description="Dagster job name to launch")
     repository_name: str = Field("__repository__", description="Repository name in the location")
     run_config: Optional[dict[str, Any]] = Field(
@@ -18,13 +18,32 @@ class TriggerRunRequest(BaseModel):
     )
 
 
-class ReloadCodeLocationRequest(BaseModel):
-    """Reload a workspace's code location after user code changes."""
+class DeploymentRequest(BaseModel):
+    """Ensure or reload the deployment backing one environment working copy.
 
-    workspace_path: str = Field(..., description="Workspace root path")
+    ``workspace_path`` alone is sufficient: it encodes the tenant, workspace,
+    user and environment, and the deployment name is a pure function of the last
+    two. The remaining fields carry the environment registry's POLICY, which no
+    path can express; when omitted the safe default applies (only the production
+    environment is a production deployment, and only production is scheduled).
+    """
 
-
-class EnsureCodeLocationRequest(BaseModel):
-    """Ensure a workspace's code location gRPC server is running."""
-
-    workspace_path: str = Field(..., description="Workspace root path")
+    workspace_path: str = Field(..., description="Environment working-copy path")
+    environment: str = Field(
+        default="",
+        description=(
+            "Expected environment name. Confirms the working copy rather than "
+            "redirecting it: a mismatch is rejected."
+        ),
+    )
+    env_type: str = Field(
+        default="",
+        description="Deployment type from the registry: production | shared | sandbox",
+    )
+    schedules_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether the daemon may run this deployment's schedules. Defaults to "
+            "true only for the production deployment."
+        ),
+    )

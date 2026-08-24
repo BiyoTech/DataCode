@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # Subprocess lifecycle.
     process_start_timeout: int = 30       # seconds to wait for a subprocess to become healthy
     process_stop_timeout: int = 5         # seconds to wait for graceful SIGTERM before SIGKILL
+    # Supervision: how often dead subprocesses are respawned, and how many
+    # respawns are allowed inside a sliding window before giving up (a
+    # crash-looping code location must surface, not spin forever).
+    process_health_interval: int = 10
+    process_max_restarts: int = 3
+    process_restart_window: int = 300
 
     # SQLMesh request timeout (for the SQLMesh -> Dagster bridge).
     sqlmesh_request_timeout: float = 10.0
@@ -138,6 +144,9 @@ def _flatten_yaml(data: dict) -> dict:
         "dagster.remote_token": "dagster_remote_token",
         "dagster.process_start_timeout": "process_start_timeout",
         "dagster.process_stop_timeout": "process_stop_timeout",
+        "dagster.process_health_interval": "process_health_interval",
+        "dagster.process_max_restarts": "process_max_restarts",
+        "dagster.process_restart_window": "process_restart_window",
         "sqlmesh.request_timeout": "sqlmesh_request_timeout",
     }
     return flatten_yaml_mapping(data, mapping)

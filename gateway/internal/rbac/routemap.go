@@ -22,6 +22,9 @@ const (
 	// ScopeSourceWorkspacePath reads "workspace_path" from the query or JSON
 	// body and derives the workspace id from the working-copy layout.
 	ScopeSourceWorkspacePath
+	// ScopeSourceEnvironmentSegment reads an environment id ("{workspace_id}:
+	// {environment}") from a path segment and derives the workspace from it.
+	ScopeSourceEnvironmentSegment
 )
 
 // Rule maps a request onto the permission it requires.
@@ -106,6 +109,29 @@ var rules = []Rule{
 	{Method: http.MethodDelete, Pattern: "/api/v1/workspaces/{}",
 		Permission: PermWorkspaceDelete, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 
+	// ---------------------------------------------------------- environments
+	// The environment registry is the platform's development-line API: it owns
+	// the Git branch, the SQLMesh virtual environment and the Dagster
+	// deployment as one unit.
+	{Method: http.MethodGet, Pattern: "/api/v1/workspaces/{}/environments",
+		Permission: PermWorkspaceEnvRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/{}/environments",
+		Permission: PermWorkspaceEnvCreate, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+	// Materializing a working copy of an existing environment is an ordinary
+	// read of the workspace: it creates no shared resource.
+	{Method: http.MethodPost, Pattern: "/api/v1/environments/{}/open",
+		Permission: PermWorkspaceRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+	// Reconciliation may recreate a branch and a virtual environment, which is
+	// what creating an environment does — hence env:create, not env:read.
+	{Method: http.MethodPost, Pattern: "/api/v1/environments/{}/reconcile",
+		Permission: PermWorkspaceEnvCreate, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+	{Method: http.MethodDelete, Pattern: "/api/v1/environments/{}",
+		Permission: PermWorkspaceEnvDelete, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+	// Details, events and any future read (diff, drift) share one rule so a new
+	// backend read endpoint cannot degrade to "authenticated only".
+	{Method: http.MethodGet, Pattern: "/api/v1/environments/*",
+		Permission: PermWorkspaceEnvRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+
 	// ------------------------------------------------------- agent & models
 	{Pattern: "/api/v1/sessions/*", Permission: PermTenantAgentUse, Source: ScopeSourceTenant},
 	{Method: http.MethodGet, Pattern: "/api/v1/models",
@@ -130,6 +156,10 @@ var rules = []Rule{
 		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/schema/discover",
 		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+	// Repairing the platform-managed state_schema rewrites config.yaml, i.e. a
+	// code change, so it is gated like any other file write.
+	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/config/state-schema/repair",
+		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 	// Static service metadata carries no workspace context.
 	{Method: http.MethodGet, Pattern: "/api/v1/sqlmesh/meta", Source: ScopeSourceNone},
 	{Method: http.MethodGet, Pattern: "/api/v1/sqlmesh/modules", Source: ScopeSourceNone},
@@ -156,6 +186,17 @@ var rules = []Rule{
 		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/git/publish",
 		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
+	// Merging one environment branch into another publishes the result on the
+	// remote, so it is gated like any other push. Merging into the PRODUCTION
+	// branch additionally requires workspace:env:promote, which the service
+	// checks from the granted permission set: the target branch lives in the
+	// body, and the route map is intentionally static.
+	{Method: http.MethodPost, Pattern: "/api/v1/git/merge",
+		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
+	// Syncing a base branch into the caller's own working copy changes files
+	// only locally — an ordinary code write, no remote mutation.
+	{Method: http.MethodPost, Pattern: "/api/v1/git/sync",
+		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodGet, Pattern: "/api/v1/git/*",
 		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/git/*",
@@ -166,6 +207,15 @@ var rules = []Rule{
 		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/files/*",
 		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+
+	// ------------------------------------------------------------------ logs
+	// Read-only, and deliberately NOT ScopeOptional: a log query without a
+	// resolvable workspace has no meaning, so an unresolvable one must be
+	// rejected rather than degraded into "has the permission somewhere".
+	{Method: http.MethodGet, Pattern: "/api/v1/logs",
+		Permission: PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
+	{Method: http.MethodGet, Pattern: "/api/v1/logs/*",
+		Permission: PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
 
 	// ------------------------------------------------------------- knowledge
 	{Method: http.MethodGet, Pattern: "/api/v1/knowledge/*",
@@ -184,6 +234,19 @@ var rules = []Rule{
 	// --------------------------------------------------------------- dagster
 	{Method: http.MethodGet, Pattern: "/api/v1/dagster/health", Source: ScopeSourceNone},
 	{Method: http.MethodGet, Pattern: "/api/v1/dagster/mode", Source: ScopeSourceNone},
+	// Deployments are the Dagster side of an environment. Bringing one up or
+	// refreshing it is an orchestration action on a known working copy, so the
+	// workspace MUST resolve from the body — unlike run cancellation, there is
+	// no id-only form of these calls.
+	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/ensure",
+		Permission: PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/reload",
+		Permission: PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+	// Tearing a deployment down is part of destroying an environment, and the
+	// request carries only the deployment name — hence env:delete in some
+	// workspace rather than pipeline:run on a resolvable one.
+	{Method: http.MethodDelete, Pattern: "/api/v1/dagster/deployments/*",
+		Permission: PermWorkspaceEnvDelete, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Method: http.MethodGet, Pattern: "/api/v1/dagster/*",
 		Permission: PermWorkspacePipelineRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/dagster/*",

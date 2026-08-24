@@ -1,9 +1,15 @@
-"""Error archive — persist actionable service errors to ``{workspace}/errors/``.
+"""Error archive — persist actionable service errors to ``{workspace}/logs/errors/``.
 
 When SQLMesh Service encounters an actionable error (SQL execution failure,
 model parsing error, context load failure, plan/apply failure, etc.), the
 ``service_error_from_exception`` helper calls :func:`ErrorArchive.record` to
-write a structured JSON file into the workspace's ``errors/`` directory.
+write a structured JSON file into the workspace's ``logs/errors/`` directory.
+
+The archive sits beside the service log timeline under ``logs/`` and the two
+are linked by ``error_log_id``: the timeline says when something failed, the
+archive holds the traceback, SQL and context needed to fix it. It stays a
+separate artifact rather than a log line precisely because that payload is
+too rich to flatten into one record.
 
 The JSON files are consumed by:
 
@@ -29,36 +35,24 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agenticdata_common.logging.redact import redact_string
+
 from src.config import settings
 from src.utils.errors import ServiceError, extract_root_cause
 from src.utils.logging import get_logger
+from src.workspace.layout import errors_dir as _errors_dir
 
 logger = get_logger(__name__)
 
 # Safety cap on traceback length to avoid unbounded file growth.
 _MAX_TRACEBACK_LEN = 32 * 1024
-
-# Regex patterns for credential redaction (case-insensitive). Applied to all
-# string fields in the payload. The replacement keeps the key visible so the
-# reader knows a secret was present, but never the value.
-_REDACTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    # password=secret  /  password: secret
-    (re.compile(r"(?i)(password\s*[:=]\s*)\S+", re.IGNORECASE), r"\1***REDACTED***"),
-    # token=secret  /  token: secret
-    (re.compile(r"(?i)(token\s*[:=]\s*)\S+", re.IGNORECASE), r"\1***REDACTED***"),
-    # secret=secret  /  secret: secret
-    (re.compile(r"(?i)(secret\s*[:=]\s*)\S+", re.IGNORECASE), r"\1***REDACTED***"),
-    # postgresql://user:pass@host  /  mysql://user:pass@host  ...
-    (re.compile(r"(://[^:/\s]+:)[^@/\s]+(@)", re.IGNORECASE), r"\1***\2"),
-]
 
 
 @dataclass
@@ -147,7 +141,7 @@ class ErrorArchive:
 
             cls._sanitize_payload(payload)
 
-            errors_dir = Path(archive_context.workspace_path) / "errors"
+            errors_dir = Path(_errors_dir(archive_context.workspace_path))
             errors_dir.mkdir(parents=True, exist_ok=True)
 
             filename = cls._build_filename(payload, now)
@@ -241,11 +235,12 @@ class ErrorArchive:
 
     @staticmethod
     def _redact_string(text: str) -> str:
-        """Apply each redaction regex pattern to ``text`` in sequence."""
-        result = text
-        for pattern, replacement in _REDACTION_PATTERNS:
-            result = pattern.sub(replacement, result)
-        return result
+        """Apply the shared credential redaction patterns to ``text``.
+
+        Shared with the workspace log sink so both writers mask the same
+        credential shapes.
+        """
+        return redact_string(text)
 
     @staticmethod
     def _enforce_retention(errors_dir: Path, retention: int) -> None:

@@ -2,14 +2,21 @@
 /**
  * PlanStageTracker - Displays stage-based progress for Plan/Apply lifecycle.
  * Shows Tests → Changes → Backfills → Apply stages with status indicators.
+ * A STATE_SCHEMA_MISMATCH error renders as a structured, repairable card
+ * instead of the generic banner: the user sees exactly which value is wrong
+ * and gets a one-click fix that re-runs the plan.
  */
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { usePlanStore } from '@/stores/plan'
+import { useWorkspaceStore } from '@/stores/workspace'
+import { useStateSchemaRepair } from '@/composables/useStateSchemaRepair'
 import type { StageStatus } from '@/types/plan'
 
 const { t } = useI18n()
 const planStore = usePlanStore()
+const workspaceStore = useWorkspaceStore()
+const repairState = useStateSchemaRepair()
 
 interface DisplayStage {
   label: string
@@ -62,6 +69,27 @@ const stages = computed<DisplayStage[]>(() => {
   return []
 })
 
+// The structured fields the backend inlines into the 409 body.
+const mismatch = computed(() => {
+  if (planStore.errorCode !== 'STATE_SCHEMA_MISMATCH') return null
+  const payload = planStore.errorPayload ?? {}
+  return {
+    gateway: typeof payload.gateway === 'string' ? payload.gateway : '',
+    expected: typeof payload.expected === 'string' ? payload.expected : '',
+    actual: typeof payload.actual === 'string' ? payload.actual : '',
+  }
+})
+
+/** Rewrite config.yaml to the managed value, then re-run the plan. */
+async function handleRepairAndRetry(): Promise<void> {
+  const wsPath = workspaceStore.currentWorkspace?.path
+  if (!wsPath) return
+  const ok = await repairState.repair(wsPath)
+  if (ok) {
+    await planStore.runPlan()
+  }
+}
+
 function getStatusIcon(status: StageStatus): string {
   switch (status) {
     case 'success': return 'check'
@@ -102,9 +130,44 @@ function getStatusClass(status: StageStatus): string {
       <span class="stage-label">{{ stage.label }}</span>
     </div>
 
+    <!-- State-schema mismatch: structured, repairable error card -->
+    <div v-if="mismatch" class="stage-error mismatch-card">
+      <div class="mismatch-header">
+        <t-icon name="error-circle" size="15px" />
+        <span class="mismatch-title">{{ t('plan.stateSchema.title') }}</span>
+      </div>
+      <p class="mismatch-reason">
+        {{ t('plan.stateSchema.reason', {
+          gateway: mismatch.gateway,
+          actual: mismatch.actual,
+          expected: mismatch.expected,
+        }) }}
+      </p>
+      <p class="mismatch-hint">{{ t('plan.stateSchema.hint') }}</p>
+      <div class="mismatch-actions">
+        <button
+          class="repair-btn"
+          :disabled="repairState.repairing.value"
+          @click="handleRepairAndRetry"
+        >
+          <t-icon
+            :name="repairState.repairing.value ? 'loading' : 'setting-1'"
+            size="13px"
+            :class="{ spinning: repairState.repairing.value }"
+          />
+          <span>{{ repairState.repairing.value
+            ? t('plan.stateSchema.repairing')
+            : t('plan.stateSchema.repairAction') }}</span>
+        </button>
+      </div>
+      <p class="mismatch-hint secondary">
+        {{ t('plan.stateSchema.manualHint', { expected: mismatch.expected }) }}
+      </p>
+    </div>
+
     <!-- Generic error message (test failures use the dedicated panel) -->
     <div
-      v-if="planStore.isError && planStore.errorMessage && !planStore.testResults"
+      v-else-if="planStore.isError && planStore.errorMessage && !planStore.testResults"
       class="stage-error"
     >
       <t-icon name="close" size="14px" />
@@ -196,6 +259,74 @@ function getStatusClass(status: StageStatus): string {
   color: var(--error);
   font-size: 11px;
   margin-top: 4px;
+}
+
+/* Structured STATE_SCHEMA_MISMATCH card: reason + fields + repair action. */
+.mismatch-card {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  color: var(--text-primary);
+}
+
+.mismatch-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--error);
+  font-weight: 600;
+}
+
+.mismatch-title {
+  font-size: 12px;
+}
+
+.mismatch-reason {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.mismatch-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.mismatch-hint.secondary {
+  font-size: 10px;
+}
+
+.mismatch-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.repair-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-foreground);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+
+.repair-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+.repair-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .stage-done {

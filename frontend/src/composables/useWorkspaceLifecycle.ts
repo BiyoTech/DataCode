@@ -15,6 +15,7 @@ import { useExternalModelsStore } from '@/stores/externalModels'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useGitStore } from '@/stores/git'
 import { useEnvironmentStore } from '@/stores/environment'
+import { useLogsStore } from '@/stores/logs'
 
 export function useWorkspaceLifecycle() {
   const workspaceStore = useWorkspaceStore()
@@ -27,6 +28,7 @@ export function useWorkspaceLifecycle() {
   const knowledge = useKnowledgeStore()
   const git = useGitStore()
   const environment = useEnvironmentStore()
+  const logs = useLogsStore()
 
   function resetWorkspaceScopedState() {
     fileStore.reset()
@@ -38,8 +40,9 @@ export function useWorkspaceLifecycle() {
     externalModels.reset()
     knowledge.reset()
     git.reset()
-    environment.setEnvironment('prod')
-    environment.setDefault('prod')
+    environment.reset()
+    // Also tears down the SSE tail: it is bound to the previous working copy.
+    logs.reset()
   }
 
   watch(

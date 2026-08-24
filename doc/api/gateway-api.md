@@ -28,6 +28,7 @@
 - [Workspace Management](#workspace-management)
 - [Git Operations](#git-operations)
 - [File Operations](#file-operations)
+- [Workspace Logs](#workspace-logs)
 - [Error Codes](#error-codes)
 
 ---
@@ -449,70 +450,130 @@ GET /api/v1/sqlmesh/lineage/column?workspace_path=...&model_name=...&column_name
 
 ---
 
-### List Environments
+### List Environments (Registry)
 
-Get all environments.
+List a workspace's environments. The registry is the source of truth: the list is
+identical for every member, and each entry carries the lifecycle metadata the
+SQLMesh engine does not know about (type, status, TTL, last applied commit).
 
 ```
-GET /api/v1/sqlmesh/environments?workspace_path=...&gateway=...
+GET /api/v1/workspaces/{workspace_id}/environments?include_archived=false
 ```
 
-**Query Parameters:**
-
-| Param | Type | Required | Description |
-|-------|------|----------|-------------|
-| `workspace_path` | string | ✓ | Target workspace path |
-| `gateway` | string | | Gateway override |
+Requires `workspace:env:read`.
 
 **Response:**
 
 ```json
 {
-  "environments": {
-    "prod": {
+  "workspace_id": "ws-t1-sales",
+  "environments": [
+    {
+      "environment_id": "ws-t1-sales:prod",
       "name": "prod",
-      "snapshots": ["model_a", "model_b"],
-      "start_at": "2024-01-01",
-      "plan_id": "plan_abc123"
-    },
-    "dev": {
-      "name": "dev",
-      "snapshots": [],
-      "start_at": "",
-      "plan_id": ""
+      "branch": "main",
+      "env_type": "production",
+      "base_env": "prod",
+      "status": "active",
+      "deployment_name": "ws_t1_sales__prod",
+      "schedules_enabled": true,
+      "is_production": true,
+      "last_applied_commit": "a1b2c3d",
+      "last_applied_at": "2026-08-17T09:12:00+00:00",
+      "ttl_hours": 0,
+      "expires_at": "",
+      "created_at": "2026-07-01T00:00:00+00:00",
+      "updated_at": "2026-08-17T09:12:00+00:00"
     }
-  },
-  "pinned_environments": ["prod"],
-  "default_target_environment": "dev"
+  ]
+}
+```
+
+All timestamps are UTC ISO 8601; the frontend renders them in the user's timezone.
+
+---
+
+### Create Environment
+
+Provision a development line: registry row, Git branch, worktree and SQLMesh
+virtual environment, as one unit.
+
+```
+POST /api/v1/workspaces/{workspace_id}/environments
+{ "name": "feature_orders", "env_type": "shared", "base_env": "prod", "ttl_hours": 168 }
+```
+
+Requires `workspace:env:create`. Publishing the branch additionally needs
+`workspace:git:push`; when the push fails the environment stays usable locally
+and its `status` reports it.
+
+---
+
+### Open Environment
+
+Materialize the caller's worktree and return the `workspace_path` every other
+endpoint expects. Idempotent.
+
+```
+POST /api/v1/environments/{environment_id}/open
+```
+
+Requires `workspace:read`. `environment_id` is `{workspace_id}:{environment}`.
+
+**Response:**
+
+```json
+{
+  "environment_id": "ws-t1-sales:dev_alice",
+  "environment": "dev_alice",
+  "branch": "env/dev_alice",
+  "workspace_path": "/data/workspaces/t1/ws-t1-sales/u1/envs/dev_alice",
+  "head_commit": "a1b2c3d",
+  "materialized": true
 }
 ```
 
 ---
 
-### Delete Environment
+### Destroy Environment
 
-Invalidate and delete an environment.
+Release the SQLMesh views, worktree and branch. The registry row and its events
+are kept for audit. Production is rejected.
 
 ```
-DELETE /api/v1/sqlmesh/environments?workspace_path=...&environment=...&gateway=...
+DELETE /api/v1/environments/{environment_id}?delete_remote_branch=true
+```
+
+Requires `workspace:env:delete`.
+
+---
+
+### Environment Events
+
+```
+GET /api/v1/environments/{environment_id}/events?limit=50
+```
+
+Requires `workspace:env:read`. Lifecycle timeline, newest first.
+
+---
+
+### List Engine Environments (troubleshooting)
+
+The environments that actually exist in the SQLMesh state. Used by the reconciler
+and for troubleshooting only — it does not carry platform metadata, so the UI
+reads the registry instead.
+
+```
+GET /api/v1/sqlmesh/engine/environments?workspace_path=...&gateway=...
 ```
 
 **Query Parameters:**
 
 | Param | Type | Required | Description |
 |-------|------|----------|-------------|
-| `workspace_path` | string | ✓ | Target workspace path |
-| `environment` | string | ✓ | Environment name |
+| `workspace_path` | string | ✓ | Target working copy |
 | `gateway` | string | | Gateway override |
-
-**Response:**
-
-```json
-{
-  "deleted": true,
-  "environment": "dev"
-}
-```
 
 ---
 
@@ -705,8 +766,7 @@ DELETE /api/v1/workspaces/{workspaceID}?delete_remote=false
 | POST | `/api/v1/git/commit` | Commit changes |
 | POST | `/api/v1/git/push` | Push to remote |
 | POST | `/api/v1/git/pull` | Pull from remote (invalidates context) |
-| POST | `/api/v1/git/checkout` | Checkout branch (invalidates context) |
-| GET | `/api/v1/git/branches?workspace_path=...` | List branches |
+| GET | `/api/v1/git/branches?workspace_path=...` | List branches (read-only; each entry carries `environment` + `managed`) |
 | GET | `/api/v1/git/log?workspace_path=...&branch=...&limit=50` | Commit history |
 | GET | `/api/v1/git/commit-files?workspace_path=...&commit_hash=...` | Files in commit |
 | GET | `/api/v1/git/commit-file-diff?workspace_path=...&commit_hash=...&file_path=...` | File diff |
@@ -724,6 +784,51 @@ DELETE /api/v1/workspaces/{workspaceID}?delete_remote=false
 | POST | `/api/v1/files/delete` | Delete file (marks context dirty) |
 | POST | `/api/v1/files/mkdir` | Create directory |
 | POST | `/api/v1/files/rename` | Rename/move file (marks context dirty) |
+
+---
+
+## Workspace Logs
+
+Services mirror every workspace-attributable log line as NDJSON into
+`{workspace}/logs/service/`, so these endpoints read files rather than a log
+store. `workspace_path` is required on all of them: a log query with no
+resolvable workspace is rejected, never widened.
+
+Authorization is `workspace:logs:read`, separate from `workspace:code:read`
+because a log line may quote SQL, data values or tool output.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/logs?workspace_path=...&sources=...&levels=...&q=...&since=...&limit=200&cursor=...` | Newest-first page of log entries, merged across sources |
+| GET | `/api/v1/logs/stream?workspace_path=...&sources=...&levels=...&q=...` | SSE tail of lines appended after connecting |
+| GET | `/api/v1/logs/errors?workspace_path=...&limit=50` | Archived error summaries, newest first |
+| GET | `/api/v1/logs/errors/{error_id}?workspace_path=...` | One archived error with traceback and context |
+
+`sources` and `levels` are comma-separated. A source is a file origin such as
+`sqlmesh-service`, `dagster-service` or `sqlmesh-cli` (SQLMesh's own text logs,
+exposed read-only). Paginate by passing the previous response's `next_cursor`.
+
+An entry has the shape:
+
+```json
+{
+  "id": "sqlmesh-service:sqlmesh-service.2026-08-21.ndjson:42",
+  "ts": "2026-08-21T09:30:12.123Z",
+  "level": "error",
+  "source": "sqlmesh-service",
+  "service": "sqlmesh-service",
+  "event": "git_remote_failed",
+  "trace_id": "b3f1",
+  "environment": "dev",
+  "error_code": "GIT_REMOTE_ACCESS_DENIED",
+  "error_log_id": "ab12-...",
+  "fields": { "git_error_reason": "unknown", "host": "github.com" }
+}
+```
+
+`error_log_id` links a timeline entry to its full archive record; `trace_id` is
+issued by the gateway and forwarded downstream, so one user action can be
+followed across services.
 
 ---
 

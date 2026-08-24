@@ -17,8 +17,13 @@ const newWorkspaceDialect = ref('duckdb')
 const newWorkspaceGitUrl = ref('')
 const isCreating = ref(false)
 
-// Branch picker shown when a workspace has more than one remote branch.
-const branchPicker = ref<{ workspaceId: string; branches: string[]; selected: string } | null>(null)
+// Environment picker shown when a workspace offers more than one development
+// line. Users pick an environment, never a raw branch.
+const environmentPicker = ref<{
+  workspaceId: string
+  environments: { environmentId: string; name: string; envType: string; status: string }[]
+  selected: string
+} | null>(null)
 // Member management target (owner only).
 const membersTarget = ref<WorkspaceInfo | null>(null)
 // Git binding target and input.
@@ -57,15 +62,25 @@ function blockedTooltip(ws: WorkspaceInfo): string {
     : t('workspace.notOpenable')
 }
 
-/** Subtitle: the Git remote replaces the old local-path display. */
+/**
+ * Subtitle: the Git remote plus the environment currently open. Before the
+ * workspace is opened only the remote is known, so the default environment is
+ * shown as what opening it would land on.
+ */
 function repoLabel(ws: WorkspaceInfo): string {
   if (!ws.gitRepoUrl) return t('workspace.noGitRepo')
-  return `${ws.gitRepoUrl} · ${ws.gitBranch}`
+  return `${ws.gitRepoUrl} · ${ws.currentBranch || ws.defaultEnv}`
 }
 
 /**
- * Open a workspace. When several remote branches exist, ask which one to check
- * out instead of silently defaulting.
+ * Open a workspace.
+ *
+ * When it offers several environments, ask which development line to open
+ * instead of silently defaulting: the environment decides both the code on disk
+ * and the data views, so guessing it would be guessing what the user works on.
+ * The last environment used in that workspace is preselected, so returning to a
+ * workspace returns to the line the user left. A single-environment workspace
+ * opens straight into it (the workspace default).
  */
 async function selectWorkspace(ws: WorkspaceInfo) {
   if (!ws.openable) return
@@ -74,29 +89,30 @@ async function selectWorkspace(ws: WorkspaceInfo) {
   if (ws.id === workspaceStore.currentWorkspaceId && ws.path) return
 
   try {
-    if (ws.gitRepoUrl) {
-      const branches = await workspaceStore.fetchRemoteBranches(ws.id)
-      if (branches.length > 1) {
-        branchPicker.value = {
-          workspaceId: ws.id,
-          branches,
-          selected: branches.includes(ws.gitBranch) ? ws.gitBranch : branches[0],
-        }
-        return
+    const environments = await workspaceStore.fetchOpenableEnvironments(ws.id)
+    if (environments.length > 1) {
+      const remembered = workspaceStore.rememberedEnvironment(ws.id)
+      const stillOpen = environments.some((env) => env.name === remembered)
+      const production = environments.find((env) => env.envType === 'production')
+      environmentPicker.value = {
+        workspaceId: ws.id,
+        environments,
+        selected: (stillOpen && remembered) || (production || environments[0]).name,
       }
+      return
     }
-    await workspaceStore.selectWorkspace(ws.id)
+    await workspaceStore.selectWorkspace(ws.id, environments[0]?.name || '')
   } catch (e) {
     notifyError(e, t('workspace.openFailed'))
   }
 }
 
-async function confirmBranch() {
-  const picker = branchPicker.value
+async function confirmEnvironment() {
+  const picker = environmentPicker.value
   if (!picker) return
   try {
     await workspaceStore.selectWorkspace(picker.workspaceId, picker.selected)
-    branchPicker.value = null
+    environmentPicker.value = null
   } catch (e) {
     notifyError(e, t('workspace.openFailed'))
   }
@@ -316,19 +332,21 @@ function closeCreateDialog() {
       </div>
     </div>
 
-    <!-- Branch picker dialog -->
-    <div v-if="branchPicker" class="dialog-overlay" @click.self="branchPicker = null">
+    <!-- Environment picker dialog -->
+    <div v-if="environmentPicker" class="dialog-overlay" @click.self="environmentPicker = null">
       <div class="dialog">
-        <h3>{{ t('workspace.selectBranch') }}</h3>
+        <h3>{{ t('workspace.selectEnvironment') }}</h3>
         <div class="dialog-field">
-          <label>{{ t('workspace.branchLabel') }}</label>
-          <select v-model="branchPicker.selected">
-            <option v-for="b in branchPicker.branches" :key="b" :value="b">{{ b }}</option>
+          <label>{{ t('workspace.environmentLabel') }}</label>
+          <select v-model="environmentPicker.selected">
+            <option v-for="env in environmentPicker.environments" :key="env.environmentId" :value="env.name">
+              {{ env.name }} · {{ t(`environment.type.${env.envType}`) }}
+            </option>
           </select>
         </div>
         <div class="dialog-actions">
-          <button class="btn-cancel" @click="branchPicker = null">{{ t('common.cancel') }}</button>
-          <button class="btn-primary" :disabled="workspaceStore.isOpening" @click="confirmBranch">
+          <button class="btn-cancel" @click="environmentPicker = null">{{ t('common.cancel') }}</button>
+          <button class="btn-primary" :disabled="workspaceStore.isOpening" @click="confirmEnvironment">
             {{ workspaceStore.isOpening ? t('common.loading') : t('workspace.open') }}
           </button>
         </div>

@@ -1,48 +1,82 @@
-"""Tests for the workspace -> Code Location manager.
+"""Tests for the Code Location manager (the mechanism behind a deployment).
 
-Covers name derivation, the path-traversal guard, workspace.yaml
-serialization, and the full ensure/reload lifecycle with the gRPC spawn and
+Covers the path-traversal guard, workspace.yaml serialization, persistent port
+assignment and the ensure/reload/remove lifecycle, with the gRPC spawn and the
 GraphQL reload stubbed out (no real processes / network).
+
+The location NAME is no longer derived here — it is passed in by the deployment
+manager — so these tests assert that the caller's name is what reaches the
+process, workspace.yaml and the instance.
 """
+
+from pathlib import Path
 
 import pytest
 import yaml
 
 from src.config import Settings
-from src.core.code_location_manager import CodeLocationManager
-from src.utils.errors import CodeLocationLoadError, WorkspacePathInvalidError
+from src.core.code_location_manager import CodeLocationManager, CodeLocationSpec
+from src.utils.errors import WorkspacePathInvalidError
+
+LOCATION = "ws_t1_sales__dev_alice"
 
 
 @pytest.fixture
 def env(tmp_path):
-    """A settings object + a valid workspace containing asset-dag/definitions.py."""
+    """Settings plus a valid environment working copy on disk."""
     base = tmp_path / "workspaces"
-    ws = base / "demo-ws"
-    (ws / "asset-dag").mkdir(parents=True)
-    (ws / "asset-dag" / "definitions.py").write_text("# defs\n")
+    workspace = base / "t1" / "ws-t1-sales" / "u42" / "envs" / "dev_alice"
+    workspace.mkdir(parents=True)
     home = tmp_path / "dagster_home"
     cfg = Settings(
         dagster_mode="local",
         workspace_base_path=str(base),
         dagster_home=str(home),
+        process_start_timeout=1,
     )
-    return cfg, str(ws), home
+    return cfg, str(workspace), home
+
+
+@pytest.fixture
+def spec(env):
+    _, workspace, _ = env
+    return CodeLocationSpec(
+        location_name=LOCATION,
+        workspace_path=workspace,
+        workspace_name="ws-t1-sales",
+        env={"AGENTICDATA_ENVIRONMENT": "dev_alice"},
+    )
+
+
+class _FakeProcess:
+    def __init__(self):
+        self.alive = True
+
+    def is_alive(self):
+        return self.alive
 
 
 class _FakeProcessManager:
     def __init__(self):
-        self.spawned = []
+        self.spawned: list[str] = []
+        self.envs: list[dict] = []
+        self.processes: dict[str, _FakeProcess] = {}
 
-    def spawn(self, name, command, cwd=None, env=None):
+    def spawn(self, name, command, cwd=None, env=None, autorestart=True, on_restart=None):
         self.spawned.append(name)
+        self.envs.append(env or {})
+        self.processes[name] = _FakeProcess()
 
     def stop(self, name):
-        pass
+        self.processes.pop(name, None)
+
+    def get(self, name):
+        return self.processes.get(name)
 
 
 class _FakeClient:
     def __init__(self):
-        self.reloaded = []
+        self.reloaded: list[str] = []
 
     async def reload_code_location(self, location_name):
         self.reloaded.append(location_name)
@@ -51,24 +85,21 @@ class _FakeClient:
 
 @pytest.fixture
 def stub_backends(monkeypatch):
-    """Stub the lazily-imported process manager + GraphQL client."""
+    """Stub the lazily-imported process manager + GraphQL client.
+
+    ``_wait_grpc_ready`` is stubbed too: no port is ever bound here, and waiting
+    for one would only burn the start timeout.
+    """
     fake_pm = _FakeProcessManager()
     fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "src.core.process_manager.get_process_manager", lambda: fake_pm
-    )
-    monkeypatch.setattr(
-        "src.core.dagster_client.get_dagster_client", lambda: fake_client
-    )
+    monkeypatch.setattr("src.core.process_manager.get_process_manager", lambda: fake_pm)
+    monkeypatch.setattr("src.core.dagster_client.get_dagster_client", lambda: fake_client)
+
+    async def _ready(self, entry):
+        return True
+
+    monkeypatch.setattr(CodeLocationManager, "_wait_grpc_ready", _ready)
     return fake_pm, fake_client
-
-
-# --- Name derivation ---------------------------------------------------------
-
-
-def test_location_name_sanitizes_workspace_name():
-    mgr = CodeLocationManager(Settings())
-    assert mgr.location_name_for("/base/My-WS 01") == "ws_My_WS_01"
 
 
 # --- Path traversal guard ----------------------------------------------------
@@ -83,9 +114,8 @@ def test_definitions_path_rejects_outside_base(tmp_path):
 
 
 def test_definitions_path_resolves_inside_base(env):
-    cfg, ws, _ = env
-    mgr = CodeLocationManager(cfg)
-    path = mgr._definitions_path(ws)
+    cfg, workspace, _ = env
+    path = CodeLocationManager(cfg)._definitions_path(workspace)
     assert path.name == "definitions.py"
     assert path.parent.name == "asset-dag"
 
@@ -95,61 +125,116 @@ def test_definitions_path_resolves_inside_base(env):
 
 def test_ensure_workspace_yaml_writes_empty_load_from(env):
     cfg, _, home = env
-    mgr = CodeLocationManager(cfg)
-    path = mgr.ensure_workspace_yaml()
+    path = CodeLocationManager(cfg).ensure_workspace_yaml()
     assert path.exists()
-    data = yaml.safe_load(path.read_text())
-    assert data == {"load_from": []}
+    assert yaml.safe_load(path.read_text()) == {"load_from": []}
 
 
-# --- Lifecycle: ensure + reload ---------------------------------------------
+# --- Lifecycle ---------------------------------------------------------------
 
 
-async def test_ensure_location_missing_definitions_raises(tmp_path):
-    base = tmp_path / "workspaces"
-    ws = base / "empty-ws"
-    ws.mkdir(parents=True)  # no asset-dag/definitions.py
-    mgr = CodeLocationManager(
-        Settings(workspace_base_path=str(base), dagster_home=str(tmp_path / "dh"))
-    )
-    with pytest.raises(CodeLocationLoadError):
-        await mgr.ensure_location(str(ws))
-
-
-async def test_ensure_location_spawns_grpc_and_writes_yaml(env, stub_backends):
-    cfg, ws, home = env
+async def test_ensure_uses_the_caller_supplied_location_name(env, spec, stub_backends):
+    cfg, _, home = env
     fake_pm, fake_client = stub_backends
+    runtime = await CodeLocationManager(cfg).ensure(spec)
+
+    assert runtime.location_name == LOCATION
+    assert runtime.port == cfg.code_location_port
+    assert fake_pm.spawned == [f"code-location-{LOCATION}"]
+    assert fake_client.reloaded == [LOCATION]
+    entry = yaml.safe_load((home / "workspace.yaml").read_text())["load_from"][0]
+    assert entry["grpc_server"]["location_name"] == LOCATION
+
+
+async def test_ensure_injects_the_deployment_identity(env, spec, stub_backends):
+    cfg, workspace, _ = env
+    fake_pm, _ = stub_backends
+    await CodeLocationManager(cfg).ensure(spec)
+
+    injected = fake_pm.envs[0]
+    assert injected["AGENTICDATA_ENVIRONMENT"] == "dev_alice"
+    assert injected["DAGSTER_WORKSPACE_PATH"] == workspace
+    assert injected["SQLMESH_SERVICE_URL"]
+
+
+async def test_ensure_scaffolds_the_asset_dag_project(env, spec, stub_backends):
+    cfg, workspace, _ = env
+
+    await CodeLocationManager(cfg).ensure(spec)
+    asset_dag = Path(workspace) / "asset-dag"
+    assert (asset_dag / "definitions.py").exists()
+    # The deployment gate is part of the canonical scaffold.
+    assert (asset_dag / "defs" / "deployment.py").exists()
+
+
+async def test_ensure_does_not_respawn_a_healthy_location(env, spec, stub_backends):
+    cfg, _, _ = env
+    fake_pm, _ = stub_backends
     mgr = CodeLocationManager(cfg)
 
-    summary = await mgr.ensure_location(ws)
-
-    assert summary["location_name"] == "ws_demo_ws"
-    assert summary["port"] == cfg.code_location_port
-    # gRPC server spawned + best-effort reload attempted.
-    assert fake_pm.spawned
-    assert fake_client.reloaded == ["ws_demo_ws"]
-    # workspace.yaml now lists the location.
-    data = yaml.safe_load((home / "workspace.yaml").read_text())
-    assert data["load_from"][0]["grpc_server"]["location_name"] == "ws_demo_ws"
-
-
-async def test_reload_location_respawns_existing(env, stub_backends):
-    cfg, ws, _ = env
-    fake_pm, fake_client = stub_backends
-    mgr = CodeLocationManager(cfg)
-
-    await mgr.ensure_location(ws)
+    first = await mgr.ensure(spec)
     fake_pm.spawned.clear()
-    result = await mgr.reload_location(ws)
+    second = await mgr.ensure(spec)
 
-    assert result["reloaded"] is True
-    assert fake_pm.spawned  # re-spawned the gRPC server
+    assert fake_pm.spawned == []  # idempotent: safe on every page load
+    assert first.port == second.port
+    assert len(mgr.list()) == 1
 
 
-async def test_ensure_location_reuses_port_across_calls(env, stub_backends):
-    cfg, ws, _ = env
+async def test_reload_respawns_and_reattaches(env, spec, stub_backends):
+    cfg, _, _ = env
+    fake_pm, fake_client = stub_backends
     mgr = CodeLocationManager(cfg)
-    first = await mgr.ensure_location(ws)
-    second = await mgr.ensure_location(ws)
-    assert first["port"] == second["port"]
-    assert len(mgr.list_locations()) == 1
+
+    await mgr.ensure(spec)
+    fake_pm.spawned.clear()
+    fake_client.reloaded.clear()
+    runtime = await mgr.reload(spec)
+
+    assert runtime.location_name == LOCATION
+    assert fake_pm.spawned == [f"code-location-{LOCATION}"]
+    assert fake_client.reloaded == [LOCATION]
+
+
+async def test_remove_stops_the_process_and_drops_it_from_workspace_yaml(
+    env, spec, stub_backends
+):
+    cfg, _, home = env
+    fake_pm, _ = stub_backends
+    mgr = CodeLocationManager(cfg)
+    await mgr.ensure(spec)
+
+    assert mgr.remove(LOCATION) is True
+    assert fake_pm.get(f"code-location-{LOCATION}") is None
+    assert yaml.safe_load((home / "workspace.yaml").read_text()) == {"load_from": []}
+    # Idempotent: removing an unknown deployment reports "nothing was running".
+    assert mgr.remove(LOCATION) is False
+
+
+# --- Port persistence --------------------------------------------------------
+
+
+async def test_ports_survive_a_service_restart(env, spec, stub_backends):
+    """A location's port must be stable: workspace.yaml and remote
+    registrations reference it, so a silent move invalidates both."""
+    cfg, _, _ = env
+    first = await CodeLocationManager(cfg).ensure(spec)
+
+    # A fresh manager stands in for a restarted service.
+    restarted = CodeLocationManager(cfg)
+    assert restarted.port_of(LOCATION) == first.port
+    assert (await restarted.ensure(spec)).port == first.port
+
+
+async def test_distinct_locations_get_distinct_ports(env, spec, stub_backends):
+    cfg, workspace, _ = env
+    mgr = CodeLocationManager(cfg)
+    other = CodeLocationSpec(
+        location_name="ws_t1_sales__prod",
+        workspace_path=workspace,
+        workspace_name="ws-t1-sales",
+    )
+
+    first = await mgr.ensure(spec)
+    second = await mgr.ensure(other)
+    assert first.port != second.port

@@ -33,6 +33,15 @@ dagster:
   process_start_timeout: 30
   process_stop_timeout: 5
 
+  # Supervision of managed subprocesses (daemon, webserver, code locations).
+  # A dead process is respawned every `process_health_interval` seconds, at most
+  # `process_max_restarts` times per `process_restart_window`; beyond that it is
+  # abandoned and reported through /health, so a broken code location surfaces
+  # instead of crash-looping.
+  process_health_interval: 10
+  process_max_restarts: 3
+  process_restart_window: 300
+
 # SQLMesh bridge request timeout
 sqlmesh:
   request_timeout: 10

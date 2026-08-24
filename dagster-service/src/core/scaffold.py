@@ -1,14 +1,16 @@
 """Canonical asset-dag project scaffold rendering.
 
-Renders the templates under ``src/templates/`` into a workspace's
+Renders the templates under ``src/templates/`` into a working copy's
 ``asset-dag/`` directory. Rendering is fill-missing for user-editable files
 (existing files are never overwritten, so user edits survive), with one
-exception: a small set of *managed* bridge files are force-overwritten whenever
-their content drifts from the template. This keeps the SQLMesh bridge
-(``defs/assets/sql_assets.py``) authoritative and lets us evolve its behavior
-(naming, grouping, removed assets) without stale on-disk copies lingering.
+exception: a small set of *managed* platform files are force-overwritten whenever
+their content drifts from the template. That keeps the SQLMesh bridge
+(``defs/assets/sql_assets.py``) and the deployment gate
+(``defs/deployment.py``) authoritative, so their behavior can evolve without
+stale on-disk copies lingering — and so the gate deciding whether this
+environment's schedules may run cannot be edited into always-on.
 
-Calling this on every code-location ensure is safe and idempotent.
+Calling this on every deployment ensure is safe and idempotent.
 
 Canonical layout (modern Dagster ``dg`` auto-discovery):
 
@@ -18,6 +20,7 @@ Canonical layout (modern Dagster ``dg`` auto-discovery):
     ├── README.md               # layout + conventions
     ├── defs/                   # auto-discovery root (importable package)
     │   ├── __init__.py
+    │   ├── deployment.py       # MANAGED: deployment identity + schedule gate
     │   ├── assets/             # sql_assets (SQLMesh bridge) + daft_assets
     │   ├── resources/          # resources wired via @dg.definitions
     │   ├── jobs/               # asset jobs
@@ -58,6 +61,7 @@ _SCAFFOLD_FILES = {
     "README.md.tpl": "README.md",
     # defs/ auto-discovery root
     "defs/__init__.py.tpl": "defs/__init__.py",
+    "defs/deployment.py.tpl": "defs/deployment.py",
     "defs/assets/__init__.py.tpl": "defs/assets/__init__.py",
     "defs/assets/sql_assets.py.tpl": "defs/assets/sql_assets.py",
     "defs/assets/daft_assets.py.tpl": "defs/assets/daft_assets.py",
@@ -74,14 +78,17 @@ _SCAFFOLD_FILES = {
     "tests/test_assets.py.tpl": "tests/test_assets.py",
 }
 
-# Managed bridge files (subset of _SCAFFOLD_FILES) that dagster-service owns and
+# Managed platform files (subset of _SCAFFOLD_FILES) that dagster-service owns and
 # keeps authoritative. Unlike user-editable files, these are force-overwritten
 # whenever the on-disk content drifts from the rendered template. This eliminates
 # stale bridge code (e.g. legacy graph/nodes assets or the wrong asset group)
-# left behind by earlier scaffold versions. Keep this set as narrow as possible
-# so user-authored assets/jobs/schedules are never clobbered.
+# left behind by earlier scaffold versions, and keeps the deployment gate — the
+# module that decides whether this environment's schedules may run at all — from
+# being edited into always-on. Keep this set as narrow as possible so
+# user-authored assets/jobs/schedules are never clobbered.
 _MANAGED_FILES = {
     "defs/assets/sql_assets.py.tpl": "defs/assets/sql_assets.py",
+    "defs/deployment.py.tpl": "defs/deployment.py",
 }
 
 

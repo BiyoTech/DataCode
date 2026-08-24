@@ -40,20 +40,41 @@ class PlanOptions(BaseModel):
     forward_only: bool = False
     no_auto_categorization: bool = False
     include_unmodified: bool = False
-    create_from: Optional[str] = None
     restate_models: Optional[List[str]] = None
     auto_apply: bool = False
+    # Accepted only to reject it explicitly: an environment used to be created as
+    # a side effect of ``apply`` + ``create_from``. Environments are now registry
+    # objects (branch + worktree + virtual environment + deployment), so silently
+    # ignoring the field would hide a request that no longer does what it says.
+    create_from: Optional[str] = None
+
+    @field_validator("create_from")
+    @classmethod
+    def _reject_create_from(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            raise ValueError(
+                "plan_options.create_from is no longer supported: create the "
+                "environment with POST /api/v1/workspaces/{workspace_id}/"
+                "environments, then plan inside its working copy"
+            )
+        return v
 
 
 class PlanPreviewRequest(WorkspacePathMixin):
-    environment: str = "dev"
+    """Preview a plan for the environment this working copy is checked out to.
+
+    ``environment`` is mandatory and must name a registered environment: the
+    platform never infers a target nor creates one on the fly.
+    """
+
+    environment: str = Field(min_length=1, max_length=40)
     gateway: Optional[str] = None
     plan_dates: Optional[PlanDates] = None
     plan_options: Optional[PlanOptions] = None
 
 
 class PlanApplyRequest(WorkspacePathMixin):
-    environment: str = "dev"
+    environment: str = Field(min_length=1, max_length=40)
     gateway: Optional[str] = None
     plan_dates: Optional[PlanDates] = None
     plan_options: Optional[PlanOptions] = None
@@ -67,6 +88,15 @@ class PlanApplyRequest(WorkspacePathMixin):
 
 class PlanCancelRequest(WorkspacePathMixin):
     gateway: Optional[str] = None
+
+
+class RepairStateSchemaRequest(WorkspacePathMixin):
+    """Reset the platform-managed ``state_schema`` in the working copy.
+
+    Carries only the workspace path: the managed value is derived from the
+    workspace id, never supplied by the client, so a tampered request cannot
+    point the state at another workspace's schema.
+    """
 
 
 # --- SQLMesh Model Operations ---
@@ -168,9 +198,12 @@ class CreateWorkspaceRequest(IdentityMixin):
 
 
 class OpenWorkspaceRequest(IdentityMixin):
-    """Materialize the caller's working copy, optionally on a chosen branch."""
+    """Materialize the caller's working copy of one environment.
 
-    branch: str = ""
+    Empty ``environment`` falls back to the workspace's ``default_env``.
+    """
+
+    environment: str = ""
 
 
 class BindGitRepoRequest(IdentityMixin):
@@ -181,6 +214,27 @@ class BindGitRepoRequest(IdentityMixin):
 class SyncWorkspaceRequest(IdentityMixin):
     workspace_id: str
     message: str = "Auto-save"
+    # Environment whose worktree is committed and pushed; empty = default_env.
+    environment: str = ""
+
+
+# --- Environments ---
+
+class CreateEnvironmentRequest(BaseModel):
+    """Create a platform environment (branch + virtual env + deployment).
+
+    ``name`` is validated by the registry against the platform naming rule
+    (lowercase snake_case); ``base_env`` defaults to the workspace's production
+    environment. ``trigger_type`` distinguishes human from agent activity in the
+    audit trail: agents may operate inside a sandbox but never create or promote,
+    which the gateway enforces through permissions.
+    """
+
+    name: str = Field(min_length=2, max_length=40)
+    env_type: str = "sandbox"          # shared | sandbox
+    base_env: str = ""
+    ttl_hours: int = Field(default=0, ge=0, le=720)
+    trigger_type: str = "human"       # human | agent | schedule
 
 
 # --- Git ---
@@ -209,15 +263,6 @@ class GitPullRequest(WorkspacePathMixin):
     branch: str = ""
 
 
-class GitCheckoutRequest(WorkspacePathMixin):
-    branch: str
-    create: bool = False
-    # Ref the new branch starts from, e.g. "origin/dev". Combined with
-    # ``track`` this materializes a remote branch as a local tracking branch.
-    start_point: str = ""
-    track: bool = False
-
-
 class GitFetchRequest(WorkspacePathMixin):
     user_id: str = ""
     remote: str = "origin"
@@ -235,10 +280,35 @@ class GitResetRequest(WorkspacePathMixin):
     mode: str = "mixed"
 
 
-class GitDeleteBranchRequest(WorkspacePathMixin):
-    branch: str
-    # Delete even when the branch is not fully merged.
-    force: bool = False
+class GitMergeRequest(WorkspacePathMixin):
+    """Merge one environment branch into another and publish the result.
+
+    The promotional half of what used to be a single atomic "promote": it moves
+    CODE only. Landing the data (plan & apply) and refreshing the orchestration
+    (code-location reload) are separate, explicit steps on the target
+    environment. ``workspace_path`` identifies the caller's working copy, which
+    supplies the shared object database and the remote — it is never modified.
+    """
+
+    user_id: str = ""
+    remote: str = "origin"
+    source_branch: str
+    target_branch: str
+    # Empty means the default "Merge branch 'x' into 'y'" subject.
+    message: str = ""
+
+
+class GitSyncRequest(WorkspacePathMixin):
+    """Merge a base branch INTO the branch checked out in this working copy.
+
+    The resolution path for a conflicting promotion: conflicts are left in the
+    working tree, where the user fixes them with the editor and the Git panel.
+    """
+
+    user_id: str = ""
+    remote: str = "origin"
+    base_branch: str
+    message: str = ""
 
 
 class GitPublishRequest(WorkspacePathMixin):

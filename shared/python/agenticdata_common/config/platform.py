@@ -124,11 +124,27 @@ class WorkspaceConfig(BaseModel):
     base_path: str = "~/.agenticdata/workspaces"
 
 
+class WorkspaceFileLoggingConfig(BaseModel):
+    """Mirroring of workspace-attributable logs into ``{workspace}/logs/``.
+
+    Shared across services on purpose: the on-disk layout is a contract the
+    agent and the UI both read, so it must not drift per service.
+    """
+
+    enabled: bool = True
+    min_level: str = "info"          # debug volume can fill a user's disk
+    max_line_bytes: int = 8192
+    max_open_files: int = 64
+    max_lines_per_sec: int = 200
+    retention_days: int = 7
+
+
 class LoggingConfig(BaseModel):
     """Shared logging configuration."""
 
     level: str = "info"
     format: str = "json"             # "json" | "text"
+    workspace_file: WorkspaceFileLoggingConfig = WorkspaceFileLoggingConfig()
 
 
 class PlatformConfig(BaseModel):

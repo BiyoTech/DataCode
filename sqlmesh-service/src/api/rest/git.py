@@ -1,29 +1,40 @@
 """Git operation endpoints.
 
-Handles Git panel operations (status, stage, commit, push, pull, branches, checkout, publish).
+Handles the day-to-day operations of ONE environment working copy: status,
+stage, commit, push, pull, fetch, reset, log and credentials.
+
+Branch lifecycle is deliberately absent. A branch is an Environment's code
+carrier (1:1), so creating, switching and deleting one is orchestrated by the
+environment registry (``/api/v1/workspaces/{id}/environments``), which also
+manages the matching worktree, SQLMesh virtual environment and deployment.
+Switching environment means opening another worktree, never a ``git checkout``,
+so uncommitted work can never block it. ``GET /branches`` stays as a read-only
+view annotated with environment ownership.
+
 CRITICAL: Operations that change the working tree invalidate the Context Pool.
 """
 
 import asyncio
 import os
+import typing as t
 import uuid
 
 from fastapi import APIRouter, HTTPException
 
-from src.api.deps import WorkspacePath
+from src.api.deps import Caller, WorkspacePath
 
 from src.api.models.requests import (
     CreateGitCredentialRequest,
-    GitCheckoutRequest,
     GitCommitRequest,
-    GitDeleteBranchRequest,
     GitFetchRequest,
     GitInitRequest,
+    GitMergeRequest,
     GitPublishRequest,
     GitPullRequest,
     GitPushRequest,
     GitResetRequest,
     GitStageRequest,
+    GitSyncRequest,
     GitUnstageRequest,
     UpdateGitCredentialRequest,
 )
@@ -39,6 +50,11 @@ router = APIRouter(prefix="/api/v1/git", tags=["git"])
 # is personal-access-token only.
 OAUTH_CAPABLE_PROVIDERS = ("github",)
 
+# Permission code shared with the gateway catalog. Merging into the production
+# branch is a promotion: the gateway already checked ``workspace:git:push`` for
+# the route, this is the additional gate the target's criticality demands.
+PERM_ENV_PROMOTE = "workspace:env:promote"
+
 
 async def _resolve_remote_auth(user_id: str, workspace_path: str, remote: str):
     """Resolve the credential that matches the workspace remote's host.
@@ -49,6 +65,47 @@ async def _resolve_remote_auth(user_id: str, workspace_path: str, remote: str):
     from src.workspace.git_credentials import resolve_auth_for_workspace
 
     return await resolve_auth_for_workspace(user_id, workspace_path, remote)
+
+
+def _remote_failure(
+    operation: str,
+    reason: str,
+    host: str,
+    workspace_path: str,
+    detail: str = "",
+) -> GitRemoteAccessError:
+    """Log and archive a rejected remote Git operation, then return the error.
+
+    Every remote failure funnels through here so the user is never told to
+    "check the workspace logs" about something that was never written there.
+    The archive gives the response an ``error_log_id`` pointing at the full
+    record, which matters most for ``unknown`` — the reason code that carries
+    no actionable sentence of its own.
+
+    Returns the error rather than raising it so call sites keep an explicit
+    ``raise`` and static analysis still sees the control flow.
+    """
+    from src.utils.error_archive import ErrorArchive, ErrorArchiveContext
+
+    error = GitRemoteAccessError(operation, reason, host, detail)
+    logger.error(
+        "git_remote_failed",
+        operation=f"git.{operation}",
+        git_error_reason=reason,
+        host=host,
+        error_code=error.code.value,
+        stderr=detail,
+    )
+    error.error_log_id = ErrorArchive.record(
+        exc=error,
+        service_error=error,
+        archive_context=ErrorArchiveContext(
+            workspace_path=workspace_path,
+            operation=f"git.{operation}",
+            context={"git_error_reason": reason, "host": host, "stderr": detail},
+        ),
+    )
+    return error
 
 
 # --- Git Panel Operations ---
@@ -152,8 +209,13 @@ async def git_unstage(req: GitUnstageRequest):
 @router.post("/commit")
 async def git_commit(req: GitCommitRequest):
     """Commit staged changes."""
+    from src.core.env_locks import check_environment_lock
     from src.workspace.git_ops import run_git_async
 
+    # A commit landing mid-apply would desynchronize the recorded applied
+    # commit from the code that actually ran; reject while apply holds the
+    # environment lock (advisory pre-check, non-blocking).
+    check_environment_lock(req.workspace_path, operation="commit")
     result = await run_git_async(req.workspace_path, ["commit", "-m", req.message])
     if result.returncode != 0:
         if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
@@ -184,25 +246,53 @@ async def git_push(req: GitPushRequest):
             detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
         )
     if resolved.auth is None:
-        raise GitRemoteAccessError(
-            "push", GitRemoteReason.CREDENTIAL_MISSING, extract_git_host(remote_url)
+        raise _remote_failure(
+            "push",
+            GitRemoteReason.CREDENTIAL_MISSING,
+            extract_git_host(remote_url),
+            req.workspace_path,
         )
 
     result = await push_async(req.workspace_path, branch, req.remote, resolved.auth)
     if not result.ok:
-        raise GitRemoteAccessError("push", result.reason, resolved.host, result.detail)
+        raise _remote_failure(
+            "push", result.reason, resolved.host, req.workspace_path, result.detail
+        )
     return {"success": True, "message": f"Pushed to {req.remote}/{branch}"}
 
 
 @router.post("/pull")
 async def git_pull(req: GitPullRequest):
-    """Pull from remote. INVALIDATES context (working tree changes)."""
-    from src.workspace.git_ops import pull_async, run_git_async
+    """Integrate the remote branch into this working copy.
+
+    Not a raw ``git pull``: the integration strategy is decided by the platform
+    (fast-forward when possible, otherwise a real merge commit) so the result
+    never depends on ambient ``pull.rebase`` configuration and a DIVERGENT
+    environment branch can be pulled at all.
+
+    A conflicted outcome is a 200: the conflicted files are now in the working
+    tree, which is the only place a human can resolve them — the same contract
+    as ``POST /sync``. Uncommitted tracked changes are a 409 instead, because
+    nothing was written and the user has to commit or discard first.
+
+    INVALIDATES the context whenever the working tree changed.
+    """
+    from src.core.env_locks import check_environment_lock
+    from src.workspace.git_ops import (
+        PULL_BLOCKED,
+        PULL_UP_TO_DATE,
+        pull_async,
+        run_git_async,
+    )
 
     branch = req.branch
     if not branch:
         br_result = await run_git_async(req.workspace_path, ["branch", "--show-current"])
         branch = br_result.stdout.strip() if br_result.returncode == 0 else "main"
+
+    # An integration landing mid-apply would desynchronize the recorded applied
+    # commit from the code that actually ran (same reason as commit / sync).
+    check_environment_lock(req.workspace_path, operation="pull")
 
     resolved, remote_url = await _resolve_remote_auth(
         req.user_id, req.workspace_path, req.remote
@@ -216,13 +306,33 @@ async def git_pull(req: GitPullRequest):
     # A public repository can be pulled without a credential, so a missing
     # credential is not rejected up-front here (unlike push).
     result = await pull_async(req.workspace_path, branch, req.remote, resolved.auth)
+
     if not result.ok:
-        raise GitRemoteAccessError("pull", result.reason, resolved.host, result.detail)
+        if result.outcome == PULL_BLOCKED:
+            raise ConflictError(
+                f"This working copy has uncommitted changes ({result.detail}). "
+                f"Commit or discard them before pulling '{branch}'."
+            )
+        raise _remote_failure(
+            "pull", result.reason, resolved.host, req.workspace_path, result.detail
+        )
 
-    # CRITICAL: Invalidate context after pull (working tree changed)
-    await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
+    # CRITICAL: the context caches the loaded project, so it must be dropped as
+    # soon as the working tree changed — including a conflicted merge, whose
+    # markers are real file content.
+    if result.outcome != PULL_UP_TO_DATE:
+        await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
 
-    return {"success": True, "message": f"Pulled from {req.remote}/{branch}"}
+    return {
+        "success": True,
+        "branch": branch,
+        "outcome": result.outcome,
+        "conflicted": bool(result.conflicts),
+        "conflicts": result.conflicts,
+        "commit": result.commit,
+        "integrated_commits": result.integrated_commits,
+        "message": f"Pulled from {req.remote}/{branch}",
+    }
 
 
 @router.post("/fetch")
@@ -243,46 +353,10 @@ async def git_fetch(req: GitFetchRequest):
     # not rejected up-front.
     result = await fetch_async(req.workspace_path, req.remote, req.prune, resolved.auth)
     if not result.ok:
-        raise GitRemoteAccessError("fetch", result.reason, resolved.host, result.detail)
+        raise _remote_failure(
+            "fetch", result.reason, resolved.host, req.workspace_path, result.detail
+        )
     return {"success": True, "message": f"Fetched from {req.remote}"}
-
-
-@router.post("/checkout")
-async def git_checkout(req: GitCheckoutRequest):
-    """Check out a branch, optionally creating it from a start point.
-
-    Passing ``start_point`` + ``track`` (e.g. ``origin/dev``) materializes a
-    remote branch locally with upstream tracking configured, so later pull/push
-    need no arguments.
-
-    INVALIDATES context (working tree changes).
-    """
-    from src.workspace.git_ops import (
-        GitOperations,
-        is_valid_branch_name,
-        is_valid_start_point,
-    )
-
-    if not is_valid_branch_name(req.branch):
-        raise InvalidRequestError(f"Invalid branch name: {req.branch}")
-    if req.start_point and not is_valid_start_point(req.start_point):
-        raise InvalidRequestError(f"Invalid start point: {req.start_point}")
-
-    result = await asyncio.to_thread(
-        GitOperations.checkout,
-        req.workspace_path,
-        req.branch,
-        req.create,
-        req.start_point,
-        req.track,
-    )
-    if not result.ok:
-        raise HTTPException(status_code=409, detail=result.detail or "Git checkout failed")
-
-    # CRITICAL: Invalidate context after branch switch
-    await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
-
-    return {"success": True, "branch": req.branch}
 
 
 @router.post("/reset")
@@ -317,33 +391,25 @@ async def git_reset(req: GitResetRequest):
     }
 
 
-@router.post("/branch/delete")
-async def git_delete_branch(req: GitDeleteBranchRequest):
-    """Delete a local branch. The checked-out branch cannot be deleted."""
-    from src.workspace.git_ops import GitOperations, is_valid_branch_name
-
-    if not is_valid_branch_name(req.branch):
-        raise InvalidRequestError(f"Invalid branch name: {req.branch}")
-
-    current = await asyncio.to_thread(GitOperations.current_branch, req.workspace_path)
-    if current == req.branch:
-        raise ConflictError(
-            f"Branch '{req.branch}' is checked out. Switch to another branch first."
-        )
-
-    result = await asyncio.to_thread(
-        GitOperations.delete_branch, req.workspace_path, req.branch, req.force
-    )
-    if not result.ok:
-        raise HTTPException(
-            status_code=409, detail=result.detail or "Git branch deletion failed"
-        )
-    return {"success": True, "branch": req.branch}
-
-
 @router.get("/branches")
 async def git_branches(workspace_path: WorkspacePath):
-    """List all branches (local + remote)."""
+    """List all branches (local + remote), annotated with environment ownership.
+
+    Read-only by design: branches are not created, switched or deleted here.
+    A branch is an Environment's code carrier, so its whole lifecycle belongs to
+    the environment registry (``/api/v1/workspaces/{id}/environments``). This
+    endpoint exists so the Git panel can show WHICH environment a branch backs.
+
+    Each entry carries:
+
+    * ``environment`` - the environment claiming the branch, or ``null`` for a
+      branch outside the platform's ``env/`` namespace (e.g. ``release/1.0``
+      brought in from an external repository);
+    * ``managed``     - whether the platform owns the branch's lifecycle.
+      Un-managed branches are read-only: they cannot be planned or applied and
+      must be adopted as an environment first.
+    """
+    from src.environments.naming import env_of
     from src.workspace.git_ops import run_git_async
 
     current_result = await run_git_async(workspace_path, ["branch", "--show-current"])
@@ -360,14 +426,275 @@ async def git_branches(workspace_path: WorkspacePath):
             commit_hash = parts[1] if len(parts) > 1 else ""
             message = parts[2] if len(parts) > 2 else ""
             is_remote = name.startswith("origin/")
+            # Remote refs are prefixed with the remote name, which is not part
+            # of the branch identity the naming algebra works on.
+            local_name = name.split("/", 1)[1] if is_remote else name
+            environment = env_of(local_name)
             branches.append({
                 "name": name,
                 "is_remote": is_remote,
                 "last_commit_hash": commit_hash,
                 "last_commit_message": message,
+                "environment": environment,
+                "managed": environment is not None,
             })
 
-    return {"branches": branches, "current_branch": current_branch}
+    return {
+        "branches": branches,
+        "current_branch": current_branch,
+        "current_environment": env_of(current_branch),
+    }
+
+
+# --- Cross-branch merge (code promotion, step 1 of 2) ---
+#
+# Promotion is TWO explicit user actions, not one atomic endpoint: merge the
+# code here, then plan & apply and reload the code location on the target
+# environment. A merge conflict is an intermediate state only a human with a
+# working tree can leave, so an "atomic promote" would inevitably degrade into
+# "try, report conflict, wait for a human, retry" — the same sequence, only
+# hidden inside a black box and much harder to audit or retry step by step.
+
+
+def _require_platform_branch(branch: str, field: str) -> str:
+    """Return the environment a branch backs, refusing platform-external ones.
+
+    A merge changes what an environment's code IS, so both sides must be
+    environments the platform owns. A branch outside the ``env/`` namespace
+    (e.g. ``release/1.0`` from an existing repository) stays read-only until it
+    is adopted as an environment, exactly as it is everywhere else in the UI.
+    """
+    from src.environments.naming import env_of
+    from src.workspace.git_ops import is_valid_branch_name
+
+    if not is_valid_branch_name(branch):
+        raise InvalidRequestError(f"Invalid {field}: {branch!r}")
+
+    environment = env_of(branch)
+    if environment is None:
+        raise ConflictError(
+            f"Branch '{branch}' ({field}) is outside the platform namespace and "
+            f"cannot take part in a merge. Adopt it as an environment first."
+        )
+    return environment
+
+
+async def _record_merge_event(
+    workspace_path: str,
+    environment: str,
+    actor_user_id: str,
+    succeeded: bool,
+    commit_hash: str = "",
+    detail: t.Optional[dict] = None,
+) -> None:
+    """Append a ``merge`` entry to the target environment's audit trail.
+
+    Best-effort by design: the merge already happened in Git, so failing the
+    response because the audit write failed would only hide a completed action.
+    """
+    try:
+        from src.environments.naming import ACTION_MERGE, environment_id
+        from src.environments.repository import EnvironmentRepository
+        from src.workspace.identity import resolve_workspace_identity
+
+        identity = resolve_workspace_identity(workspace_path)
+        await EnvironmentRepository().record_event(
+            environment_id=environment_id(identity.workspace_id, environment),
+            action=ACTION_MERGE,
+            actor_user_id=actor_user_id,
+            succeeded=succeeded,
+            commit_hash=commit_hash,
+            detail=detail,
+        )
+    except Exception as exc:
+        logger.warning(
+            "git_merge_event_not_recorded",
+            workspace=workspace_path,
+            environment=environment,
+            error=str(exc),
+        )
+
+
+@router.get("/branch-diff")
+async def git_branch_diff(
+    workspace_path: WorkspacePath,
+    source: str,
+    target: str,
+    user_id: str = "",
+    file_path: str = "",
+    limit: int = 100,
+    remote: str = "origin",
+):
+    """Preview merging ``source`` into ``target``: commits, files and conflicts.
+
+    Read-only. The conflict verdict comes from the real merge machinery
+    (``git merge-tree``), so the confirmation dialog can state whether the merge
+    is able to land instead of guessing from changed paths. Pass ``file_path``
+    to get that single file's patch, which is what opens a branch diff in the
+    editor.
+    """
+    from src.workspace.git_merge import preview_merge
+
+    resolved, _ = await _resolve_remote_auth(user_id, workspace_path, remote)
+    return await preview_merge(
+        workspace_path,
+        source_branch=source,
+        target_branch=target,
+        remote=remote,
+        auth=resolved.auth,
+        file_path=file_path,
+        limit=limit,
+    )
+
+
+@router.post("/merge")
+async def git_merge(req: GitMergeRequest, caller: Caller):
+    """Merge one environment branch into another and push the result.
+
+    Touches no working copy: the merge is computed with plumbing and published
+    by pushing the merge commit straight to the remote, so a member holding the
+    target branch checked out is never desynchronized behind their back. They
+    pick the change up with their own explicit pull + reload.
+    """
+    from src.environments.naming import PRODUCTION_ENV
+    from src.utils.errors import PermissionDeniedError, ServiceError
+    from src.workspace.git_ops import GitRemoteReason, extract_git_host
+    from src.workspace.git_merge import promote_merge
+
+    source_env = _require_platform_branch(req.source_branch, "source branch")
+    target_env = _require_platform_branch(req.target_branch, "target branch")
+
+    # Defence in depth on top of the gateway's route permission: merging into
+    # production IS the promotion, and it is gated separately from an ordinary
+    # push between development branches.
+    if target_env == PRODUCTION_ENV and not caller.can(PERM_ENV_PROMOTE):
+        raise PermissionDeniedError(
+            "Merging into the production branch is a promotion",
+            permission=PERM_ENV_PROMOTE,
+        )
+
+    resolved, remote_url = await _resolve_remote_auth(
+        req.user_id, req.workspace_path, req.remote
+    )
+    if not remote_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
+        )
+    if resolved.auth is None:
+        raise _remote_failure(
+            "merge",
+            GitRemoteReason.CREDENTIAL_MISSING,
+            extract_git_host(remote_url),
+            req.workspace_path,
+        )
+
+    try:
+        result = await promote_merge(
+            req.workspace_path,
+            source_branch=req.source_branch,
+            target_branch=req.target_branch,
+            remote=req.remote,
+            auth=resolved.auth,
+            host=resolved.host,
+            message=req.message,
+        )
+    except ServiceError as exc:
+        await _record_merge_event(
+            req.workspace_path,
+            target_env,
+            req.user_id,
+            succeeded=False,
+            detail={
+                "source_branch": req.source_branch,
+                "target_branch": req.target_branch,
+                "error_code": exc.code.value,
+            },
+        )
+        raise
+
+    await _record_merge_event(
+        req.workspace_path,
+        target_env,
+        req.user_id,
+        succeeded=True,
+        commit_hash=result["merge_commit"],
+        detail={
+            "source_branch": req.source_branch,
+            "source_environment": source_env,
+            "target_branch": req.target_branch,
+            "merged_commits": result["merged_commits"],
+            "files_changed": result["files_changed"],
+        },
+    )
+
+    result["source_environment"] = source_env
+    result["target_environment"] = target_env
+    return result
+
+
+@router.post("/sync")
+async def git_sync(req: GitSyncRequest):
+    """Merge a base branch into THIS working copy's branch.
+
+    The conflict-resolution path of a promotion: bring the target's newer
+    commits into the source environment, resolve the conflicts in the editor,
+    commit, then merge again. A conflicted outcome is reported as a successful
+    start of that resolution (``conflicted: true``), not as an error — the
+    conflicted files are now in the working tree, where they belong.
+
+    INVALIDATES the context (the working tree changed).
+    """
+    from src.core.env_locks import check_environment_lock
+    from src.workspace.git_merge import sync_with_base
+
+    _require_platform_branch(req.base_branch, "base branch")
+
+    # A merge landing mid-apply would desynchronize the recorded applied commit
+    # from the code that actually ran.
+    check_environment_lock(req.workspace_path, operation="sync")
+
+    resolved, remote_url = await _resolve_remote_auth(
+        req.user_id, req.workspace_path, req.remote
+    )
+    if not remote_url:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workspace has no '{req.remote}' remote. Bind a Git repository first.",
+        )
+
+    # A public repository can be fetched anonymously, so a missing credential is
+    # not rejected up-front (unlike merge, which has to push).
+    result = await sync_with_base(
+        req.workspace_path,
+        base_branch=req.base_branch,
+        remote=req.remote,
+        auth=resolved.auth,
+        host=resolved.host,
+        message=req.message,
+    )
+
+    await get_context_pool().invalidate_all_for_workspace(req.workspace_path)
+
+    from src.environments.naming import env_of
+
+    environment = env_of(result["branch"])
+    if environment:
+        await _record_merge_event(
+            req.workspace_path,
+            environment,
+            req.user_id,
+            succeeded=not result["conflicted"],
+            commit_hash=result["merge_commit"],
+            detail={
+                "direction": "sync",
+                "base_branch": req.base_branch,
+                "conflicts": result["conflicts"],
+                "up_to_date": result["up_to_date"],
+            },
+        )
+
+    return result
 
 
 @router.get("/log")
@@ -492,10 +819,11 @@ async def git_publish(req: GitPublishRequest):
     )
     push_result = await push_async(req.workspace_path, "main", "origin", auth)
     if not push_result.ok:
-        raise GitRemoteAccessError(
+        raise _remote_failure(
             "publish",
             push_result.reason,
             extract_git_host(repo_info.clone_url),
+            req.workspace_path,
             push_result.detail,
         )
 

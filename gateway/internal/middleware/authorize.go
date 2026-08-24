@@ -238,6 +238,13 @@ func resolveWorkspaceID(r *http.Request, rule rbac.Rule, tenantID string) (strin
 
 	case rbac.ScopeSourceWorkspacePath:
 		return rbac.WorkspaceIDFromPath(requestField(r, "workspace_path"), tenantID)
+
+	case rbac.ScopeSourceEnvironmentSegment:
+		segment, ok := rbac.SegmentAt(r.URL.Path, rule.SegmentIndex)
+		if !ok {
+			return "", false
+		}
+		return rbac.WorkspaceIDFromEnvironmentID(segment, tenantID)
 	}
 	return "", false
 }

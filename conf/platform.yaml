@@ -74,6 +74,20 @@ logging:
   level: "info"
   format: "json"                        # "json" | "text"
 
+  # Workspace-attributable logs are additionally mirrored as NDJSON into
+  # {workspace}/logs/service/, so the agent can read them with plain file
+  # tools and the UI can tail them without a central log store. Records with
+  # no workspace (startup, auth, reapers) stay on stdout only.
+  #
+  # The target is the user's own working copy, hence the caps below.
+  workspace_file:
+    enabled: true
+    min_level: "info"                   # "debug" only for troubleshooting
+    max_line_bytes: 8192                # longer lines are truncated
+    max_open_files: 64                  # LRU of append descriptors
+    max_lines_per_sec: 200              # per workspace; excess is dropped
+    retention_days: 7                   # older .ndjson files are pruned
+
 # ── Security (documentation only — values are env-only) ──────────────
 # This section documents which env vars each service requires.
 # DO NOT put actual secret values here.

@@ -403,8 +403,9 @@ sqlmesh-service/src/
 │   └── layout.py             # 目录布局常量
 └── utils/
     ├── errors.py             # 统一错误体系 (ServiceError + ErrorCode 枚举)
-    ├── error_archive.py      # 错误归档到磁盘 ({workspace}/errors/)
-    └── logging.py            # structlog 配置
+    ├── error_archive.py      # 错误归档到磁盘 ({workspace}/logs/errors/)
+    ├── log_context.py        # 每请求 structlog contextvars 绑定
+    └── logging.py            # structlog 配置 + 工作区落盘 sink
 ```
 
 ### 4.2 ContextPool — 核心并发模型
@@ -479,10 +480,15 @@ SQLMesh Service 使用 SQLAlchemy ORM，支持 SQLite（开发）和 PostgreSQL�
 
 | 表名 | 说明 | 关键字段 |
 |------|------|---------|
-| `workspaces` | 工作区元数据 | id, user_id, name, dialect, git_repo_url, git_branch, status, local_path |
+| `workspaces` | 工作区元数据 | workspace_id, tenant_id, owner_user_id, name, dialect, git_repo_url, production_env, default_env, status |
+| `workspace_members` | 工作区成员与角色绑定 | workspace_id, user_id, role_code, is_owner |
+| `environments` | **环境注册表**（唯一真相源）：一个环境 = 一个分支 + 一个 SQLMesh 虚拟环境 + 一个 Dagster deployment | id(`{ws}:{name}`), workspace_id, name, branch, env_type, base_env, status, deployment_name, last_applied_commit, expires_at |
+| `environment_events` | 环境生命周期审计（append-only） | id, environment_id, action, actor_user_id, trigger_type, succeeded, duration_ms |
 | `user_git_credentials` | Git 凭证（OAuth/PAT） | id, user_id, provider, auth_type, token(加密), is_default |
 | `plan_apply_history` | Apply 审计 | id, workspace_path, environment, user_id, trigger_type, plan_result_json |
 | `knowledge_documents` | 知识文档元数据 | id, workspace_path, title, filename, content_type, tags |
+
+`workspaces.git_branch` 已下线（迁移 `0003_environments`）：分支不再是工作区属性，而是环境属性。工作区只保留 `production_env` / `default_env` 两个环境指针。
 
 ---
 
@@ -535,22 +541,31 @@ dagster-service/src/
 
 Code Location **始终本地**，因为它加载用户 `asset-dag/` 下的 Python 代码。
 
-### 5.3 Code Location 生命周期
+### 5.3 Deployment / Code Location 生命周期
+
+一个环境 = 一个 Dagster deployment = 一个 Code Location（名字为 `{workspace_id}__{env}`，
+由平台命名代数派生，不再从工作副本路径推断）。
 
 ```
-用户打开工作区
+用户打开环境（或注册表编排 apply / promote）
   │
   ▼
-ensure_location(workspace_path)
+POST /api/v1/dagster/deployments/ensure { workspace_path[, env_type, schedules_enabled] }
   │
+  ├─ 解析 workspace_path → (tenant, workspace, user, environment) → deployment 名
   ├─ 已运行? → 直接返回 (不重启，避免中断 GraphQL)
   │
   └─ 未运行:
-      ├─ scaffold 自愈 (fill-missing 模板 + 强制覆盖 sql_assets.py)
+      ├─ scaffold 自愈 (fill-missing 模板 + 强制覆盖 sql_assets.py / defs/deployment.py)
       ├─ 生成 definitions.py 检查
-      ├─ 分配端口 (从 4000 递增)
+      ├─ 分配端口 (从 4000 递增，持久化到 DAGSTER_HOME/code_location_ports.json)
+      ├─ 注入 deployment 身份 (AGENTICDATA_ENVIRONMENT / _DEPLOYMENT / _DEPLOYMENT_TYPE /
+      │   _WORKSPACE_ID / _SCHEDULES_ENABLED) + SQLMesh 桥接变量
       ├─ 启动 gRPC 服务器子进程
-      └─ 等待健康检查通过
+      └─ 等待健康检查通过 → 写 workspace.yaml → 通知 DagsterInstance
+
+代码变更后由显式动作刷新：POST /deployments/reload（不做文件监听）。
+子进程被 supervisor 定期巡检，异常退出自动 respawn（窗口内次数受限，超限则上报放弃）。
 ```
 
 ### 5.4 SQLMesh → Dagster 桥接
@@ -724,7 +739,10 @@ ontology-service/src/
 ├── ontology/                  # 语义模型 YAML (语义层)
 ├── knowledge/                 # 知识文档 (AI 对话域)
 ├── .ai/                       # Agent 上下文 (memory, context, rules)
-├── errors/                    # 错误归档 (error_archive)
+├── logs/                      # 运行时日志（everything is file）
+│   ├── service/               # 各服务 NDJSON 时间线，级别为字段
+│   ├── runs/                  # 任务级日志流（Dagster run 等）
+│   └── errors/                # 错误归档 (error_archive)
 └── .git/                      # 独立 Git clone (可选)
 ```
 
@@ -739,7 +757,9 @@ ontology-service/src/
 
 ### 7.3 State Isolation
 
-每个工作区的 `config.yaml` 由 `config_ops.ensure_state_isolation()` 配置，确保 SQLMesh state sync 按工作区隔离（SQLite 文件或 PG schema）。
+SQLMesh state（快照 / 环境 / external models）按 **workspace** 隔离，schema 为 `sqlmesh__{workspace_id}`，由 `config_ops.workspace_state_schema()` 纯函数派生。归属模型是"生成即真值 + 执行时校验"：`config_ops.reconcile_state_schema()` 在工作区创建时把值写入 `config.yaml`（随首次 commit 进入 Git），此后每次加载 Context 只做校验——缺值补齐，异值直接拒绝加载（409 `STATE_SCHEMA_MISMATCH`），绝不静默改写。
+
+隔离粒度是 workspace 而非 user/environment：环境是团队共享资产，环境间的 virtual promote 要求共享同一份 state。详见 [environment-branch-deployment-design.md](environment-branch-deployment-design.md) §3.4。
 
 ---
 
@@ -821,9 +841,21 @@ result = await asyncio.to_thread(context.plan, ...)
 - **Ontology Service** — 返回服务存活状态
 - **Gateway** — 支持 `?deep=1` 探测所有上游服务
 
-### 10.3 错误归档
+### 10.3 工作区日志落盘
 
-SQLMesh Service 将可操作的服务错误归档到 `{workspace}/errors/` 目录（JSON 文件），供 Agent 消费和用户诊断。归档包含完整异常上下文（SQL、配置、操作类型）。
+可归因到工作区的日志额外以 NDJSON 镜像到 `{workspace}/logs/service/{service}.{date}.ndjson`，一行一条记录，**级别是字段而非目录**——按级别分目录会把同一次请求的因果链拆散。没有工作区归属的日志（服务启动、鉴权、后台 reaper）只留在 stdout。
+
+写入由 `agenticdata_common.logging.workspace_sink.WorkspaceLogSink` 作为 structlog 处理器完成：单次 `os.write` 追加 `O_APPEND` 描述符（多进程不交错）、文件句柄 LRU、按工作区令牌桶限流、单行截断、按天滚动与保留期清理，且**任何失败都不会抛出**。配置见 `conf/platform.yaml` 的 `logging.workspace_file`。
+
+请求上下文（`trace_id` / `user_id` / `tenant_id`）由 `LogContextMiddleware` 绑定，工作区上下文（`workspace_path` / `workspace_id` / `environment`）由 `validate_workspace_path` 绑定——它是 query 与 body 两条路径的唯一入口。`trace_id` 由 Gateway 生成并经 `X-Trace-ID` 透传，用于跨服务对齐同一次操作。
+
+### 10.4 错误归档
+
+SQLMesh Service 将可操作的服务错误归档到 `{workspace}/logs/errors/` 目录（JSON 文件），供 Agent 消费和用户诊断。归档包含完整异常上下文（SQL、配置、操作类型）。它与服务时间线通过 `error_log_id` 关联：时间线说明何时失败，归档提供 traceback 与上下文。
+
+### 10.5 日志读取
+
+`GET /api/v1/logs` 提供有界尾读、按级别/来源/关键词过滤与跨文件归并，`GET /api/v1/logs/stream` 提供 SSE 实时追加。权限为 `workspace:logs:read`，独立于 `workspace:code:read`，因为日志可能含 SQL 文本与工具输出。
 
 ---
 

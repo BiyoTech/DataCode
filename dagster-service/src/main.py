@@ -111,10 +111,15 @@ app = FastAPI(
 )
 _register_exception_handlers(app)
 
+from src.api.middleware import LogContextMiddleware  # noqa: E402
+
+app.add_middleware(LogContextMiddleware)
+
 # Register REST route modules.
-from src.api.rest import assets, health, pipelines, runs, schedules  # noqa: E402
+from src.api.rest import assets, deployments, health, pipelines, runs, schedules  # noqa: E402
 
 app.include_router(health.router)
+app.include_router(deployments.router)
 app.include_router(pipelines.router)
 app.include_router(assets.router)
 app.include_router(runs.router)
