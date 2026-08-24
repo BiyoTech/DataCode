@@ -49,7 +49,7 @@ def _validate_readonly_sql(sql: str) -> t.Optional[str]:
     if match:
         return (
             f"Rejected: keyword '{match.group(1)}' is not allowed in a "
-            f"read-only query. Use the Data Engineering Agent for DDL/DML "
+            f"read-only query. Use the Warehouse Modeling Agent for DDL/DML "
             f"operations."
         )
     return None
@@ -62,7 +62,7 @@ async def query(ctx: RunContextWrapper[ToolContext], sql: str, limit: int = 100)
 
     Use this tool for exploratory data analysis, validation queries, and
     ad-hoc investigation. This is NOT for creating/modifying models — use
-    the Data Engineering Agent for model work.
+    the Warehouse Modeling Agent for model work.
 
     Args:
         sql: The SQL query to execute (SELECT only, read-only).

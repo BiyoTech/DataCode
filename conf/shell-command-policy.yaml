@@ -130,6 +130,18 @@ rules:
     risk_level: 4
     reason: "sqlmesh apply performs destructive deployment to environment"
 
+  - name: confirm_dc_deployment_reload
+    pattern: '(^|\s)dc\s+deployment\s+reload(\s|$)'
+    action: confirm
+    risk_level: 4
+    reason: "dc deployment reload re-imports orchestration code and may interrupt in-flight runs"
+
+  - name: confirm_dc_run
+    pattern: '(^|\s)dc\s+run(\s|$)'
+    action: confirm
+    risk_level: 4
+    reason: "dc run launches a job execution that writes data in the environment"
+
   - name: confirm_chmod
     pattern: '(^|\s)chmod\s'
     action: confirm

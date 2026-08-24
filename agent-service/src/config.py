@@ -223,6 +223,14 @@ class Settings(BaseSettings):
             return env_val
         return self.platform.services.url("sqlmesh", "rest_url")
 
+    @property
+    def dagster_service_url(self) -> str:
+        """Dagster service URL from platform topology (env override wins)."""
+        env_val = os.getenv("AGENT_SERVICE_DAGSTER_SERVICE_URL")
+        if env_val:
+            return env_val
+        return self.platform.services.url("dagster", "rest_url")
+
     # ── Logging (from platform) ────────────────────────────────────────
 
     @property

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin executable that delegates to dc.sh.
+# Placed in PATH as "dc" so the shell tool picks it up transparently;
+# unknown subcommands still reach the system desk calculator via passthrough.
+exec "$(dirname "$0")/dc.sh" "$@"

@@ -25,8 +25,8 @@ class AgentRegistry:
         """装饰器 — 注册 Agent 工厂函数。
 
         Usage:
-            @AgentRegistry.register("data_engineering_agent")
-            def create_data_engineering_agent(**kwargs) -> Agent:
+            @AgentRegistry.register("warehouse_modeling_agent")
+            def create_warehouse_modeling_agent(**kwargs) -> Agent:
                 return Agent(name="Model Agent", ...)
         """
         def decorator(factory: AgentFactory) -> AgentFactory:
@@ -74,7 +74,8 @@ def load_all_agents() -> None:
     """
     from src.agents import (  # noqa: F401
         triage,
-        data_engineering_agent,
+        warehouse_modeling_agent,
+        asset_orchestration_agent,
         data_analysis_agent,
         memory_agent,
         design_agent,

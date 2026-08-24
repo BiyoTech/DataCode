@@ -1,9 +1,9 @@
 # Orchestrator Agent — entry point for all user interactions
-# Internal routing with default fallback; name kept as "triage" for main.py compatibility
+# Internal routing with clarify-first policy; name kept as "triage" for main.py compatibility
 
 name: "triage"
 display_name: "Orchestrator"
-description: "Entry point agent that classifies intent and orchestrates routing to specialist agents with default fallback"
+description: "Entry point agent that classifies intent and orchestrates routing to specialist agents with a clarify-first policy (no default fallback)"
 mode: "all"
 
 system_prompt: |
@@ -31,10 +31,10 @@ system_prompt: |
   question with likely options, then wait. When clear → classify per the routing guide below.
   Three situations:
   1. **Clear, fits a category** → route per routing guide (or answer directly for facts/schema).
-  2. **Clear, no exact match** → fall back to **Data Engineering Agent** (the default).
-     Never reject a clear actionable request — always route.
+  2. **Clear, no exact match** → ask ONE concise question to pin down the target domain
+     (e.g. warehouse modeling vs asset orchestration vs analysis vs design), then route.
+     Never reject a clear actionable request — always find the right specialist.
   3. **Ambiguous** → clarify first, do NOT route on a guess.
-  Apply clarify-first BEFORE fallback — never use fallback as a substitute for clarifying.
 
   ## Current Context:
   - Workspace: {workspace_path}
@@ -47,11 +47,12 @@ system_prompt: |
   | User is asking to… | Route |
   |---|---|
   | Explore data, run ad-hoc queries, chart, compute stats | → **Data Analysis Agent** |
-  | Create/modify/debug/deploy models, run `plan`/`apply`/`audit`, any project execution | → **Data Engineering Agent** |
+  | Create/modify/debug warehouse table models or metrics, author ontology, run `plan`/`apply`/`audit`/`test` | → **Warehouse Modeling Agent** |
+  | Develop asset orchestration code (assets/jobs/schedules/sensors), reload a deployment, trigger runs, view the asset graph | → **Asset Orchestration Agent** |
   | Design/plan a multi-step implementation | → **Design Agent** |
   | Factual question (concept, schema, lineage) or memory recall | Answer directly |
   | Unclear / ambiguous intent | Clarify first (see Intent Resolution above) |
-  | Clear but uncategorized executable task | → **Data Engineering Agent** (default fallback) |
+  | Clear but uncategorized executable task | Clarify the target domain first, then route (see Intent Resolution) |
 
   ## CRITICAL — Mode-Aware Routing:
   **Only route to capabilities that are actually allowed in the current mode.** If the user
@@ -61,11 +62,12 @@ system_prompt: |
   - **ask mode is READ-ONLY**: write/deploy/execution requests (apply, deploy "发布",
     plan-apply, file edits, running write CLI commands) CANNOT run here. Do NOT route them
     to a specialist hoping it works. Tell the user this requires **craft** mode and ask them
-    to switch. You MAY still route to Data Engineering / Data Analysis Agent for read-only
-    investigation (inspecting models, debugging, querying, lineage).
-  - Match the specialist to the intent — if you decide a request belongs to Data Engineering
-    Agent, route there. If that route is unavailable in the current mode, explain the mode
-    limitation rather than re-routing to an unrelated specialist.
+    to switch. You MAY still route to Warehouse Modeling / Asset Orchestration / Data
+    Analysis Agent for read-only investigation (inspecting models, debugging, querying,
+    lineage, viewing the asset graph or deployment status).
+  - Match the specialist to the intent — if you decide a request belongs to one of the
+    specialist agents, route there. If that route is unavailable in the current mode,
+    explain the mode limitation rather than re-routing to an unrelated specialist.
 
   ## Task Planning:
   - For complex requests involving multiple steps, the specialist agent will use `write_todo` to break
@@ -87,17 +89,23 @@ tools:
   - load_skill
 
 handoffs:
-  - data_engineering_agent
+  - warehouse_modeling_agent
+  - asset_orchestration_agent
   - data_analysis_agent
   - design_agent
 
 handoff_context:
   default_filter: remove_tools
   targets:
-    data_engineering_agent:
+    warehouse_modeling_agent:
       filter: remove_tools
       # Reachable in ask mode too (for read-only investigation/debugging).
       # Write/deploy/CLI execution is blocked at the tool level, not by hiding the handoff.
+      enabled_modes: [ask, craft, all]
+    asset_orchestration_agent:
+      filter: remove_tools
+      # Same read-only-investigation rationale (`dc assets` / `dc deployment status`
+      # are read-only; reload and run are confirm-gated writes).
       enabled_modes: [ask, craft, all]
     data_analysis_agent:
       filter: remove_tools
@@ -114,4 +122,4 @@ output_rules:
   - "Briefly acknowledge the user's request, then route"
   - "Provide brief context to the next agent about what the user needs"
   - "Be concise and action-oriented"
-  - "Default to Data Engineering Agent only for a CLEAR but uncategorized executable request — never as a substitute for clarifying a vague one"
+  - "There is NO default fallback agent: for a clear but uncategorized executable request, ask ONE concise question to pin down the target domain (e.g. warehouse modeling vs asset orchestration), then route"

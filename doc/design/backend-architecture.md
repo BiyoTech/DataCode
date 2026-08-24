@@ -122,10 +122,10 @@ graph TB
     subgraph AgentService["Agent Service (Python)"]
         TRIAGE["Triage Orchestrator"]
         DA["Data Analysis Agent"]
-        DE["Data Engineering Agent"]
+        WM["Warehouse Modeling Agent"]
+        AO["Asset Orchestration Agent"]
         DS["Design Agent"]
         subgraph NewAgents["新增 Agents (规划中)"]
-            AE["Asset Engineering Agent"]
             MOps["ML Ops Agent"]
         end
         RUNTIME["Runtime (Goal Loop + Streaming)"]
@@ -266,14 +266,16 @@ agent-service/src/
 │   ├── registry.py            # Agent 注册表
 │   ├── triage.py              # Triage Orchestrator (意图路由)
 │   ├── data_analysis_agent.py # 数据分析 Agent
-│   ├── data_engineering_agent.py # 数据工程 Agent
+│   ├── warehouse_modeling_agent.py  # 数仓建模 Agent (SQLMesh 模型/指标/本体)
+│   ├── asset_orchestration_agent.py # 资产编排 Agent (Dagster 资产/调度)
 │   ├── design_agent.py        # 设计 Agent
 │   ├── memory_agent.py        # 记忆 Agent
 │   └── handoff_filters.py     # Handoff 过滤器
 ├── subagents/                  # Agent YAML 定义 (system prompt + tools + handoffs)
 │   ├── triage.yaml
 │   ├── data_analysis_agent.yaml
-│   ├── data_engineering_agent.yaml
+│   ├── warehouse_modeling_agent.yaml
+│   ├── asset_orchestration_agent.yaml
 │   ├── design_agent.yaml
 │   └── memory_agent.yaml
 ├── runtime/
@@ -306,12 +308,12 @@ agent-service/src/
 
 | Agent | 职责 | 典型场景 |
 |-------|------|---------|
-| **Triage Orchestrator** | 意图识别与路由，决定分发给哪个专业 Agent | 用户输入 → 路由到 DA/DE/Design |
+| **Triage Orchestrator** | 意图识别与路由，决定分发给哪个专业 Agent | 用户输入 → 路由到 DA/WM/AO/Design |
 | **Data Analysis Agent** | 数据分析、SQL 查询、数据探索 | "分析上月销售趋势" |
-| **Data Engineering Agent** | 数据建模、SQLMesh 模型开发、Plan/Apply | "创建一个 orders 汇总模型" |
+| **Warehouse Modeling Agent** | 数仓建模：SQLMesh 表模型、指标、本体定义，Plan/Apply 数据落地 | "创建一个 orders 汇总模型" |
+| **Asset Orchestration Agent** | 资产编排：Dagster assets/jobs/schedules/sensors 开发，deployment reload 与 run 触发 | "给订单模型加一个每天凌晨 2 点的调度" |
 | **Design Agent** | 架构设计、方案规划 | "设计一个客户分层数据仓库" |
 | **Memory Agent** | 对话记忆管理、摘要生成 | 会话结束时自动调用 |
-| **Asset Engineering Agent** *(规划中)* | Asset Dag 开发、Dagster 资产定义 | "创建一个模型训练 Pipeline" |
 | **ML Ops Agent** *(规划中)* | ML 模型训练/推理、特征工程、RAG 索引 | "训练推荐模型并部署" |
 
 ### 3.3 工具调用与审批
@@ -933,7 +935,7 @@ Gateway (Go/Chi) 采用三层路由策略：
 - ContextPool 缓存复用，asyncio 并发
 - SQLite 元数据存储 + DuckDB 分析引擎
 - 本地文件系统工作区
-- AI Agent 基础编排（Triage → DA/DE/Design）
+- AI Agent 基础编排（Triage → DA/WM/AO/Design）
 
 ### Phase 2: 多实例 + 共享存储
 
