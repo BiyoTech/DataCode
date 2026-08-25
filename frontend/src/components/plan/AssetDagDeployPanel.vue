@@ -240,7 +240,7 @@ watch(
                 <t-icon name="refresh" size="13px" />
                 {{ t('deploy.reload') }}
               </button>
-              <button class="ghost-btn" @click="router.push('/asset-dag')">
+              <button class="ghost-btn" @click="router.push('/app/asset-dag')">
                 <t-icon name="chart-bubble" size="13px" />
                 {{ t('deploy.openGraph') }}
               </button>

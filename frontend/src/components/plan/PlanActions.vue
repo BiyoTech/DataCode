@@ -38,7 +38,7 @@ function handleReset() {
 
 function handleGoBack() {
   planStore.reset()
-  router.push('/chat')
+  router.push('/app/chat')
 }
 </script>
 

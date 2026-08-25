@@ -108,7 +108,7 @@ const currentRoleLabel = computed(() => {
 })
 
 function goBack() {
-  router.push('/chat')
+  router.push('/app/chat')
 }
 
 // Language settings

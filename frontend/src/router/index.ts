@@ -7,18 +7,26 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
+      // Public product landing page — the entry point of the app.
+      path: '/',
+      name: 'landing',
+      component: () => import('@/views/LandingView.vue'),
+      meta: { public: true },
+    },
+    {
       path: '/login',
       name: 'login',
       component: () => import('@/views/LoginView.vue'),
       meta: { public: true },
     },
     {
-      path: '/',
+      // Authenticated workbench (IDE) lives under the /app prefix.
+      path: '/app',
       component: () => import('@/layouts/AppShell.vue'),
       children: [
         {
           path: '',
-          redirect: '/chat',
+          redirect: '/app/chat',
         },
         {
           path: 'chat',
@@ -68,10 +76,10 @@ router.beforeEach((to) => {
   const isAuthenticated = getSession() !== null
 
   if (!to.meta.public && !isAuthenticated) {
-    return { name: 'login', query: to.fullPath === '/' ? {} : { redirect: to.fullPath } }
+    return { name: 'login', query: { redirect: to.fullPath } }
   }
   if (to.name === 'login' && isAuthenticated) {
-    return { path: '/' }
+    return { path: '/app' }
   }
   return true
 })
@@ -79,11 +87,11 @@ router.beforeEach((to) => {
 // Send the user back to the login page when a session cannot be refreshed.
 setUnauthenticatedHandler(() => {
   const current = router.currentRoute.value
-  if (current.name === 'login') return
+  if (current.name === 'login' || current.meta.public) return
 
   router.replace({
     name: 'login',
-    query: current.fullPath === '/' ? {} : { redirect: current.fullPath },
+    query: { redirect: current.fullPath },
   })
 })
 

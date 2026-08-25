@@ -24,6 +24,101 @@ export default {
     registerNow: 'Sign up now',
     loginNow: 'Sign in',
   },
+  landing: {
+    nav: {
+      capabilities: 'Capabilities',
+      workflow: 'How It Works',
+      stack: 'Tech Stack',
+      signIn: 'Sign In',
+      enterWorkbench: 'Enter Workbench',
+    },
+    hero: {
+      badge: 'Data as Code · AI-Native',
+      titleA: 'Data as Code',
+      titleB: 'Vibe Data Engineering',
+      subtitle:
+        'Models, ontologies, workflows, schedules and tests — the entire data platform is code in Git. AI-assisted DataOps: manage data the way you manage code.',
+      primaryCta: 'Get Started',
+      primaryCtaAuthed: 'Enter Workbench',
+      secondaryCta: 'Explore Capabilities',
+      previewUser: 'Build a daily revenue model from raw orders, with audits.',
+      previewAssistant:
+        'Created models/marts/daily_revenue.sql with 3 audits. Plan ready — 2 models to backfill, 14 intervals.',
+      previewPlanReady: 'PLAN READY',
+    },
+    capabilities: {
+      title: 'Data as Code, AI by Design',
+      subtitle:
+        'Two convictions shape DataCode: the whole data platform is versioned code, and AI agents are the ones writing it — under your governance.',
+      items: {
+        dataAsCode: {
+          title: 'Data as Code',
+          desc: 'Models, AI pipelines, schedules and tests live in one versioned Git codebase — a single source of truth for data + AI assets: reviewable, diffable, revertible.',
+        },
+        aiNative: {
+          title: 'AI-Native Development',
+          desc: 'Specialized agents write code with full awareness of lineage, schema and business semantics. Even agent memory is Markdown in your repo — transparent and auditable.',
+        },
+        envBranch: {
+          title: 'Environment = Branch',
+          desc: 'Every environment maps 1:1:1 to a Git branch, a SQLMesh virtual environment and a Dagster deployment — data views always match the code that produced them.',
+        },
+        plan: {
+          title: 'Plan Before You Apply',
+          desc: 'AI proposes, humans decide. Every change is a reviewable plan: diffs, backfill intervals and downstream impact — nothing reaches production unreviewed.',
+        },
+        analysis: {
+          title: 'Data Analysis',
+          desc: 'Code is lineage, lineage is context: model, ontology and pipeline definitions are all code — data context goes beyond schemas and table relations, living in the very code that produces the data.',
+        },
+        governance: {
+          title: 'Enterprise Governance',
+          desc: 'Graded AI autonomy — read-only actions run freely, production changes require approval — with multi-tenant isolation, RBAC and complete audit trails.',
+        },
+      },
+    },
+    workflow: {
+      title: 'From Idea to Production in Four Steps',
+      subtitle: 'A tight feedback loop where AI does the heavy lifting and you make the calls.',
+      steps: {
+        describe: {
+          title: 'Describe',
+          desc: 'Tell the agent what you need in plain language — no boilerplate, no context switching.',
+        },
+        generate: {
+          title: 'Generate',
+          desc: 'Models, audits, tests and schedules materialize as versioned code in your Git workspace, ready to inspect.',
+        },
+        review: {
+          title: 'Review',
+          desc: 'Inspect the plan: diffs, impacted intervals and downstream effects before anything runs.',
+        },
+        ship: {
+          title: 'Ship',
+          desc: 'Apply with Virtual Update for zero-downtime release; Dagster keeps it running on schedule.',
+        },
+      },
+    },
+    stack: {
+      title: 'Built on Production-Grade Open Source',
+      subtitle: 'No black boxes — a composable foundation of best-in-class engines.',
+      items: {
+        sqlmesh: { name: 'SQLMesh', desc: 'Transformation & virtual data environments' },
+        dagster: { name: 'Dagster', desc: 'Asset orchestration & scheduling' },
+        daft: { name: 'Daft', desc: 'Distributed DataFrame engine' },
+        agents: { name: 'OpenAI Agents SDK', desc: 'Agent orchestration & tool calling' },
+      },
+    },
+    cta: {
+      title: 'Ready to ship data at the speed of thought?',
+      subtitle: 'Sign up, describe your first pipeline, and let the agent take it from there.',
+      button: 'Get Started',
+    },
+    footer: {
+      tagline: 'AI-Native DataOps Platform',
+      copyright: '© 2026 DataCode. All rights reserved.',
+    },
+  },
   identity: {
     title: 'Choose an account',
     subtitle: '{count} accounts are linked to these credentials. Pick one to continue.',

@@ -53,10 +53,10 @@ function validate(): string {
   return ''
 }
 
-/** Navigate to the originally requested page, defaulting to the home route. */
+/** Navigate to the originally requested page, defaulting to the workbench. */
 async function enterApp() {
   const redirect = route.query.redirect
-  const target = typeof redirect === 'string' && redirect.startsWith('/') ? redirect : '/'
+  const target = typeof redirect === 'string' && redirect.startsWith('/app') ? redirect : '/app'
   await nextTick()
   router.replace(target)
 }

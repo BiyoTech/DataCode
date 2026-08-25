@@ -24,6 +24,100 @@ export default {
     registerNow: '立即注册',
     loginNow: '返回登录',
   },
+  landing: {
+    nav: {
+      capabilities: '核心能力',
+      workflow: '工作方式',
+      stack: '技术底座',
+      signIn: '登录',
+      enterWorkbench: '进入工作台',
+    },
+    hero: {
+      badge: '数据即代码 · AI 原生',
+      titleA: '数据即代码',
+      titleB: 'Vibe 数据工程',
+      subtitle:
+        '模型、本体、工作流、调度与测试——整个数据平台都是 Git 中的代码。AI 辅助的 DataOps，像管理代码一样管理数据。',
+      primaryCta: '立即开始',
+      primaryCtaAuthed: '进入工作台',
+      secondaryCta: '了解核心能力',
+      previewUser: '基于原始订单表构建每日营收模型，并加上审计。',
+      previewAssistant:
+        '已创建 models/marts/daily_revenue.sql，包含 3 个审计。Plan 已就绪：2 个模型待回填，共 14 个区间。',
+      previewPlanReady: 'PLAN 已就绪',
+    },
+    capabilities: {
+      title: '数据即代码，AI 原生',
+      subtitle: 'DataCode 的两个信条：整个数据平台都是可版本化的代码，而代码主要由 AI Agent 编写——始终在你的治理之下。',
+      items: {
+        dataAsCode: {
+          title: '数据即代码',
+          desc: '模型、AI Pipeline、调度与测试全部存在于一个可版本化的 Git 代码库中，Data + AI 资产同源同仓——可评审、可对比、可回滚。',
+        },
+        aiNative: {
+          title: 'AI 原生开发',
+          desc: '专业 Agent 在理解血缘、Schema 与业务语义的基础上编写代码；连 Agent 的记忆都是仓库里的 Markdown，透明可审计。',
+        },
+        envBranch: {
+          title: '环境即分支',
+          desc: '每个环境与 Git 分支、SQLMesh 虚拟环境、Dagster 部署严格 1:1:1 对应——数据视图永远与产生它的代码一致。',
+        },
+        plan: {
+          title: '变更先评审',
+          desc: 'AI 提议，人来决策。每一次变更都是可评审的 Plan：差异、回填区间与下游影响一目了然，未评审的变更进不了生产。',
+        },
+        analysis: {
+          title: '数据分析',
+          desc: '代码即血缘，血缘即上下文：模型定义、本体定义与 Pipeline 定义皆为代码——数据的上下文不止表结构与表关系，更蕴含在生成数据的代码中。',
+        },
+        governance: {
+          title: '企业级治理',
+          desc: 'AI 操作分级自治——只读操作自由执行，生产变更必须审批；叠加多租户隔离、RBAC 与完整审计轨迹。',
+        },
+      },
+    },
+    workflow: {
+      title: '四步，从想法到生产',
+      subtitle: 'AI 承担繁重工作，你来做关键决策——紧凑而可靠的反馈闭环。',
+      steps: {
+        describe: {
+          title: '描述',
+          desc: '用自然语言告诉 Agent 你的需求——无需样板代码，无需切换上下文。',
+        },
+        generate: {
+          title: '生成',
+          desc: '模型、审计、测试与调度以代码形式在你的 Git 工作区中成形，随时可检查。',
+        },
+        review: {
+          title: '评审',
+          desc: '检查 Plan：差异、受影响区间与下游影响，一切尽在执行之前。',
+        },
+        ship: {
+          title: '发布',
+          desc: 'Virtual Update 零停机上线，Dagster 按调度持续运行。',
+        },
+      },
+    },
+    stack: {
+      title: '构建于生产级开源底座之上',
+      subtitle: '没有黑盒——由一流引擎组合而成的可插拔基础。',
+      items: {
+        sqlmesh: { name: 'SQLMesh', desc: '数据转换与虚拟数据环境' },
+        dagster: { name: 'Dagster', desc: '资产编排与调度' },
+        daft: { name: 'Daft', desc: '分布式 DataFrame 引擎' },
+        agents: { name: 'OpenAI Agents SDK', desc: 'Agent 编排与工具调用' },
+      },
+    },
+    cta: {
+      title: '准备好以思考的速度交付数据了吗？',
+      subtitle: '注册账号，描述你的第一条 Pipeline，剩下的交给 Agent。',
+      button: '立即开始',
+    },
+    footer: {
+      tagline: 'AI 原生 DataOps 平台',
+      copyright: '© 2026 DataCode. 保留所有权利。',
+    },
+  },
   identity: {
     title: '选择登录账号',
     subtitle: '当前登录方式有 {count} 个关联账号，请选择登录账号',

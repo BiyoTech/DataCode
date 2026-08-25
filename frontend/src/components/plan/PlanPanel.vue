@@ -34,7 +34,7 @@ function getStateBadgeClass(): string {
     <!-- Header -->
     <div class="panel-header">
       <div class="header-left">
-        <button class="back-btn" title="Back" @click="router.push('/chat')">
+        <button class="back-btn" title="Back" @click="router.push('/app/chat')">
           <t-icon name="chevron-left" size="16px" />
         </button>
         <t-icon name="tools" size="16px" class="header-icon" />
