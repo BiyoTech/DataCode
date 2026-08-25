@@ -29,13 +29,13 @@ const gitStore = useGitStore()
 const { requestMention } = useFileMention()
 
 // Highlight the Models activity-bar button when on the Models page.
-const isModelsPage = computed(() => router.currentRoute.value.path === '/models')
+const isModelsPage = computed(() => router.currentRoute.value.path === '/app/models')
 // Highlight the Plan button when on the Plan page.
-const isPlanPage = computed(() => router.currentRoute.value.path === '/plan')
+const isPlanPage = computed(() => router.currentRoute.value.path === '/app/plan')
 // Highlight the A-BI button when on the A-BI module page.
-const isAbiPage = computed(() => router.currentRoute.value.path === '/abi')
+const isAbiPage = computed(() => router.currentRoute.value.path === '/app/abi')
 // Highlight the Asset Dag button when on the Asset Dag module page.
-const isAssetDagPage = computed(() => router.currentRoute.value.path === '/asset-dag')
+const isAssetDagPage = computed(() => router.currentRoute.value.path === '/app/asset-dag')
 
 // The main editor view is shown on any route that is not a dedicated nav page.
 const isMainEditorRoute = computed(
@@ -97,7 +97,7 @@ const emit = defineEmits<{
  */
 function selectTab(tab: 'files' | 'diff') {
   if (!isMainEditorRoute.value) {
-    router.push('/chat')
+    router.push('/app/chat')
   }
   emit('change-tab', tab)
 }
@@ -282,25 +282,25 @@ async function handleImportSuccess() {
           :class="{ active: isModelsPage }"
           label="Models"
           class="plan-btn"
-          @click="router.push('/models')"
+          @click="router.push('/app/models')"
         ><t-icon name="chart-bar" size="18px" /></IconButton>
         <IconButton
           :class="{ active: isAbiPage }"
           label="A-BI"
           class="abi-btn"
-          @click="router.push('/abi')"
+          @click="router.push('/app/abi')"
         ><t-icon name="chart-analytics" size="18px" /></IconButton>
         <IconButton
           :class="{ active: isAssetDagPage }"
           label="Asset Dag"
           class="plan-btn"
-          @click="router.push('/asset-dag')"
+          @click="router.push('/app/asset-dag')"
         ><t-icon name="chart-bubble" size="18px" /></IconButton>
         <IconButton
           :class="{ active: isPlanPage }"
           label="Plan & Apply"
           class="plan-btn"
-          @click="router.push('/plan')"
+          @click="router.push('/app/plan')"
         ><t-icon name="play-circle" size="16px" /></IconButton>
       </div>
       <div class="tabs-bottom">

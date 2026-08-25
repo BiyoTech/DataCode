@@ -88,17 +88,17 @@ function toggleBottomPanel(tab: 'git' | 'log') {
 
 function openSettings() {
   showUserMenu.value = false
-  router.push({ path: '/settings', query: { section: 'appearance' } })
+  router.push({ path: '/app/settings', query: { section: 'appearance' } })
 }
 
 function openAccountSecurity() {
   showUserMenu.value = false
-  router.push({ path: '/settings', query: { section: 'account-security' } })
+  router.push({ path: '/app/settings', query: { section: 'account-security' } })
 }
 
 function openGitSettings() {
   showBottom.value = false
-  router.push({ path: '/settings', query: { section: 'git-credentials' } })
+  router.push({ path: '/app/settings', query: { section: 'git-credentials' } })
 }
 
 /** Open the account switcher and load the available identities. */
@@ -129,7 +129,7 @@ async function handleSwitchIdentity(tenantId: string) {
   try {
     await authStore.selectTenant(tenantId)
     MessagePlugin.success(t('identity.switched'))
-    window.location.assign('/')
+    window.location.assign('/app')
   } catch (error) {
     notifyError(error)
   } finally {
