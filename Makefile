@@ -1,6 +1,6 @@
 .PHONY: help setup doctor dev dev-backend dev-frontend dev-logs stop db-upgrade \
         pg-set-password \
-        infra infra-down up down ps logs dagster-up dagster-down data-plane-up data-plane-down \
+        infra infra-down up build down ps logs dagster-up dagster-down data-plane-up data-plane-down \
         cell-up global-up images \
         k8s-render k8s-diff k8s-apply k8s-delete k8s-migrate \
         lint test clean
@@ -24,7 +24,9 @@ help:
 	@echo "  make infra        Start postgres + redis (+ gitea) only"
 	@echo "  make infra-down   Stop the infra stack"
 	@echo "  make up           Single-machine ALL-container stack (8 services)  -> :8080"
-	@echo "  make down         Stop it"
+	@echo "                    (reuses existing images; run make build after code changes)"
+	@echo "  make build        Rebuild the stack images"
+	@echo "  make down         Stop it (containers + networks; volumes and images kept)"
 	@echo "  make ps           List its containers"
 	@echo "  make logs         Follow its logs"
 	@echo "  make dagster-up   Dagster orchestration plane (stackable on up/cell) -> :3000"
@@ -152,11 +154,25 @@ deploy/.env:
 
 # Single-machine, every service in a container, profile `docker`. Migrations
 # run in the one-shot migrate service BEFORE the deployments start.
+#
+# Deliberately WITHOUT --build: compose v2 reuses an image that already exists
+# locally and only builds the ones that are missing, so a down/up cycle costs
+# seconds instead of a full rebuild. The trade-off is that `make up` alone will
+# keep running a stale image after a code change — run `make build` first (or
+# `make build up`) in that case.
 up: deploy/.env
 	@bash scripts/pg-password.sh ensure
 	@bash scripts/jwt-secret.sh ensure
 	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml up -d --build
+		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml up -d
+
+# Rebuild the stack images after a code/dependency change. `make up` picks the
+# new images up on the next run and recreates only the affected containers.
+build: deploy/.env
+	@bash scripts/pg-password.sh ensure
+	@bash scripts/jwt-secret.sh ensure
+	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
+		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml build
 
 down: deploy/.env
 	@bash scripts/jwt-secret.sh ensure
