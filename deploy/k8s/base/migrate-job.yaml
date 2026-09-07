@@ -1,0 +1,138 @@
+# Migration Jobs — schema changes as a FIRST-CLASS deploy step.
+#
+# Why a Job and not boot-time migration: with more than one replica every one
+# of them races create_all + upgrade head against the others, and against any
+# concurrent deploy. A Job runs exactly once per rollout, ordered before the
+# Deployments pick up the new image (see the overlays, which sequence
+# job-then-deployments via `make k8s-migrate`).
+#
+# Two jobs, because there are two migration chains with different owners:
+#   control-migrate     control-service's alembic chain (platform metadata)
+#   identity-migrate    identity-service's SQL migrations (users/tenants/roles)
+#
+# control-migrate exits after creating the control-plane tables and running
+# `alembic upgrade head` (python -m src.db_migrate): the base tables are owned
+# by the ORM metadata and alembic's 0001 baseline is empty on purpose, so
+# table creation must happen explicitly. identity-migrate runs the full
+# service binary with AUTO_MIGRATE=1: identity-service has no migrate-only
+# entrypoint (by design — a replica that finishes migrating serves), so the
+# Job runs the binary with a deadline and treats "migrations current +
+# listening" as success. Both are idempotent, and ttlSecondsAfterFinished
+# keeps finished jobs from accumulating.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: control-migrate
+  namespace: datacode
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: control-migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: datacode/control-service:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "src.db_migrate"]
+          env:
+            # The config mechanism, identical to every other deployment shape:
+            # conf/ from the ConfigMap, profile selected by DATACODE_ENV. The
+            # base declares the cell profile; overlays replace it where needed.
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-cell
+            - name: DATACODE_CELL_ID
+              value: cell-0
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: identity-migrate
+  # The identity tables live in the GLOBAL namespace, not a cell's.
+  namespace: datacode-global
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  # The binary keeps serving after migrating (no migrate-only mode); the
+  # deadline bounds the Job and the probe below proves migrations completed
+  # before it fires.
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app: identity-migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: datacode/identity-service:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # The config mechanism; the GLOBAL profile (identity lives in the
+            # global tier's database, not a cell's).
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-global
+            - name: DATACODE_CELL_ID
+              value: global
+            - name: IDENTITY_SERVICE_AUTO_MIGRATE
+              value: "1"
+            - name: GW_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: gateway-jwt-secret
+            - name: IDENTITY_SERVICE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: identity-internal-token
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          # Readiness == migrations applied + server listening: the process
+          # REFUSES to serve (exits nonzero) while migrations are pending,
+          # so a ready pod is the success signal.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf

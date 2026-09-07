@@ -2,7 +2,7 @@
 
 > DataCode — Data+AI 一体化 AI 原生开发平台
 > 将传统数据工程（ELT、数据建模、数据质量、血缘）与现代 AI 工程（模型训练/推理、特征工程、RAG 索引构建）统一在一个 AI 原生开发平台中
-> 基于 sqlmesh-service / dagster-service / ontology-service / agent-service 实际实现
+> 基于 2.0 服务架构（gateway / identity-service / control-service / workspace-runtime / agent-service）实际实现；服务切分依据见 [00-README.md](00-README.md)
 
 ---
 
@@ -49,7 +49,6 @@ graph TB
         Snapshot[快照 Snapshot]
         Lineage[血缘关系 Lineage]
         ColumnLineage[列级血缘 ColumnLineage]
-        ContextPool[Context池 ContextPool]
     end
 
     subgraph 环境与发布域["环境与发布域 (Environment & Deployment)"]
@@ -120,12 +119,13 @@ graph TB
 
 | 限界上下文 | 核心实体 | 所在服务 | 职责 |
 |-----------|---------|---------|------|
-| **工作区与身份域** | Workspace, GitCredential, WorkspaceRepository | sqlmesh-service | 工作区生命周期管理（DB+Git+Disk）、Git 凭证管理、用户级开发环境隔离 |
-| **SQL Warehouse 域** | Model, Snapshot, Lineage, ColumnLineage, ContextPool | sqlmesh-service | SQLMesh 模型定义、版本管理（快照/指纹）、血缘分析、Context 缓存与并发 |
-| **环境与发布域** | Environment, EnvironmentTopology, Plan, PlanApplyHistory | sqlmesh-service | 虚拟环境管理、环境级拓扑构建、Plan/Apply 变更发布、审计追踪 |
-| **Asset Dag 域** | AssetDag, CodeLocation, AssetRun, Schedule, SourceAsset, MLAsset, FeatureAsset, RAGAsset | dagster-service | Dagster Code Location 管理、统一资产 DAG（Data+ML+Feature+RAG）、运行编排、调度 |
-| **语义层域** | SemanticModel, Entity, Relationship, Metric | ontology-service | 语义模型定义、业务实体/关系/指标、交叉引用验证、语义搜索 |
-| **AI 对话域** | ChatSession, TriageAgent, DataAgent, AgentAction, KnowledgeDocument | agent-service + sqlmesh-service | AI 交互、Agent 编排（Triage→专业 Agent）、工具调用、知识文档管理 |
+| **身份与租户域** | User, Tenant, Role, TenantMember | identity-service | 认证、RBAC、租户放置（2.0 拆出：身份是全平台唯一真源） |
+| **工作区与身份域** | Workspace, GitCredential, WorkspaceRepository | control-service（元数据） + workspace-runtime（物化） | 工作区生命周期管理（元数据/注册 vs 文件系统/引擎副作用分治）、Git 凭证管理、用户级开发环境隔离 |
+| **SQL Warehouse 域** | Model, Snapshot, Lineage, ColumnLineage | workspace-runtime | SQLMesh 模型定义、版本管理（快照/指纹）、血缘分析 |
+| **环境与发布域** | Environment, EnvironmentTopology, Plan, PlanApplyHistory | control-service（注册中心） + workspace-runtime（执行） | 虚拟环境管理、环境级拓扑构建、Plan/Apply 变更发布、审计追踪 |
+| **Asset Dag 域** | AssetDag, CodeLocation, AssetRun, Schedule, SourceAsset, MLAsset, FeatureAsset, RAGAsset | workspace-runtime | Dagster Code Location 管理、统一资产 DAG（Data+ML+Feature+RAG）、运行编排、调度 |
+| **语义层域** | SemanticModel, Entity, Relationship, Metric | workspace-runtime | 语义模型定义、业务实体/关系/指标、交叉引用验证、语义搜索 |
+| **AI 对话域** | ChatSession, TriageAgent, DataAgent, AgentAction, KnowledgeDocument | agent-service | AI 交互、Agent 编排（Triage→专业 Agent）、工具调用（经 workspace-runtime） |
 
 ---
 
@@ -340,13 +340,14 @@ erDiagram
 
 | 聚合根 (Aggregate Root) | 包含的实体/值对象 | 所在服务 | 说明 |
 |------------------------|------------------|---------|------|
-| **Workspace** | SQL Warehouse (Model, Environment, Plan), Asset Dag (AssetDag, SourceAsset), SemanticModel, KnowledgeDocument, GitCredential | sqlmesh-service + dagster-service | 工作区是 Data+AI 开发的核心组织单元，包含 SQL Warehouse 和 Asset Dag 两个子域 |
-| **ContextPool** | ContextEntry (Context + Lock + dirty flag) | sqlmesh-service | SQLMesh Context 缓存池，按 (workspace, gateway) 键化 |
-| **EnvironmentTopology** | Snapshot, SnapshotId, graph, nodes | sqlmesh-service | 环境级拓扑从 snapshots 重建 |
-| **Plan** | PlanApplyHistory, ChangeSet, Backfill | sqlmesh-service | Plan 是变更管理的核心流程对象 |
-| **AssetDag** | CodeLocation, SourceAsset, MLAsset, FeatureAsset, RAGAsset, AssetInfo, AssetDagEdge | dagster-service | 统一资产 DAG，桥接原生 Dagster + SQLMesh + AI Pipeline 资产 |
-| **SemanticModel** | Entity, Relationship, Metric, Attribute, SubConcept | ontology-service | 语义模型是业务术语的容器 |
+| **Workspace** | SQL Warehouse (Model, Environment, Plan), Asset Dag (AssetDag, SourceAsset), SemanticModel, KnowledgeDocument, GitCredential | control-service（元数据） + workspace-runtime（工作副本） | 工作区是 Data+AI 开发的核心组织单元，包含 SQL Warehouse 和 Asset Dag 两个子域 |
+| **EnvironmentTopology** | Snapshot, SnapshotId, graph, nodes | workspace-runtime | 环境级拓扑从 snapshots 重建 |
+| **Plan** | PlanApplyHistory, ChangeSet, Backfill | workspace-runtime | Plan 是变更管理的核心流程对象 |
+| **AssetDag** | CodeLocation, SourceAsset, MLAsset, FeatureAsset, RAGAsset, AssetInfo, AssetDagEdge | workspace-runtime | 统一资产 DAG，桥接原生 Dagster + SQLMesh + AI Pipeline 资产 |
+| **SemanticModel** | Entity, Relationship, Metric, Attribute, SubConcept | workspace-runtime | 语义模型是业务术语的容器 |
 | **ChatSession** | TriageAgent, DataAgent, AgentAction, Artifact, ToolCall | agent-service | AI 对话会话，Agent 编排的上下文容器 |
+
+> 1.x 的 ContextPool 聚合已随 2.0 沙箱化移除：用户代码不再于平台进程内构建 SQLMesh Context，读侧元数据由 workspace-runtime 的 MetadataContextStore 缓存，写侧进入 task-runner 沙箱（见 [04-workspace-sandbox-isolation.md](04-workspace-sandbox-isolation.md)）。
 
 ---
 
@@ -354,17 +355,16 @@ erDiagram
 
 | 事件 | 触发条件 | 消费者 | 传输方式 |
 |------|---------|--------|---------|
-| `WorkspaceCreated` | 创建新工作区 | Scaffold（生成 asset-dag 骨架）、ContextPool（预加载） | 同步调用 |
-| `WorkspaceActivated` | 用户打开工作区 | Dagster Service（ensure Code Location）、ContextPool（加载 Context） | HTTP |
-| `ModelFileChanged` | AI 生成/修改模型文件 | ContextPool（标记 dirty）、SQLMesh Service（验证语法） | 同步 |
-| `ContextRefreshed` | dirty Context 在操作前刷新 | 内部 | 同步 |
+| `WorkspaceCreated` | 创建新工作区 | Scaffold（生成 asset-dag 骨架） | 同步调用 |
+| `WorkspaceActivated` | 用户打开工作区 | workspace-runtime（ensure Code Location） | HTTP |
+| `ModelFileChanged` | AI 生成/修改模型文件 | workspace-runtime（验证语法）、元数据缓存失效 | 同步 |
 | `PlanCreated` | 创建 Plan 预览 | EventBus（SSE 推送进度） | SSE |
-| `PlanApplied` | Plan apply 成功 | PlanApplyHistory（审计记录）、ContextPool（失效）、AssetDag（重建） | 同步 + SSE |
-| `EnvironmentChanged` | 切换虚拟环境 | 前端（重载模型/血缘）、Dagster Service（重载 asset graph） | HTTP |
-| `CodeLocationReady` | gRPC Code Location 启动完成 | Dagster Service（GraphQL 查询资产图） | 同步 |
+| `PlanApplied` | Plan apply 成功 | PlanApplyHistory（审计记录）、元数据缓存失效、AssetDag（重建） | 同步 + SSE |
+| `EnvironmentChanged` | 切换虚拟环境 | 前端（重载模型/血缘）、workspace-runtime（重载 asset graph） | HTTP |
+| `CodeLocationReady` | gRPC Code Location 启动完成 | workspace-runtime（GraphQL 查询资产图） | 同步 |
 | `AssetRunCompleted` | Dagster 运行完成（Data/ML/Feature/RAG 资产） | 前端（状态更新）、EventBus | SSE |
-| `OntologyValidated` | 本体验证完成 | 前端（展示错误）、sqlmesh-service（外部引用检查） | HTTP |
-| `GitOperationCompleted` | Git push/pull 完成 | ContextPool（失效 Context）、前端（状态更新） | HTTP |
+| `OntologyValidated` | 本体验证完成 | 前端（展示错误）、workspace-runtime（外部引用检查） | HTTP |
+| `GitOperationCompleted` | Git push/pull 完成 | 元数据缓存失效、前端（状态更新） | HTTP |
 | `ErrorArchived` | 服务错误发生 | 错误归档到 `{workspace}/logs/errors/` | 同步 |
 | `KnowledgeDocumentUploaded` | 上传知识文档 | KnowledgeDocumentModel（元数据记录） | HTTP |
 | `AgentHandoff` | Triage Agent 路由到专业 Agent | 目标 Agent（加载上下文） | 内部 |
@@ -405,20 +405,12 @@ stateDiagram-v2
     Archived --> [*]: 删除
 ```
 
-### 5.3 Context 状态机（ContextPool 内）
+### 5.3 Context 状态机（1.x，已移除）
 
-```mermaid
-stateDiagram-v2
-    [*] --> Loading: 首次请求 (workspace, gateway)
-    Loading --> Ready: Context 加载完成
-    Ready --> Dirty: 文件写入 / Git 操作
-    Dirty --> Refreshing: 下次操作前
-    Refreshing --> Ready: 刷新完成
-    Ready --> Idle: 无访问 (TTL 计时)
-    Idle --> Ready: 新请求到达
-    Idle --> Evicted: TTL 过期 / LRU 淘汰
-    Evicted --> [*]: 释放
-```
+> ContextPool 及其状态机已随 2.0 沙箱化移除（P6 close-out）：平台进程不再构建
+> SQLMesh Context —— 读侧元数据由 workspace-runtime 的 MetadataContextStore 缓存，
+> 写侧（plan/apply）整体进入 task-runner 沙箱按任务执行。保留本节仅为阅读
+> 历史设计时的对照，现行机制见 [04-workspace-sandbox-isolation.md](04-workspace-sandbox-isolation.md)。
 
 ### 5.4 Deployment（Code Location）状态机
 
@@ -448,21 +440,20 @@ stateDiagram-v2
 
 | 术语 | 英文 | 定义 | 所属域 | 所在服务 |
 |------|------|------|--------|---------|
-| **工作区** | Workspace | 一个 SQLMesh 数据工程工作区，对应本地目录 `~/.datacode/workspaces/{user}/{name}/`，包含模型、Git、asset-dag 等 | 工作区与身份域 | sqlmesh-service |
-| **模型** | Model | SQLMesh 中的数据转换单元，用 SQL 定义。显示名 `schema.table`，FQN 为完全限定名 | 模型开发域 | sqlmesh-service |
-| **Context 池** | ContextPool | SQLMesh Context 的缓存池，按 (workspace, gateway) 键化，TTL/LRU 淘汰 | 模型开发域 | sqlmesh-service |
-| **Context 条目** | ContextEntry | ContextPool 中的缓存条目，持有 Context + asyncio.Lock + dirty flag | 模型开发域 | sqlmesh-service |
-| **虚拟环境** | Environment | SQLMesh 的虚拟环境（prod/dev 等），通过视图层实现隔离 | 环境与发布域 | sqlmesh-service |
-| **环境拓扑** | EnvironmentTopology | 从环境 snapshots 重建的模型依赖图，区别于本地定义视图 | 环境与发布域 | sqlmesh-service |
-| **计划** | Plan | SQLMesh 的变更计划，描述模型变更的影响范围和执行策略 | 环境与发布域 | sqlmesh-service |
-| **代码位置** | CodeLocation | Dagster 的 gRPC 服务器进程，加载用户 `asset-dag/` Python 代码 | 资产调度域 | dagster-service |
-| **资产 DAG** | AssetDag | 统一的资产依赖图，合并原生 Dagster 资产 + SQLMesh 桥接资产 | 资产调度域 | dagster-service |
-| **源资产** | SourceAsset | SQLMesh 模型在 Dagster 中的映射，key 为 `sqlmesh__schema__table` | 资产调度域 | dagster-service |
-| **SQLMesh 桥接** | SQLMeshBridge | dagster-service 通过 HTTP 调用 sqlmesh-service 获取模型/血缘元数据 | 资产调度域 | dagster-service |
-| **语义模型** | SemanticModel | 一个 YAML 文件定义的业务域，包含实体、关系、指标 | 语义层域 | ontology-service |
-| **业务实体** | Entity | 语义层中的核心业务概念，映射到 SQLMesh 物理模型 | 语义层域 | ontology-service |
-| **业务指标** | Metric | 业务度量定义（基础/过滤/派生/映射），映射到 SQLMesh 指标 | 语义层域 | ontology-service |
-| **知识文档** | KnowledgeDocument | 存储在 `{workspace}/knowledge/` 下的业务知识文件 | AI 对话域 | sqlmesh-service |
+| **工作区** | Workspace | 一个 SQLMesh 数据工程工作区，对应目录 `{base}/{tenant_id}/{workspace_id}/{user_id}/envs/{environment}/`（按环境隔离的工作副本），包含模型、Git、asset-dag 等 | 工作区与身份域 | control-service（元数据） + workspace-runtime（工作副本） |
+| **工作副本** | Working Copy | 一个成员某环境的 Git worktree 检出，工作区租约的持有单位 | 工作区与身份域 | workspace-runtime |
+| **模型** | Model | SQLMesh 中的数据转换单元，用 SQL 定义。显示名 `schema.table`，FQN 为完全限定名 | 模型开发域 | workspace-runtime |
+| **虚拟环境** | Environment | SQLMesh 的虚拟环境（prod/dev 等），通过视图层实现隔离 | 环境与发布域 | control-service（注册） + workspace-runtime（执行） |
+| **环境拓扑** | EnvironmentTopology | 从环境 snapshots 重建的模型依赖图，区别于本地定义视图 | 环境与发布域 | workspace-runtime |
+| **计划** | Plan | SQLMesh 的变更计划，描述模型变更的影响范围和执行策略 | 环境与发布域 | workspace-runtime |
+| **代码位置** | CodeLocation | Dagster 的 gRPC 服务器进程，加载用户 `asset-dag/` Python 代码 | 资产调度域 | workspace-runtime |
+| **资产 DAG** | AssetDag | 统一的资产依赖图，合并原生 Dagster 资产 + SQLMesh 桥接资产 | 资产调度域 | workspace-runtime |
+| **源资产** | SourceAsset | SQLMesh 模型在 Dagster 中的映射，key 为 `sqlmesh__schema__table` | 资产调度域 | workspace-runtime |
+| **SQLMesh 桥接** | SQLMeshBridge | 生成的 asset-dag 代码通过 HTTP 调用 workspace-runtime 获取模型/血缘元数据 | 资产调度域 | workspace-runtime |
+| **语义模型** | SemanticModel | 一个 YAML 文件定义的业务域，包含实体、关系、指标 | 语义层域 | workspace-runtime |
+| **业务实体** | Entity | 语义层中的核心业务概念，映射到 SQLMesh 物理模型 | 语义层域 | workspace-runtime |
+| **业务指标** | Metric | 业务度量定义（基础/过滤/派生/映射），映射到 SQLMesh 指标 | 语义层域 | workspace-runtime |
+| **知识文档** | KnowledgeDocument | 存储在 `{workspace}/knowledge/` 下的业务知识文件 | AI 对话域 | workspace-runtime |
 
 ### 6.2 SQLMesh 专有概念
 
@@ -544,12 +535,10 @@ graph LR
         W --> GC[Git凭证]
     end
 
-    subgraph SQLWarehouse["SQL Warehouse (sqlmesh-service)"]
-        W --> CP[ContextPool]
-        CP --> Ctx[Context]
-        Ctx --> M[模型]
-        Ctx --> L[血缘]
-        Ctx --> CL[列级血缘]
+    subgraph SQLWarehouse["SQL Warehouse (workspace-runtime)"]
+        W --> M[模型]
+        M --> L[血缘]
+        M --> CL[列级血缘]
         M --> S[快照]
         S --> F[指纹]
         W --> Env[虚拟环境]
@@ -560,7 +549,7 @@ graph LR
         W --> KD[知识文档]
     end
 
-    subgraph AssetDag["Asset Dag (dagster-service)"]
+    subgraph AssetDag["Asset Dag (workspace-runtime)"]
         W --> AD[AssetDag]
         AD --> CL2[CodeLocation]
         AD --> SA[SourceAsset]
@@ -575,7 +564,7 @@ graph LR
         CL2 --> Sch[调度]
     end
 
-    subgraph 语义层["语义层 (ontology-service)"]
+    subgraph 语义层["语义层 (workspace-runtime)"]
         W --> SM[语义模型]
         SM --> E[实体]
         SM --> R[关系]
@@ -647,7 +636,7 @@ Ontology Entity 通过 `Entity.model` 字段引用 SQLMesh 模型，`CrossRefVal
 
 | 数据源 | 服务 | 环境参数 | 数据来源 |
 |--------|------|---------|---------|
-| 模型列表 | sqlmesh-service `/models` | `environment` | local: `context.models`；promoted: snapshots |
-| 模型血缘 | sqlmesh-service `/lineage` | `environment` | local: `context.dag`；promoted: snapshot parents |
-| 资产图 | dagster-service `/assets/graph` | `environment` | 原生资产不受影响；SQLMesh 子图按环境 |
-| SQLMesh 子图 | dagster-service `buildSqlmeshSubgraph` | `environment` | 调用 `/sqlmesh/lineage?environment=...` |
+| 模型列表 | workspace-runtime `/models` | `environment` | local: `context.models`；promoted: snapshots |
+| 模型血缘 | workspace-runtime `/lineage` | `environment` | local: `context.dag`；promoted: snapshot parents |
+| 资产图 | workspace-runtime `/assets/graph` | `environment` | 原生资产不受影响；SQLMesh 子图按环境 |
+| SQLMesh 子图 | workspace-runtime `buildSqlmeshSubgraph` | `environment` | 调用 `/sqlmesh/lineage?environment=...` |

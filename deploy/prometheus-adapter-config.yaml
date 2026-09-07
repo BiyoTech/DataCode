@@ -1,0 +1,38 @@
+# Prometheus Adapter configuration for the platform's custom HPA metric.
+#
+# This bridges Prometheus series → the Kubernetes custom-metrics API, which is
+# what lets an HPA scale on `active_contexts_per_pod` (exposed by
+# workspace-runtime's /metrics, see workspace-runtime/src/api/rest/metrics.py)
+# instead of only CPU/memory.
+#
+# Deploy (K8s path):
+#   helm install prometheus-adapter prometheus-community/prometheus-adapter \
+#     -f deploy/prometheus-adapter-config.yaml
+#
+# With the adapter serving the metric, the HPA in deploy/k8s/base/gateway.yaml
+# (and any custom HPA targeting workspace-runtime) resolves as-is:
+#
+#   metrics:
+#     - type: Pods
+#       pods: { metric: { name: active_contexts_per_pod } }
+#       target: { type: AverageValue, averageValue: "12" }
+#
+# Compose/dev path: no adapter exists outside K8s. KEDA is the alternative
+# (ScaledObject referencing the same series); both consume the same endpoint,
+# so nothing in the services changes between paths.
+
+rules:
+  - seriesQuery: 'active_contexts_per_pod{namespace!=""}'
+    # Relabel the scraped series onto the resource the HPA asks about. The
+    # service's scrape config must carry pod/namespace labels (the standard
+    # prometheus.io/scrape annotations do this via the PodMonitor/ServiceMonitor).
+    resources:
+      overrides:
+        namespace:
+          resource: namespace
+        pod:
+          resource: pod
+    name:
+      matches: "^(.*)$"
+      as: "active_contexts_per_pod"
+    metricsQuery: 'avg(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'

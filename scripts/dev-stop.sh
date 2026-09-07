@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
-# Stop all development services and infrastructure.
-set -euo pipefail
+# Stop dev services started by dev-start.sh / dev-backend.sh.
+#
+# Frees every dev port by terminating the WHOLE process group behind each
+# listener (go run + compiled binary, uvicorn reloader + worker, npm + vite),
+# waits up to 10s for a graceful exit, then SIGKILLs the survivors. Docker's
+# port proxies are never signalled — a port owned by a container is reported
+# with a hint instead (make stack-down / infra-down).
+#
+# Docker infrastructure started via INFRA_MODE=docker is deliberately NOT
+# touched here: `make infra-down` owns it.
+set -uo pipefail   # no -e: one failed kill must not abort the sweep
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=scripts/dev-lib.sh
+. "$SCRIPT_DIR/dev-lib.sh"
 
-# Detect docker compose command
-if docker compose version &>/dev/null; then
-  DOCKER_COMPOSE="docker compose"
-elif docker-compose version &>/dev/null; then
-  DOCKER_COMPOSE="docker-compose"
-else
-  echo "WARNING: Docker not found, skipping infrastructure shutdown."
-  DOCKER_COMPOSE=""
-fi
+require_cmd lsof ps
 
-echo "==> Stopping application services..."
-
-# Kill any running dev processes by port
-for port in 5173 8000 8001 8002 8003 50053; do
-  pid=$(lsof -ti ":$port" 2>/dev/null || true)
-  if [ -n "$pid" ]; then
-    echo "    Stopping process on port $port (PID: $pid)"
-    kill "$pid" 2>/dev/null || true
-  fi
+dev_info "stopping dev services"
+for port in $DEV_PORTS; do
+  kill_port_group "$port" "$(dev_port_label "$port")"
 done
 
-echo "==> Stopping infrastructure..."
-if [ -n "$DOCKER_COMPOSE" ]; then
-  cd "$ROOT_DIR"
-  $DOCKER_COMPOSE -f deploy/docker-compose.infra.yml down
+# Grace window, then force-kill whatever of OURS still holds a dev port.
+round=0
+busy=""
+while [ "$round" -lt 20 ]; do
+  busy=""
+  for port in $DEV_PORTS; do
+    if [ -n "$(port_pids_ours "$port")" ]; then
+      busy="yes"
+    fi
+  done
+  [ -z "$busy" ] && break
+  sleep 0.5
+  round=$((round + 1))
+done
+
+if [ -n "$busy" ]; then
+  dev_warn "grace period over — force killing survivors"
+  for port in $DEV_PORTS; do
+    kill_port_group "$port" "$(dev_port_label "$port")" KILL
+  done
 fi
 
-echo "==> All services stopped."
+dev_ok "dev services stopped"
+dev_info "Docker infra (if running) is untouched; stop it with: make infra-down"

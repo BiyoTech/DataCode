@@ -33,20 +33,39 @@ def _truncate_output(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return f"{normalized[:limit]}\n\n... [truncated {omitted} chars]"
 
 
+def _empty_command_result(command: str) -> dict[str, Any]:
+    """Result for a blank command.
+
+    Returned rather than silently skipped: the agent submitted N commands and
+    must receive N results, otherwise it cannot tell which one was dropped.
+    """
+    return {
+        "command": command,
+        "stdout": "",
+        "stderr": "command cannot be empty",
+        "exit_code": -1,
+        "timed_out": False,
+    }
+
+
 class ShellRuntimeBootstrap:
     """Prepare and reuse one agent-local Python 3.13 virtual environment for shell commands."""
 
-    # Resolved once at class load; points to the sqlmesh-cli shim directory
-    _SHIM_DIR: Optional[Path] = None
-
-    def __init__(self, agent_path: str | Path, user_id: str = "", session_id: str = "", environment: str = "") -> None:
+    def __init__(
+    self,
+    agent_path: str | Path,
+    user_id: str = "",
+    session_id: str = "",
+    environment: str = "",
+) -> None:
         self.agent_path = Path(os.path.expanduser(str(agent_path))).resolve()
         self.venv_path = self.agent_path / "venv"
         self._user_id = user_id
         self._session_id = session_id
         # Authoritative active environment selected by the user in the toolbar.
-        # Injected into the sqlmesh shim so plan/apply always target the user's
-        # chosen environment, regardless of what the LLM passes (anti-hallucination).
+        # Carried for the DEV in-process fallback only: in the real path the
+        # runtime derives the environment from the working copy itself, which is
+        # per-environment and therefore cannot be argued with.
         self._environment = environment
 
     def ensure_ready(self) -> None:
@@ -58,35 +77,129 @@ class ShellRuntimeBootstrap:
 
         python_executable = self._ensure_python313()
         self._create_virtualenv(python_executable)
-        logger.info("Shell runtime initialized successfully: agent_path=%s venv=%s", self.agent_path, self.venv_path)
+        logger.info(
+    "Shell runtime initialized successfully: agent_path=%s venv=%s",
+    self.agent_path, self.venv_path,
+)
 
     async def execute_commands(
         self,
         commands: list[str],
         timeout_ms: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        """Execute a batch of shell commands asynchronously inside the prepared workspace.
+        """Execute a batch of shell commands, preferring the isolated executor.
 
         Returns a list of structured result dicts with keys:
           command, stdout, stderr, exit_code, timed_out
+
+        P3d: execution moved OUT of this process. Commands are submitted to
+        workspace-runtime, which runs them in a persistent child with a
+        cleared environment and lowered rlimits, so user code cannot read the
+        platform's database / LLM / encryption credentials (threat T2 — see
+        design 04 §2.3).
+
+        The in-process path below remains only as a DEV fallback for when no
+        runtime endpoint is configured. It carries the old exposure, which is
+        why taking it is logged as a warning.
         """
         effective_timeout = (timeout_ms or DEFAULT_TIMEOUT_MS) / 1000.0
-        results: list[dict[str, Any]] = []
 
+        from src.tools.runtime_client import RuntimeUnavailable, get_runtime_client
+
+        client = get_runtime_client()
+        if client.configured:
+            return await self._execute_via_runtime(
+                client, commands, effective_timeout, RuntimeUnavailable)
+
+        logger.warning(
+            "shell_executing_in_process: no workspace-runtime endpoint configured; "
+            "user commands run WITHOUT executor isolation (dev only) agent_path=%s",
+            self.agent_path,
+        )
+        return await self._execute_locally(commands, effective_timeout)
+
+    async def _execute_via_runtime(
+        self,
+        client: Any,
+        commands: list[str],
+        effective_timeout: float,
+        unavailable_exc: type[Exception],
+    ) -> list[dict[str, Any]]:
+        """Run each command in workspace-runtime's isolated executor."""
+        results: list[dict[str, Any]] = []
         for command in commands:
             normalized = (command or "").strip()
             if not normalized:
+                results.append(_empty_command_result(command))
+                continue
+            try:
+                outcome = await client.shell(
+                    workspace_path=str(self.agent_path),
+                    command=normalized,
+                    timeout_s=effective_timeout,
+                    # Attribution for the apply history when the runtime routes
+                    # this to a governed verb. Sent from here because only this
+                    # side knows the session.
+                    user_id=self._user_id,
+                    session_id=self._session_id,
+                )
+            except unavailable_exc as exc:
+                # Surface as a failed command rather than raising: the agent
+                # must see a result for every command it submitted, and it
+                # must not be told a command ran when it did not.
+                logger.warning(
+                    "shell_runtime_unavailable: command=%s error=%s", normalized, exc)
                 results.append({
-                    "command": command,
+                    "command": normalized,
                     "stdout": "",
-                    "stderr": "command cannot be empty",
+                    "stderr": f"sandbox unavailable: {exc}",
                     "exit_code": -1,
                     "timed_out": False,
                 })
                 continue
 
+            # The runtime reports executor-level errors in-band (e.g. the
+            # restart budget was exhausted) so one broken working copy does
+            # not look like a transport fault.
+            if outcome.get("error_code"):
+                results.append({
+                    "command": normalized,
+                    "stdout": "",
+                    "stderr": f"{outcome['error_code']}: {outcome.get('message', '')}",
+                    "exit_code": -1,
+                    "timed_out": False,
+                })
+                continue
+
+            results.append({
+                "command": normalized,
+                "stdout": _truncate_output(outcome.get("stdout", "")),
+                "stderr": _truncate_output(outcome.get("stderr", "")),
+                "exit_code": outcome.get("exit_code", 0),
+                "timed_out": bool(outcome.get("timed_out")),
+            })
+        return results
+
+    async def _execute_locally(
+        self,
+        commands: list[str],
+        effective_timeout: float,
+    ) -> list[dict[str, Any]]:
+        """DEV fallback: run commands in this process's subprocess.
+
+        No isolation: same uid, same environment, same filesystem view as the
+        agent. Only reachable when workspace-runtime is not configured.
+        """
+        results: list[dict[str, Any]] = []
+
+        for command in commands:
+            normalized = (command or "").strip()
+            if not normalized:
+                results.append(_empty_command_result(command))
+                continue
+
             working_directory = self.agent_path
-            env = self.build_command_env()
+            env = await self.build_command_env()
             shell_cmd = self._build_shell_command(normalized)
 
             logger.info("Executing shell command: cwd=%s command=%s", working_directory, normalized)
@@ -117,6 +230,9 @@ class ShellRuntimeBootstrap:
                     "timed_out": False,
                 })
             except asyncio.TimeoutError:
+                # ``effective_timeout`` is seconds; the message reports
+                # milliseconds, which is what shell users expect.
+                timeout_ms = int(effective_timeout * 1000)
                 logger.warning("Shell command timed out after %sms: %s", timeout_ms, normalized)
                 # Kill the timed-out process
                 try:
@@ -131,7 +247,10 @@ class ShellRuntimeBootstrap:
                     "timed_out": True,
                 })
             except Exception as exc:
-                logger.error("Shell command execution failed: %s error=%s", normalized, exc, exc_info=True)
+                logger.error(
+    "Shell command execution failed: %s error=%s",
+    normalized, exc, exc_info=True,
+)
                 results.append({
                     "command": normalized,
                     "stdout": "",
@@ -158,80 +277,43 @@ class ShellRuntimeBootstrap:
             raise ValueError(f"working directory must stay inside the agent path: {resolved}")
         return resolved
 
-    def build_command_env(self) -> dict[str, str]:
-        """Build one environment that prefers the agent-local virtual environment.
+    async def build_command_env(self) -> dict[str, str]:
+        """Build the environment for the DEV in-process fallback only.
 
-        Prepend the CLI shim directory to PATH so that agent shell commands
-        hit the wrappers first: the sqlmesh wrapper intercepts write
-        operations and redirects them to the sqlmesh-service backend API
-        (read-only commands pass through to the native binary), and the dc
-        wrapper routes platform-domain commands (assets / deployment / run)
-        to the dagster-service backend API.
+        Reachable when no workspace-runtime endpoint is configured, i.e. when
+        commands run in this process with no isolation at all. It therefore
+        carries the agent-local virtualenv and the platform's context variables
+        for tools that read them.
+
+        What it deliberately no longer does is inject a runtime URL and a caller
+        identity so that a CLI shim inside the child could call the platform back.
+        Governed verbs (``sqlmesh plan/apply``, ``dc *``) are now routed by
+        workspace-runtime BEFORE anything is executed (design 04 §3.6), which is
+        the only place that can decide without handing the executing side a way
+        into the platform. A shim on PATH here would be a second, divergent
+        decision point — and in the real (sandboxed) path it is not even
+        reachable.
         """
         env = os.environ.copy()
-        shim_dir = self._resolve_shim_dir()
         venv_bin = str(self._venv_bin_path())
         existing_path = env.get("PATH", "")
 
-        # PATH = {shim_dir}:{venv_bin}:{existing} — shim must come first
-        env["PATH"] = f"{shim_dir}{os.pathsep}{venv_bin}{os.pathsep}{existing_path}" if existing_path else f"{shim_dir}{os.pathsep}{venv_bin}"
+        env["PATH"] = (
+            f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
+        )
         env["VIRTUAL_ENV"] = str(self.venv_path)
         env.pop("PYTHONHOME", None)
 
-        # Inject datacode platform context for the wrapper script
+        # Platform context for tools that read it (never a platform address or
+        # credential).
         env["DATACODE_WORKSPACE_PATH"] = str(self.agent_path)
         env["DATACODE_TRIGGER_TYPE"] = "agent"
         env["DATACODE_USER_ID"] = self._user_id
         env["DATACODE_SESSION_ID"] = self._session_id
-        # Authoritative active environment (from toolbar). The shim treats this
-        # as the single source of truth for plan/apply and overrides any
-        # environment the LLM may have hallucinated in the command arguments.
         if self._environment:
             env["DATACODE_ENVIRONMENT"] = self._environment
 
-        try:
-            from src.config import settings
-            env["DATACODE_SQLMESH_SERVICE_URL"] = settings.sqlmesh_service_url
-        except Exception:
-            # Fallback to default if settings not available (e.g. tests)
-            env["DATACODE_SQLMESH_SERVICE_URL"] = "http://localhost:8002"
-
-        # Dagster service URL for the dc platform CLI shim (assets /
-        # deployment / run commands). Same fallback pattern as above.
-        try:
-            from src.config import settings
-            env["DATACODE_DAGSTER_SERVICE_URL"] = settings.dagster_service_url
-        except Exception:
-            env["DATACODE_DAGSTER_SERVICE_URL"] = "http://localhost:8004"
-
-        logger.debug("sqlmesh_shim_injected: shim_dir=%s agent_path=%s user_id=%s", shim_dir, self.agent_path, self._user_id)
         return env
-
-    @classmethod
-    def _resolve_shim_dir(cls) -> str:
-        """Resolve the sqlmesh-cli shim directory relative to the repo root.
-
-        shell.py lives at agent-service/src/tools/shell.py; the shim is at
-        scripts/sqlmesh-cli/ relative to the repo root.
-        """
-        if cls._SHIM_DIR is not None:
-            return str(cls._SHIM_DIR)
-
-        # Walk up from this file to find the repo root
-        candidate = Path(__file__).resolve().parents[3] / "scripts" / "sqlmesh-cli"
-        if candidate.is_dir():
-            cls._SHIM_DIR = candidate
-            return str(candidate)
-
-        # Fallback: relative to cwd (may be repo root in dev)
-        fallback = Path.cwd() / "scripts" / "sqlmesh-cli"
-        if fallback.is_dir():
-            cls._SHIM_DIR = fallback
-            return str(fallback)
-
-        logger.warning("sqlmesh_shim_dir_not_found: tried %s and %s", candidate, fallback)
-        cls._SHIM_DIR = candidate  # use expected path anyway
-        return str(candidate)
 
     def _ensure_python313(self) -> Path:
         """Locate a Python 3.13 interpreter and return its executable path.
@@ -272,7 +354,10 @@ class ShellRuntimeBootstrap:
 
         detected = self._find_python313_executable()
         if detected is None:
-            raise RuntimeError(f"Python {PYTHON_VERSION} installation finished but no usable interpreter was found")
+            raise RuntimeError(
+    f"Python {PYTHON_VERSION} installation finished "
+    "but no usable interpreter was found"
+)
         logger.info("python_auto_install_succeeded", interpreter=str(detected))
         return detected
 
@@ -310,7 +395,10 @@ class ShellRuntimeBootstrap:
 
         try:
             completed = subprocess.run(
-                [*command, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{sys.executable}')"],
+                [
+    *command, "-c",
+    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{sys.executable}')",
+],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -365,7 +453,9 @@ class ShellRuntimeBootstrap:
                 )
                 brew_executable = self._detect_brew_executable()
             if brew_executable is None:
-                raise RuntimeError("Homebrew installation finished but the brew executable is still unavailable")
+                raise RuntimeError(
+    "Homebrew installation finished but the brew executable is still unavailable"
+)
             self._run_checked([str(brew_executable), "install", "python@3.13"])
             return
 
@@ -373,7 +463,9 @@ class ShellRuntimeBootstrap:
             prefix = self._privileged_prefix()
             if shutil.which("apt-get"):
                 self._run_checked([*prefix, "apt-get", "update"])
-                self._run_checked([*prefix, "apt-get", "install", "-y", "python3.13", "python3.13-venv"])
+                self._run_checked(
+    [*prefix, "apt-get", "install", "-y", "python3.13", "python3.13-venv"]
+)
                 return
             if shutil.which("dnf"):
                 self._run_checked([*prefix, "dnf", "install", "-y", "python3.13"])
@@ -381,11 +473,15 @@ class ShellRuntimeBootstrap:
             if shutil.which("yum"):
                 self._run_checked([*prefix, "yum", "install", "-y", "python3.13"])
                 return
-            raise RuntimeError("Unsupported Linux environment for automatic Python 3.13 installation")
+            raise RuntimeError(
+    "Unsupported Linux environment for automatic Python 3.13 installation"
+)
 
         if system_name == "Windows":
             if shutil.which("winget") is None:
-                raise RuntimeError("winget is required for automatic Python 3.13 installation on Windows")
+                raise RuntimeError(
+    "winget is required for automatic Python 3.13 installation on Windows"
+)
             self._run_checked(
                 [
                     "winget",
@@ -400,7 +496,10 @@ class ShellRuntimeBootstrap:
             )
             return
 
-        raise RuntimeError(f"Unsupported operating system for automatic Python 3.13 installation: {system_name}")
+        raise RuntimeError(
+    "Unsupported operating system for automatic Python 3.13 installation: "
+    f"{system_name}"
+)
 
     def _detect_brew_executable(self) -> Optional[Path]:
         """Locate the Homebrew executable from PATH or standard macOS install paths."""
@@ -431,9 +530,15 @@ class ShellRuntimeBootstrap:
         if self._is_venv_ready():
             return
 
-        self._run_checked([str(python_executable), "-m", "venv", str(self.venv_path)], cwd=str(self.agent_path))
+        self._run_checked(
+    [str(python_executable), "-m", "venv", str(self.venv_path)],
+    cwd=str(self.agent_path),
+)
         if not self._is_venv_ready():
-            raise RuntimeError(f"Virtual environment creation finished but venv is still invalid: {self.venv_path}")
+            raise RuntimeError(
+    f"Virtual environment creation finished but venv is still invalid: "
+    f"{self.venv_path}"
+)
         logger.info("Created shell venv: %s", self.venv_path)
 
     def _is_venv_ready(self) -> bool:
@@ -485,7 +590,12 @@ class ShellRuntimeBootstrap:
 # ══════════════════════════════════════════════════════════════
 
 
-def create_native_shell_tool(agent_path: Optional[str] = None, user_id: str = "", session_id: str = "", environment: str = "") -> Any:
+def create_native_shell_tool(
+    agent_path: Optional[str] = None,
+    user_id: str = "",
+    session_id: str = "",
+    environment: str = "",
+) -> Any:
     """Create a FunctionTool-based shell tool with async batch execution.
 
     Returns an agents.FunctionTool instance compatible with both
@@ -509,7 +619,10 @@ def create_native_shell_tool(agent_path: Optional[str] = None, user_id: str = ""
     if not agent_path:
         raise ValueError("agent_path is required for shell tool")
 
-    bootstrap = ShellRuntimeBootstrap(agent_path, user_id=user_id, session_id=session_id, environment=environment)
+    bootstrap = ShellRuntimeBootstrap(
+    agent_path, user_id=user_id,
+    session_id=session_id, environment=environment,
+)
     bootstrap.ensure_ready()
 
     import json
@@ -522,7 +635,8 @@ def create_native_shell_tool(agent_path: Optional[str] = None, user_id: str = ""
                 "items": {"type": "string"},
                 "description": (
                     "List of shell commands to execute sequentially inside the agent workspace. "
-                    "Each command runs in the workspace root with the agent-local Python venv activated."
+                    "Each command runs in the workspace root with the agent-local "
+        "Python venv activated."
                 ),
             },
             "timeout_ms": {
@@ -652,7 +766,8 @@ def create_native_shell_tool(agent_path: Optional[str] = None, user_id: str = ""
         description=(
             "Execute shell commands inside the agent workspace. Supports batch execution of "
             "multiple commands sequentially. The workspace has a Python 3.13 venv activated. "
-            "Returns structured JSON with stdout, stderr, exit_code, and timed_out for each command."
+            "Returns structured JSON with stdout, stderr, exit_code, and "
+        "timed_out for each command."
         ),
         params_json_schema=_PARAMS_SCHEMA,
         on_invoke_tool=_on_invoke,

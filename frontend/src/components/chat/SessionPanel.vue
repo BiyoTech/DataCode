@@ -20,7 +20,9 @@ export interface SessionStoreLike {
   sessions: ChatSession[]
   currentSessionId: string | null
   sessionPanelOpen: boolean
-  createNewSession: () => Promise<void>
+  // Returns the new session's id (undefined when creation failed) — the
+  // caller may need it to navigate; swallowing it as `void` would hide that.
+  createNewSession: () => Promise<string | undefined>
   switchSession: (id: string) => Promise<void>
   deleteSession: (id: string) => Promise<void>
   toggleSessionPanel: () => void

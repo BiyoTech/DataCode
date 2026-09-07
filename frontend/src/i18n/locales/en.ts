@@ -203,8 +203,31 @@ export default {
         'The remote branch has commits your local branch does not. Pull first, then push again.',
       branchNotFound: 'The requested branch does not exist on {host}.',
       hostUnreachable: '{host} could not be reached. Check the network and the server URL.',
+      repoCreationDenied:
+        'The token for {host} may not create a repository under that owner. Grant it permission to create repositories in the target organization (GitHub: fine-grained token → Administration: Read and write on the organization, or classic token → "repo" plus org access), or point the URL at an owner it may write to.',
+      repoCreationFailed:
+        'Creating the repository on {host} failed. Check that the name is still free and that the credential is valid.',
+      remoteEmpty: 'The repository on {host} exists but has no branches yet.',
       unknown: 'The Git operation on {host} failed. See the workspace logs for details.',
     },
+    // Quota rejections (429). The backend sends the resource, the ceiling and
+    // the current count, so the sentence can say WHICH budget ran out — without
+    // it the user only sees a bare "request failed".
+    quota: {
+      default:
+        'You have reached your organization quota for this resource. Free up resources or contact an administrator to raise the limit.',
+      exceeded:
+        'Your organization has reached its {resource} quota ({current}/{limit}). Free up resources or contact an administrator to raise the limit.',
+      workspace: 'workspace',
+      environment: 'environment',
+      concurrent_leases: 'open working copy',
+      runtime_replicas: 'runtime capacity',
+    },
+    // Working-copy relocation (503 WORKSPACE_RELOCATING, design 03 §4.3). The
+    // API client retries these transparently; this line is what the user sees
+    // while that happens — the platform is moving the copy, nothing failed.
+    relocating:
+      'This working copy is moving to another runtime; your request continues automatically…',
   },
   rbac: {
     title: 'Roles & Permissions',
@@ -246,14 +269,17 @@ export default {
     gitRepoUrl: 'Git Repository URL',
     gitRepoUrlPlaceholder: 'https://gitea.example.com/org/repo.git',
     gitRepoUrlHint: 'Optional. Bind a remote Git repo for version control.',
+    gitRepoAutoCreateHint:
+      'If the repository does not exist it is created as a private repo and seeded with the workspace template. If it already contains code, that code is reused as-is and no template is written.',
     bindGit: 'Bind Git Repository',
     bindGitHint: 'Push existing workspace code to this remote repository.',
     bind: 'Bind',
     bindGitFailed: 'Failed to bind Git repository',
     delete: 'Delete Workspace',
     deleteTitle: 'Delete Workspace',
-    deleteConfirm: 'Delete "{name}"? All members\' local copies will be removed. This cannot be undone.',
-    deleteAlsoRemote: 'Also delete the remote repository: {url}',
+    deleteConfirm:
+      'Delete "{name}"? Its working copies, environments, leases, drafts, knowledge base and apply history are removed permanently. This cannot be undone.',
+    deleteKeepsRemote: 'The remote repository is kept untouched: {url}',
     deleteFailed: 'Failed to delete workspace',
     noPermission: 'You do not have permission to perform this operation.',
     syncToRemote: 'Sync to Remote',
@@ -612,6 +638,19 @@ export default {
     mdSplit: 'Split View',
     mdPreview: 'Preview',
     closeTab: 'Close tab',
+    // Draft autosave (design 07 Q6): shown when a newer draft was restored.
+    draftRestored: 'Restored an unsaved draft for {file}',
+  },
+  // File explorer. Deletion is its only irreversible action, and for a folder
+  // it takes the whole subtree — hence the double naming (title + body) in the
+  // confirmation dialog that guards it.
+  files: {
+    deleteFileTitle: 'Delete file',
+    deleteFileConfirm: 'Delete "{name}"? This cannot be undone.',
+    deleteDirTitle: 'Delete folder',
+    deleteDirConfirm:
+      'Delete "{name}" and everything inside it? This cannot be undone.',
+    deleted: 'Deleted',
   },
   workspaceInfo: {
     title: 'Workspace',
@@ -619,6 +658,28 @@ export default {
     dialect: 'SQL Dialect',
     environment: 'Environment',
     status: 'Status',
+  },
+  // Organization quota panel (Settings → Organization → Quota). Keys are read
+  // by QuotaPanel.vue and by the 429 localization in notifyError.ts.
+  quotas: {
+    title: 'Quota & Usage',
+    description:
+      'Resource ceilings for your organization and how much is currently in use. These are the budgets the platform enforces when creating workspaces and environments.',
+    loading: 'Loading quota…',
+    loadFailed: 'Failed to load quota.',
+    retry: 'Retry',
+    exhausted: 'Limit reached',
+    // "Unknown" is a real state: the platform fails open when it cannot count,
+    // and showing 0 at that moment would claim a measurement never made.
+    unknown: 'unknown',
+    workspace: 'Workspaces',
+    environment: 'Environments',
+    concurrent_leases: 'Open working copies',
+    runtime_replicas: 'Runtime capacity',
+    peakLeases:
+      'Peak open working copies recently observed: {peak}. Capacity planning input — the live count above may be lower.',
+    contactAdmin:
+      'To raise a limit, free up resources or contact an organization administrator.',
   },
   settings: {
     title: 'Settings',
@@ -1035,6 +1096,33 @@ export default {
       deleted: 'Deleted',
       conflict: 'Conflict',
       containsChanges: 'Contains changes',
+    },
+    // WIP durability contract (design 07 Q6): user-facing visibility of the
+    // "a crash loses at most one snapshot interval" promise.
+    wip: {
+      lastProtected: 'Protected {time}',
+      neverProtected: 'Not protected yet',
+      neverProtectedTooltip: 'No WIP snapshot has been taken yet',
+      unprotectedBanner:
+        'Your changes are not protected: the last snapshot failed',
+      pendingBanner: 'A snapshot of uncommitted changes awaits your decision',
+      review: 'Review',
+      pendingTitle: 'Uncommitted changes found',
+      pendingBody:
+        'A snapshot of your uncommitted work, taken {time}, was found on the Git server.',
+      pendingBodyUnknownAge:
+        'A snapshot of your uncommitted work was found on the Git server.',
+      pendingPausedHint:
+        "Until you decide, new changes in this working copy are not protected.",
+      pendingDiscardHint:
+        'Discard removes the snapshot permanently; it cannot be undone.',
+      recover: 'Recover',
+      discard: 'Discard',
+      decideLater: 'Decide later',
+      recoverSuccess: 'Snapshot recovered into your working copy',
+      recoverFailed: 'Recovering the snapshot failed',
+      discardSuccess: 'Snapshot discarded',
+      discardFailed: 'Discarding the snapshot failed',
     },
   },
   time: {

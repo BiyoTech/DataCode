@@ -1,0 +1,46 @@
+# Profile: k8s-global — the GLOBAL tier in Kubernetes (DATACODE_ENV=k8s-global)
+#
+# Delivered as a ConfigMap generated from this conf/ directory by
+# deploy/k8s/overlays/global. This tier runs identity-service and its migration
+# Job, in its own namespace (`datacode-global`) so a cell namespace's blast
+# radius cannot include it.
+#
+# Availability contract: reached on the LOGIN path only. An outage here leaves
+# existing sessions working inside their cells (the gateway decides from a
+# cached authorization snapshot) and fails only new logins. Nothing that must
+# be reached on every request may be moved into this tier.
+
+database:
+  host: "global-pg.datacode-global.svc.cluster.local"
+  port: 5432
+  name: "identity"
+  username: "datacode"
+  # password: env-only (DB_PASSWORD, from Secret datacode-db)
+  pool_size: 10
+  pool_overflow: 20
+
+  services:
+    # The same target, stated explicitly: identity-service reads this entry
+    # when present, so omitting it would work only while the top-level values
+    # happen to match.
+    identity:
+      type: "postgresql"
+      host: "global-pg.datacode-global.svc.cluster.local"
+      port: 5432
+      name: "identity"
+      username: "datacode"
+
+cells:
+  expect_global_db: true
+
+redis:
+  # ON here, unlike the compose `global` profile: a Kubernetes deployment runs
+  # more than one identity replica, and a per-replica in-process limiter would
+  # multiply the effective login rate limit by the replica count.
+  enabled: true
+  host: "redis.datacode-global.svc.cluster.local"
+  port: 6379
+
+services:
+  identity:
+    rest_url: "http://identity-service.datacode-global.svc.cluster.local:8003"

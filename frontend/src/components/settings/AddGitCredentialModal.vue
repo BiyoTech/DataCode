@@ -51,11 +51,19 @@ const providers: { value: string; label: string }[] = [
   { value: 'custom', label: 'Custom' },
 ]
 
-/** Public host a provider serves when no explicit server URL is given. */
+/**
+ * Public host a provider serves when no explicit server URL is given.
+ *
+ * Must stay identical to `PROVIDER_DEFAULT_HOSTS` in
+ * `shared/python/datacode_common/git_providers.py`: the backend stores the host
+ * this preview shows, and a mismatch means the credential this dialog creates is
+ * later not found for the repository. A backend test asserts the two agree.
+ */
 const PROVIDER_DEFAULT_HOSTS: Record<string, string> = {
   github: 'github.com',
   gitlab: 'gitlab.com',
   bitbucket: 'bitbucket.org',
+  gitea: 'gitea.com',
 }
 
 /**

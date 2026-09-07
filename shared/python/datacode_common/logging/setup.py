@@ -16,6 +16,10 @@ def setup_logging(
 ) -> None:
     """Configure structlog for JSON-based structured logging.
 
+    Every log line this process emits carries ``cell_id`` bound once here
+    (design 03, P1): multi-cell operations must be able to filter by cell
+    from day one, even while only cell-0 exists.
+
     Args:
         level: Root log level name.
         basic_format: Format string for the stdlib handler behind structlog.
@@ -25,6 +29,12 @@ def setup_logging(
             It runs just before rendering, so it sees the fully enriched event
             dict while stdout output stays byte-for-byte unchanged.
     """
+    from datacode_common.cell import cell_id
+
+    # Bind once per process: the cell does not change during a lifetime, and
+    # contextvars-bound values would need clearing per task for no benefit.
+    structlog.contextvars.bind_contextvars(cell_id=cell_id())
+
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.filter_by_level,

@@ -19,7 +19,9 @@ import { useI18n } from 'vue-i18n'
 import { useGitStore, type CommitFile, type CommitInfo } from '@/stores/git'
 import { useEnvironmentStore } from '@/stores/environment'
 import { useFileStore } from '@/stores/files'
-import { formatLocalTime } from '@/utils/timezone'
+import { useWipStore } from '@/stores/wip'
+import { useNow } from '@/composables/useNow'
+import { formatLocalTime, formatRelativeTime } from '@/utils/timezone'
 import { baseName, kindOfStatus, letterOfStatus } from '@/utils/gitDecoration'
 import IconButton from '@/components/common/IconButton.vue'
 
@@ -27,6 +29,7 @@ const { t } = useI18n()
 const gitStore = useGitStore()
 const environmentStore = useEnvironmentStore()
 const fileStore = useFileStore()
+const wipStore = useWipStore()
 
 // UI state
 // Collapsed directory paths in the changed-files tree.
@@ -36,8 +39,43 @@ const syncLabel = computed(() => {
   const parts: string[] = []
   if (gitStore.ahead > 0) parts.push(`↑${gitStore.ahead}`)
   if (gitStore.behind > 0) parts.push(`↓${gitStore.behind}`)
-  return parts.length > 0 ? parts.join(' ') : ''
+  return parts.length ? parts.join(' ') : ''
 })
+
+// ---- WIP durability contract (design 07 Q6) ----
+// The indicator only matters while there is uncommitted work to lose; a clean
+// working copy has nothing for the snapshot to protect.
+const now = useNow()
+
+const showWipIndicator = computed(
+  () => wipStore.isEnabled && !gitStore.isClean,
+)
+
+/** True when the last protection is older than one snapshot interval. */
+const wipIsStale = computed(() => {
+  if (!wipStore.lastProtectedAt) return true
+  const elapsedMs = now.value - Date.parse(wipStore.lastProtectedAt)
+  return elapsedMs > wipStore.snapshotIntervalSeconds * 1000
+})
+
+const wipLabel = computed(() =>
+  wipStore.lastProtectedAt
+    ? t('git.wip.lastProtected', {
+        time: formatRelativeTime(wipStore.lastProtectedAt),
+      })
+    : t('git.wip.neverProtected'),
+)
+
+/** Tooltip shows the exact local wall-clock time behind the relative label. */
+const wipTooltip = computed(() =>
+  wipStore.lastProtectedAt
+    ? formatLocalTime(wipStore.lastProtectedAt, 'YYYY-MM-DD HH:mm:ss')
+    : t('git.wip.neverProtectedTooltip'),
+)
+
+function reopenWipDialog(): void {
+  wipStore.dialogVisible = true
+}
 
 /** One-letter badge and colour class, shared with the file tree decoration. */
 function statusIcon(status: string): string {
@@ -338,9 +376,45 @@ onMounted(async () => {
   <div class="git-detail">
     <!-- Left: Branches panel -->
     <div class="branches-pane">
+      <!-- WIP degradation banner: a dirty copy whose last snapshot FAILED.
+           This is the "you are not protected" warning the durability contract
+           (design 07 Q6) requires — without it the user assumes protection
+           that does not exist. -->
+      <div
+        v-if="wipStore.isEnabled && !wipStore.isProtected"
+        class="wip-banner error"
+      >
+        <t-icon name="error-circle" size="14px" />
+        <span>{{ t('git.wip.unprotectedBanner') }}</span>
+      </div>
+      <!-- Pending snapshot whose dialog was deferred: protection stays paused
+           until the user decides, so keep a non-blocking way back in. -->
+      <div
+        v-else-if="wipStore.pendingSnapshot && !wipStore.dialogVisible"
+        class="wip-banner warn"
+      >
+        <t-icon name="time" size="14px" />
+        <span>{{ t('git.wip.pendingBanner') }}</span>
+        <button class="wip-banner-action" type="button" @click="reopenWipDialog">
+          {{ t('git.wip.review') }}
+        </button>
+      </div>
+
       <div class="pane-header">
         <span class="pane-title" :title="gitStore.currentBranch">{{ gitStore.currentBranch }}</span>
         <span v-if="syncLabel" class="sync-badge">{{ syncLabel }}</span>
+        <!-- WIP indicator: makes the protection window visible (design 07
+             Q6). Grey while fresh; warning colour once it exceeds one
+             snapshot interval. -->
+        <span
+          v-if="showWipIndicator"
+          class="wip-badge"
+          :class="{ stale: wipIsStale }"
+          :title="wipTooltip"
+        >
+          <t-icon name="secured" size="12px" />
+          {{ wipLabel }}
+        </span>
         <div class="pane-actions">
           <IconButton
             class="pane-action"
@@ -802,6 +876,57 @@ onMounted(async () => {
   color: var(--accent);
   padding: 1px 5px;
   border-radius: 8px;
+}
+
+/* ---- WIP durability contract (design 07 Q6) ---- */
+.wip-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.wip-badge.stale {
+  color: var(--warning, #ed7b2f);
+}
+
+.wip-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+}
+
+.wip-banner.error {
+  color: var(--error, #e34d59);
+  background: var(--error-subtle, rgba(227, 77, 89, 0.06));
+}
+
+.wip-banner.warn {
+  color: var(--warning, #ed7b2f);
+}
+
+.wip-banner-action {
+  margin-left: auto;
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.wip-banner-action:hover {
+  opacity: 1;
 }
 
 /* Header / row action buttons — revealed on hover to keep rows quiet. */

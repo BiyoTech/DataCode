@@ -1,0 +1,66 @@
+# Kustomize base — the full platform, parameterized by the overlays.
+#
+# What the overlays change:
+#   global   keep ONLY identity (+ its migrate job); DATACODE_ENV=k8s-global
+#   cell     everything, in the datacode namespace; DATACODE_ENV=k8s-cell
+#   kind     the cell shape, scaled down + NodePort, for local verification
+#
+# The conf ConfigMap is generated from the repository's conf/ directory, so
+# the SAME files a host dev run uses are what a cluster pod reads. Its name
+# carries a content hash: editing any profile re-renders the ConfigMap and
+# triggers a rolling update of everything mounting it — without the hash,
+# config changes need a manual `rollout restart`, which is a step everyone
+# forgets eventually.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - gateway.yaml
+  - identity-service.yaml
+  - control-service.yaml
+  - agent-service.yaml
+  - workspace-runtime.yaml
+  - frontend.yaml
+  - ingress.yaml
+  - migrate-job.yaml
+  - dagster-container-plane.yaml
+  - nodepool-user-code.yaml
+  - egress-plane.yaml
+
+configMapGenerator:
+  - name: datacode-conf
+    # The neutral base plus the profiles every consumer may select. Service
+    # yaml files are included too: they are mounted together and a service
+    # reading its own yaml from CONFIG_PATH must find it in the ConfigMap.
+    files:
+      - ../../../conf/platform.yaml
+      - ../../../conf/platform.dev.yaml
+      - ../../../conf/platform.docker.yaml
+      - ../../../conf/platform.cell.yaml
+      - ../../../conf/platform.global.yaml
+      - ../../../conf/platform.k8s-cell.yaml
+      - ../../../conf/platform.k8s-global.yaml
+      - ../../../conf/gateway.yaml
+      - ../../../conf/agent-service.yaml
+      - ../../../conf/control-service.yaml
+      - ../../../conf/workspace-runtime.yaml
+      - ../../../conf/isolation-profiles.yaml
+      - ../../../conf/shell-command-policy.yaml
+    options:
+      disableNameSuffixHash: false
+
+images:
+  - name: datacode/gateway
+    newTag: latest
+  - name: datacode/identity-service
+    newTag: latest
+  - name: datacode/control-service
+    newTag: latest
+  - name: datacode/agent-service
+    newTag: latest
+  - name: datacode/workspace-runtime
+    newTag: latest
+  - name: datacode/frontend
+    newTag: latest
+  - name: datacode/egress-proxy
+    newTag: latest

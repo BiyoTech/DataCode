@@ -1,0 +1,77 @@
+# Frontend — nginx serving the built SPA and reverse-proxying the gateway.
+#
+# ONE origin for the browser: static assets, /api and /ws all arrive here and
+# are forwarded to the gateway Service, which is why the gateway's own Service
+# is ClusterIP-only in this base.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: datacode
+  labels:
+    app: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: datacode
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: datacode/frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            # Substituted into nginx.conf at container start: the gateway's
+            # in-cluster address. The frontend reads no platform config, which
+            # is why it has no CONFIG_PATH/DATACODE_ENV and no conf mount.
+            - name: GATEWAY_UPSTREAM
+              value: gateway:8000
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: datacode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: frontend

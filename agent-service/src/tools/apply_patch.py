@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.event_bus import event_bus
 from src.context.session import session_manager
 from src.context.tool_context import ToolContext

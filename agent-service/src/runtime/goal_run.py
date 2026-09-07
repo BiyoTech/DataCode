@@ -12,10 +12,10 @@ import hashlib
 import typing as t
 from dataclasses import dataclass
 
-from agents import Runner, RunConfig, RunState
 from agents.exceptions import MaxTurnsExceeded
 from agents.extensions.handoff_filters import remove_all_tools
 
+from agents import RunConfig, Runner, RunState
 from src.context.execution_style import ExecutionPolicy
 from src.context.session import SessionContext, session_manager
 from src.context.tool_context import ToolContext
@@ -351,6 +351,10 @@ async def run_agent_goal_loop(
             max_turns=max_turns,
             run_config=RunConfig(model=llm_model, handoff_input_filter=remove_all_tools),
         )
+        # Record the live streamed result so a cancel request can reach it.
+        # The task itself is owned by track_chat_run (which also releases the
+        # cross-replica registration); this only refreshes the handle payload,
+        # never the entry's lifetime.
         active_chat_runs[session_id] = {
             "task": asyncio.current_task(),
             "result": result,
@@ -426,7 +430,9 @@ async def run_agent_goal_loop(
             logger.info("agent_run_cancelled", session_id=session_id)
             await publish_and_persist(
                 session_id,
-                agent_finish(session_id, agent_name=outcome.current_agent_name, outcome="cancelled"),
+                agent_finish(
+    session_id, agent_name=outcome.current_agent_name, outcome="cancelled",
+),
             )
             outcome.cancelled = True
             return outcome
@@ -510,9 +516,6 @@ async def run_agent_goal_loop(
                 ),
             )
             continue
-
-        finally:
-            active_chat_runs.pop(session_id, None)
 
 
 async def finalize_goal_outcome(session: SessionContext, outcome: AgentRunOutcome) -> None:

@@ -9,11 +9,11 @@ Each ChatSession maintains:
 Uses an in-memory cache layer for active sessions with async DB write-through.
 """
 
-import typing as t
-import uuid
-import os
 import asyncio
 import json
+import os
+import typing as t
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -337,6 +337,35 @@ class SessionManager:
                 evicted_path, _ = self._workspace_context_cache.popitem(last=False)
                 logger.info("workspace_context_evicted_from_cache", workspace_path=evicted_path)
 
+    def invalidate_cached_session(self, session_id: str) -> bool:
+        """Drop a session from the local cache (cross-replica invalidation).
+
+        Called when ANOTHER replica wrote to the session: our cached copy is
+        now stale, and the next read must go back to the DB. Skipped while a
+        chat run is active on THIS replica — the running task holds the object
+        and its final writes re-cache the authoritative state, so dropping it
+        mid-run would only churn.
+        """
+        from src.runtime.active_runs import active_chat_runs
+
+        if session_id in active_chat_runs:
+            return False
+        evicted = self._sessions.pop(session_id, None)
+        if evicted is not None:
+            logger.info("session_cache_invalidated", session_id=session_id)
+        return evicted is not None
+
+    @staticmethod
+    def _broadcast_invalidation(session_id: str) -> None:
+        """Tell other replicas their cached copy went stale (best-effort).
+
+        Throttled inside the coordination layer, so calling this per message is
+        cheap even though a chat turn appends many.
+        """
+        from src.runtime.session_coordination import get_session_coordination
+
+        get_session_coordination().broadcast_cache_invalidation(session_id)
+
     # ================================================================
     # Public API
     # ================================================================
@@ -399,10 +428,14 @@ class SessionManager:
         and memory_summaries (manual cascade since they lack FK on session_id).
         Returns True if deleted.
         """
-        from src.context.database import (
-            get_session_factory, SessionRow, MemoryEventRow, MemorySummaryRow,
-        )
         from sqlalchemy import delete, select
+
+        from src.context.database import (
+            MemoryEventRow,
+            MemorySummaryRow,
+            SessionRow,
+            get_session_factory,
+        )
 
         # Remove from in-memory cache
         self._sessions.pop(session_id, None)
@@ -430,6 +463,7 @@ class SessionManager:
                 await db.commit()
                 deleted = result.rowcount > 0
                 if deleted:
+                    self._broadcast_invalidation(session_id)
                     logger.info("session_deleted", session_id=session_id)
                 else:
                     logger.warning("session_delete_not_found", session_id=session_id)
@@ -440,8 +474,9 @@ class SessionManager:
 
     async def update_session_title_async(self, session_id: str, title: str) -> bool:
         """Update session title (used for rename or auto-title generation)."""
-        from src.context.database import get_session_factory, SessionRow
         from sqlalchemy import update
+
+        from src.context.database import SessionRow, get_session_factory
 
         # Update in-memory cache
         session = self._sessions.get(session_id)
@@ -457,6 +492,7 @@ class SessionManager:
                 )
                 await db.execute(stmt)
                 await db.commit()
+                self._broadcast_invalidation(session_id)
                 logger.info("session_title_updated", session_id=session_id, title=title)
                 return True
         except Exception as e:
@@ -528,8 +564,9 @@ class SessionManager:
 
     async def set_execution_style_async(self, session_id: str, execution_style: str) -> bool:
         """Switch session execution style and persist it to the database."""
-        from src.context.database import get_session_factory, SessionRow
         from sqlalchemy import update
+
+        from src.context.database import SessionRow, get_session_factory
 
         session = await self.get_session_async(session_id)
         if not session:
@@ -547,6 +584,7 @@ class SessionManager:
                 )
                 await db.execute(stmt)
                 await db.commit()
+            self._broadcast_invalidation(session_id)
             logger.info(
                 "session_execution_style_persisted",
                 session_id=session_id,
@@ -563,8 +601,9 @@ class SessionManager:
 
     async def persist_runtime_context_async(self, session: SessionContext) -> None:
         """Persist last-known workspace/environment for session reload."""
-        from src.context.database import get_session_factory, SessionRow
         from sqlalchemy import update
+
+        from src.context.database import SessionRow, get_session_factory
 
         try:
             async with get_session_factory()() as db:
@@ -636,8 +675,16 @@ class SessionManager:
         tool_call_id: str = "",
     ) -> None:
         """Append message to session history and persist to DB."""
-        self.add_message(session_id, role, content, metadata, tool_calls=tool_calls, tool_call_id=tool_call_id)
-        await self._persist_message(session_id, role, content, metadata, tool_calls=tool_calls, tool_call_id=tool_call_id)
+        self.add_message(
+    session_id, role, content, metadata,
+    tool_calls=tool_calls, tool_call_id=tool_call_id,
+)
+        await self._persist_message(
+    session_id, role, content, metadata,
+    tool_calls=tool_calls, tool_call_id=tool_call_id,
+)
+        # Other replicas may hold this session in cache: their copy is stale now.
+        self._broadcast_invalidation(session_id)
 
     async def persist_run_items_async(
         self,
@@ -750,7 +797,10 @@ class SessionManager:
 
         # Inject summary as context if older messages were summarized (L2 events exist)
         if session.last_summarized_message_count is not None:
-            summary_text = f"[Earlier conversation covered {len(older)} messages. Key events are available in memory — use memory_read for details.]"
+            summary_text = (
+    f"[Earlier conversation covered {len(older)} messages. Key events are "
+    "available in memory — use memory_read for details.]"
+)
             result.append({
                 "role": "user",
                 "content": f"[Previous conversation context]\n{summary_text}",
@@ -761,7 +811,9 @@ class SessionManager:
         result.extend(self._format_messages_for_sdk(_sanitize_tool_message_sequence(recent)))
         return result
 
-    def _format_messages_for_sdk(self, messages: t.List[t.Dict[str, t.Any]]) -> t.List[t.Dict[str, t.Any]]:
+    def _format_messages_for_sdk(
+    self, messages: t.List[t.Dict[str, t.Any]]
+) -> t.List[t.Dict[str, t.Any]]:
         """Format messages into openai-agents SDK (Responses API) input items.
 
         The SDK treats `input` as a list of Responses API items, NOT ChatCompletions
@@ -789,7 +841,8 @@ class SessionManager:
 
             # 2) Assistant message carrying tool calls -> one function_call item each
             if msg.get("tool_calls"):
-                # Preserve any assistant text as a separate plain message (keep {role, content} only)
+                # Preserve any assistant text as a separate plain message
+# (keep {role, content} only)
                 content = msg.get("content")
                 if content:
                     formatted.append({"role": "assistant", "content": content})
@@ -828,7 +881,7 @@ class SessionManager:
 
         If scenario is provided, filter sessions by scenario ('dev' | 'chatbi').
         """
-        from src.context.database import get_session_factory, SessionRow
+        from src.context.database import SessionRow, get_session_factory
 
         async with get_session_factory()() as db:
             from sqlalchemy import select
@@ -889,7 +942,7 @@ class SessionManager:
         Called alongside event_bus.publish() during agent streaming. Events
         are loaded from DB when the frontend reconnects to rebuild the Timeline.
         """
-        from src.context.database import get_session_factory, TimelineEventRow
+        from src.context.database import TimelineEventRow, get_session_factory
 
         try:
             async with get_session_factory()() as db:
@@ -903,12 +956,16 @@ class SessionManager:
                 db.add(row)
                 await db.commit()
         except Exception as e:
-            logger.error("timeline_event_persist_failed", session_id=session_id, event_type=event_type, error=str(e))
+            logger.error(
+    "timeline_event_persist_failed",
+    session_id=session_id, event_type=event_type, error=str(e),
+)
 
     async def get_timeline_events_async(self, session_id: str) -> t.List[t.Dict[str, t.Any]]:
         """Load timeline events from DB for a session, ordered by creation time."""
-        from src.context.database import get_session_factory, TimelineEventRow
         from sqlalchemy import select
+
+        from src.context.database import TimelineEventRow, get_session_factory
 
         try:
             async with get_session_factory()() as db:
@@ -940,7 +997,7 @@ class SessionManager:
 
     async def _persist_session(self, session: SessionContext) -> None:
         """Write session metadata to database."""
-        from src.context.database import get_session_factory, SessionRow
+        from src.context.database import SessionRow, get_session_factory
 
         try:
             async with get_session_factory()() as db:
@@ -973,7 +1030,7 @@ class SessionManager:
         tool_call_id: str = "",
     ) -> None:
         """Write a single message to database."""
-        from src.context.database import get_session_factory, MessageRow, SessionRow
+        from src.context.database import MessageRow, SessionRow, get_session_factory
 
         try:
             # Merge tool context into metadata_json for DB storage
@@ -1009,7 +1066,7 @@ class SessionManager:
 
     async def _load_session_from_db(self, session_id: str) -> t.Optional[SessionContext]:
         """Load a session and its messages from database into memory."""
-        from src.context.database import get_session_factory, SessionRow, MessageRow
+        from src.context.database import MessageRow, SessionRow, get_session_factory
 
         try:
             async with get_session_factory()() as db:
@@ -1254,8 +1311,9 @@ agent:
 
         Returns formatted recent-activity text, or empty string if no events found.
         """
-        from src.context.database import get_session_factory, MemoryEventRow
-        from sqlalchemy import select, desc
+        from sqlalchemy import desc, select
+
+        from src.context.database import MemoryEventRow, get_session_factory
 
         try:
             session_factory = get_session_factory()
@@ -1280,7 +1338,10 @@ agent:
             return "\n".join(lines)
 
         except Exception as e:
-            logger.warning("dynamic_l1_memory_load_failed", workspace_path=workspace_path, error=str(e))
+            logger.warning(
+    "dynamic_l1_memory_load_failed",
+    workspace_path=workspace_path, error=str(e),
+)
             return ""
 
 

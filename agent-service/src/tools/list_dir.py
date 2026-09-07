@@ -9,9 +9,8 @@ import fnmatch
 from pathlib import Path
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
-from src.tools._file_utils import EXCLUDE_DIRS, resolve_safe_path
+from src.tools._file_utils import iter_visible_entries, resolve_safe_path
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
 
@@ -68,17 +67,11 @@ async def list_dir(
     dirs: list[str] = []
     files: list[str] = []
 
-    if recursive:
-        iterator = target.rglob("*")
-    else:
-        iterator = target.iterdir()
-
     truncated = False
     count = 0
-    for entry in iterator:
-        # Skip excluded directories entirely.
-        if any(part in EXCLUDE_DIRS for part in entry.parts):
-            continue
+    # Machine-written trees (caches, virtual environments, the platform's own
+    # state) are pruned by the iterator, so they cost nothing to skip.
+    for entry in iter_visible_entries(root, target, recursive=recursive):
         if not entry.exists():
             continue
 

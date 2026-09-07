@@ -6,9 +6,8 @@ Exports:
 """
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
-from src.skills.registry import SkillRegistry, SkillInfo
+from src.skills.registry import SkillInfo, SkillRegistry
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
 
@@ -64,7 +63,10 @@ async def load_skill(
 
     content = info.get_content()
     if not content:
-        return f"Skill '{skill_name}' exists but has no content. The SKILL.md file may be missing or empty."
+        return (
+    f"Skill '{skill_name}' exists but has no content. "
+    "The SKILL.md file may be missing or empty."
+)
 
     logger.info("skill_loaded", name=skill_name, chars=len(content))
     return content

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.context.execution_style import ExecutionStyle, get_policy
 from src.context.session import SessionContext, WorkspaceContext
 from src.runtime.goal_run import GoalRunController

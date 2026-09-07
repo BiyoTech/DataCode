@@ -8,9 +8,8 @@ AgentRegistry.
 import typing as t
 
 from agents import Agent
-
-from src.agents.registry import AgentRegistry
 from src.agents.factory import create_agent
+from src.agents.registry import AgentRegistry
 
 
 @AgentRegistry.register("asset_orchestration_agent")

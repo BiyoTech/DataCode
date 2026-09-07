@@ -5,7 +5,6 @@ via the Workspace Manager or directly to the filesystem (MVP).
 """
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
 from src.tools._file_utils import resolve_safe_path
 from src.tools.registry import ToolRegistry

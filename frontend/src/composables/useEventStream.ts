@@ -24,7 +24,7 @@ export interface UseEventStreamOptions {
   /** Called for every complete SSE event with its raw `data` payload. */
   onMessage: (eventType: string, data: string) => void
   onStateChange?: (state: ConnectionState) => void
-  /** Max reconnect attempts (default: 5) */
+  /** Max reconnect attempts (default: 5, may be Infinity for endless retry) */
   maxReconnectAttempts?: number
   /** Disconnect and retry if no byte arrives within this window (default: 45000) */
   heartbeatTimeout?: number
@@ -243,8 +243,10 @@ export function useEventStream(options: UseEventStreamOptions): UseEventStreamRe
     setConnectionState('reconnecting')
     reconnectAttempts++
 
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 16000)
+    // Exponential backoff capped at 16s: 1s, 2s, 4s, 8s, 16s, 16s, ...
+    // The cap is what makes an unlimited retry budget affordable — a dead
+    // backend is polled once per 16s, not hammered.
+    const delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttempts - 1, 4)), 16000)
     reconnectTimer = setTimeout(() => {
       _doConnect()
     }, delay)

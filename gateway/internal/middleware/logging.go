@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"net/http"
 	"time"
@@ -11,6 +12,13 @@ import (
 )
 
 // RequestLogger logs HTTP requests with structured fields and trace_id.
+//
+// It runs outermost so every request is logged, including the ones rejected by
+// authentication. The caller's identity is therefore not known yet: an identity
+// SLOT is installed on the way in and filled by JWTAuth once the token is
+// verified (see RequestIdentity for why reading the context directly cannot
+// work). Requests that never authenticate log an empty identity, which is the
+// accurate record.
 func RequestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -24,6 +32,9 @@ func RequestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 			// stitches their logs back into a single story.
 			r.Header.Set("X-Trace-ID", traceID)
 
+			identity := &RequestIdentity{}
+			r = r.WithContext(context.WithValue(r.Context(), RequestIdentityKey, identity))
+
 			// Wrap response writer to capture status code
 			ww := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
@@ -36,7 +47,8 @@ func RequestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 				zap.String("path", r.URL.Path),
 				zap.Int("status", ww.statusCode),
 				zap.Duration("duration", duration),
-				zap.String("user_id", GetUserID(r.Context())),
+				zap.String("user_id", identity.UserID),
+				zap.String("tenant_id", identity.TenantID),
 			)
 		})
 	}

@@ -1,0 +1,58 @@
+# Overlay: cell — a complete Cell tier in the `datacode` namespace.
+#
+# Multi-cell on one cluster: COPY this directory (not the base) per cell and
+# adjust DATACODE_CELL_ID where the base hardcodes it. The base stays shared
+# so a fix lands everywhere at once.
+#
+# The base resources already declare their namespaces and their DATACODE_ENV
+# (the cell services resolve the k8s-cell profile), so this overlay's only job
+# is REMOVAL: the identity workload belongs to the global tier, and running it
+# here would dial the cell database for identity data.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+# NOTE: no `namespace:` field here on purpose. It renames Namespace objects
+# too (the datacode/datacode-tasks pair would collide); the base resources
+# declare their namespaces explicitly instead.
+
+patches:
+  - target:
+      kind: Deployment
+      name: identity-service
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: identity-service
+  - target:
+      kind: Service
+      name: identity-service
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: identity-service
+  - target:
+      kind: PodDisruptionBudget
+      name: identity-service
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: identity-service
+  - target:
+      kind: Job
+      name: identity-migrate
+    patch: |-
+      $patch: delete
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: identity-migrate

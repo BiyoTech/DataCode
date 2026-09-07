@@ -3,13 +3,19 @@
 Provides:
 - ``resolve_safe_path``: resolve a relative path inside the workspace,
   rejecting path traversal attempts.
+- ``is_hidden_entry``: the one place that decides what browsing and searching
+  skip, delegated to the shared working-copy policy.
 - ``is_binary_file``: quick heuristic to detect binary files that should
   not be read as text.
 - ``MAX_READ_LINES``: hard ceiling for the ``limit`` parameter of read-based
   tools, aligned with Claude Code's 2000-line read window.
 """
 
+import os
 from pathlib import Path
+from typing import Iterator
+
+from datacode_common.workspace_layout import hidden_from_index
 
 # Hard ceiling for line-based reads.  Agents may request up to this many lines
 # in a single ``read_file`` call, matching the Claude Code read window so LLMs
@@ -18,25 +24,6 @@ MAX_READ_LINES = 2000
 
 # Default number of lines returned when the caller does not specify a limit.
 DEFAULT_READ_LINES = 200
-
-# Directories that are never useful for code search / listing.
-EXCLUDE_DIRS: frozenset[str] = frozenset(
-    {
-        ".git",
-        ".cache",
-        "__pycache__",
-        "node_modules",
-        ".agent",
-        ".venv",
-        "venv",
-        "dist",
-        "build",
-        ".tox",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-    }
-)
 
 # Office document extensions handled by the dedicated parser chain in
 # ``_office_parsers``.  Files matching these extensions bypass the binary
@@ -76,6 +63,73 @@ def resolve_safe_path(workspace_path: str, relative_path: str) -> Path:
             f"Access denied: path is outside workspace: {relative_path}"
         ) from None
     return target
+
+
+def is_hidden_entry(root: Path, entry: Path) -> bool:
+    """Whether *entry* must be skipped when browsing or searching the copy.
+
+    The policy itself lives in ``datacode_common.workspace_layout``, shared with
+    the runtime that serves the user's file explorer: one working copy must not
+    look different depending on who is looking at it. What matters HERE is the
+    argument it is given.
+
+    The path is made workspace-RELATIVE first, and that is the whole point of
+    this wrapper. Matching directory names against an absolute path also matches
+    the components above the workspace, and the platform's own default workspace
+    root is ``~/.datacode/workspaces/<tenant>/...`` — an absolute match on the
+    platform state directory would therefore hide every file of every workspace.
+
+    Note what this is NOT: a permission boundary. ``read_file``, ``create_file``
+    and ``apply_patch`` take an explicit path and do not consult it; hiding an
+    entry keeps it out of listings and search results, nothing more.
+    """
+    try:
+        relative = entry.relative_to(root)
+    except ValueError:
+        # Outside the copy: resolve_safe_path is what refuses those. Anything
+        # that gets here is not part of the tree being browsed.
+        return True
+    return hidden_from_index(relative.as_posix())
+
+
+def iter_visible_entries(
+    root: Path, target: Path, *, recursive: bool
+) -> Iterator[Path]:
+    """Yield the entries under *target* that browsing and search may see.
+
+    Recursion PRUNES rather than filters: ``rglob`` used to enumerate every
+    file of every virtual environment and dependency tree before discarding
+    them one by one, which on a real working copy is most of the walk. Skipping
+    a directory here skips its whole subtree.
+
+    Symlinked directories are not followed (``os.walk`` default): a link back
+    into an ancestor would otherwise loop, and a link out of the copy would
+    list files the caller never asked about.
+
+    Args:
+        root: Workspace root; entries are judged relative to it.
+        target: Directory to iterate. May be *root* itself or below it.
+        recursive: Whether to descend.
+    """
+    if not recursive:
+        for entry in sorted(target.iterdir()):
+            if not is_hidden_entry(root, entry):
+                yield entry
+        return
+
+    for current, dirnames, filenames in os.walk(target):
+        current_path = Path(current)
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not is_hidden_entry(root, current_path / name)
+        )
+        for name in dirnames:
+            yield current_path / name
+        for name in sorted(filenames):
+            entry = current_path / name
+            if not is_hidden_entry(root, entry):
+                yield entry
 
 
 def is_binary_file(path: Path, sample_size: int = 8192) -> bool:

@@ -1,0 +1,216 @@
+# Workspace Runtime Configuration
+# Role: the sole owner of working copies — SQLMesh engine + Ontology +
+# Dagster code locations + Git + file IO + gated tool execution.
+#
+# Service-specific settings only. Database, workspace, logging and the
+# runtime self-address are sourced from conf/platform.yaml.
+server:
+  rest_port: 8002                  # gateway 8000, agent 8001, runtime 8002,
+                                   # identity 8003, control 8004 — contiguous
+  host: "0.0.0.0"
+
+sqlmesh:
+  query_max_row_limit: 10000
+  query_default_row_limit: 1000
+  # Backstop TTL of the read-side metadata cache (model lists, metrics,
+  # environments, lineage). Explicit dirty/invalidate calls bypass it; this is
+  # what bounds staleness for edits made outside our API (e.g. a CLI run).
+  metadata_cache_ttl_seconds: 60
+
+concurrency:
+  workspace_write_lock_ttl: 600
+  # auto | redis | in_memory — trade-offs are documented in
+  # workspace-runtime/src/sqlmesh/env_locks.py; semantics are unchanged by
+  # the service merge.
+  env_lock_backend: "auto"
+  env_lock_ttl_seconds: 120
+
+environments:
+  max_per_workspace: 20
+  sandbox_default_ttl_hours: 168
+  reaper_enabled: true
+  reaper_interval: 3600
+  sandbox_expiry_grace_hours: 24
+
+task:
+  timeout_seconds: 600
+  ttl_seconds: 3600
+  # Execution plane (design 04 §3). Which vehicle runs work that must NOT run in
+  # this process:
+  #   disabled    no vehicle. Container profiles are unavailable AND every
+  #               sandboxed task kind — including `agent.shell` — is refused,
+  #               so the agent's shell tool answers 503 for `ls`.
+  #   local       one hardened child process per task. The single-node / dev
+  #               default: same spec-in/result-out contract as Kubernetes,
+  #               without the container boundary.
+  #   kubernetes  one Job per task. The ONLY backend that can serve L2/L3-base,
+  #               because those levels ARE the container. Set by the k8s
+  #               profiles, which also supply the node and volume settings the
+  #               backend validates at startup.
+  backend: "local"
+  # Root of the task-runner package (holds src/main.py). Empty resolves to the
+  # sibling task-runner/ directory of this checkout.
+  runner_root: ""
+  # Ceiling on top of the profile's own timeout: a profile may allow an hour
+  # while a deployment still wants a shorter maximum.
+  max_timeout_seconds: 3600
+  # Platform-owned directory holding the generated command guards, which refuse
+  # the governed verbs inside a sandbox (src/isolation/guards.py). Deliberately
+  # NOT inside a working copy — every copy is writable by the task that mounts
+  # it, so a guard placed there could be replaced by what it guards against.
+  # Empty resolves to ~/.datacode/sandbox.
+  sandbox_tool_root: ""
+
+error_archive:
+  enabled: true
+  retention: 100
+  max_sql_len: 4096
+
+# Dagster data plane (from the legacy dagster-service.yaml).
+dagster:
+  mode: "local"                    # "local" | "remote" (production forces remote)
+  # Vehicle that runs a code location's user code:
+  #   process — a child of this process (dev / single-node). Shares its
+  #             filesystem view and network namespace.
+  #   pod     — one Pod per location in the task plane (production). Requires a
+  #             container isolation profile; the manager refuses to start
+  #             rather than silently degrading to the process vehicle.
+  # Pod mode is discovered through a headless Service per environment
+  # (codeloc-<env>), whose Endpoints are the registry.
+  code_location_mode: "process"    # "process" | "pod"
+  code_location_container_image: "datacode/task-runner:latest"
+  code_location_pod_ready_timeout: 120
+  code_location_host: "0.0.0.0"
+  code_location_port: 4000
+  code_location_port_segment_size: 50
+  code_location_port_max_segments: 64
+  code_location_advertise_host: ""  # container name / Pod IP in remote mode
+  home: "~/.datacode/dagster_home"
+  daemon_enabled: true
+  webserver_enabled: true
+  webserver_host: "0.0.0.0"
+  webserver_port: 3001
+  graphql_url: "http://localhost:3001/graphql"
+  remote_graphql_url: ""
+  process_start_timeout: 30
+  process_stop_timeout: 5
+  process_health_interval: 10
+  process_max_restarts: 3
+  process_restart_window: 300
+
+# L3-proc executor (design 04 §2.3). `enabled` routes the ops that exec user
+# code (plan/apply/render/shell) through the isolated child process; when
+# false those ops run in-process exactly as the platform did before the
+# isolation plane existed (dev bootstrap only — production must set it true).
+executor:
+  enabled: false
+  user_base: 60000                 # dedicated unprivileged uid per slot
+  socket_dir: "/run/datacode/executors"
+  idle_stop_seconds: 900
+  max_restarts: 3
+  restart_window_seconds: 300
+  address_space_bytes: 4294967296  # RLIMIT_AS 4 GiB
+  cpu_seconds: 1800
+  max_processes: 256
+  max_file_size_bytes: 2147483648  # RLIMIT_FSIZE 2 GiB
+  max_open_files: 1024
+  shell_timeout_seconds: 120
+
+# Warm pool (P6c): resident task runners, so a second `agent.shell` in the same
+# working copy does not pay a container start.
+#
+# Keyed by WORKING COPY, not by tenant: a Pod serving several of a tenant's
+# copies would have to mount a subtree containing all of them, which is exactly
+# the cross-copy visibility the single-copy subPath mount removes (threat T1).
+# The trade is a lower hit rate — the first task against a copy still starts a
+# Pod — which is the honest cost of that isolation.
+#
+# Requires task_backend=kubernetes: a resident runner on the runtime's own host
+# would be the long-lived in-process hole P6 exists to close.
+warm_pool:
+  enabled: false                   # opt-in; needs the container plane
+  max_pods: 8                      # above this, tasks use one-shot Jobs
+  max_tasks: 50                    # retire a runner after this many tasks
+  idle_seconds: 900
+  ready_timeout: 120
+  # Read-only kinds only. A writable warehouse account must not outlive its
+  # task, so L2 (write) kinds are never pooled — see Q5.
+  kinds: ["agent.shell"]
+
+# Working-copy storage contract (design 07 ADR-003 / Q7).
+#
+# There is exactly ONE materialization code path (clone --bare -> .repo ->
+# worktree add) and it never asks what medium is behind `root`. `mount_kind`
+# DECLARES that medium so the process can refuse a combination whose failure
+# mode is silent data loss:
+#
+#   ephemeral       emptyDir. Nothing survives a pod restart; recovery is the
+#                   WIP ref. Fastest start, lowest cache hit rate.
+#   instance_local  A volume bound to THIS replica only (StatefulSet
+#                   volumeClaimTemplates, ReadWriteOnce). Working copies and
+#                   .repo survive rolling updates and OOMKills, so those stop
+#                   consuming the 10-minute durability window. PRODUCTION
+#                   TARGET once leases ship (P4b).
+#   shared          A volume writable by several replicas. The pre-lease
+#                   status quo; REJECTED once `lease.enabled` is true.
+#
+# Startup fails on the two silent-corruption combinations:
+#   shared + lease            -> a second replica writes behind the lease
+#   private medium, no lease  -> replicas diverge from separate directories
+materialize:
+  # Defaults to platform.yaml workspace.base_path when empty.
+  root: ""
+  mount_kind: "shared"             # current deployment; P4b -> instance_local
+  # LRU reclamation (design 06 4b): at the HIGH watermark, lease-less working
+  # copies are discarded (worktree only; .repo is kept and shared) until usage
+  # is back at/below the LOW watermark. Only meaningful on replica-private
+  # media — on a shared volume one replica cannot reclaim another's copies.
+  disk_high_watermark_percent: 85
+  disk_low_watermark_percent: 70
+  reclaim_interval_seconds: 300
+  # Bounds how much uncommitted work a NON-GRACEFUL crash can lose. This is a
+  # USER-FACING DURABILITY CONTRACT (design 07 Q6), not a tuning knob: lowering
+  # it changes what the product promises, raising it silently weakens a
+  # published guarantee. Cost of shortening: each snapshot is one
+  # `git stash create` plus a hidden-ref push, so Git-server write
+  # amplification scales inversely.
+  #
+  # A graceful drain always takes a FINAL snapshot, so planned shutdowns lose
+  # nothing regardless of this value; it only bounds hard crashes.
+  wip_snapshot_interval_seconds: 600     # 10 min -- the accepted default
+  wip_snapshot_skip_if_clean: true       # idle leases cost nothing
+
+# Workspace lease routing (design 03 §3.3, P4a). The holder side (flock guard,
+# watchdog renewal) ships incrementally; `enabled` is the switch the storage
+# contract above checks against, so P4a/P4b are config flips rather than
+# schema changes.
+lease:
+  enabled: false
+  # A CRASH-RECOVERY BOUND, not an operation timeout: a watchdog renews every
+  # ttl/3 while the holder lives, so a 20-minute apply never loses its lease.
+  # It only bounds how long a DEAD holder's working copy stays unreachable.
+  ttl_seconds: 120
+  # Hard cap per instance; 0 = derive from the memory budget alone. Capacity is
+  # a function of the pod's memory against the size of the repositories it
+  # happens to hold, so no single number is right for every tenant (Q3).
+  max_per_instance: 16
+  # Refuse new leases past this fraction of measured RSS even when the count
+  # limit is not reached -- the per-lease estimate can be wrong, and an OOM
+  # takes down every other lease on the instance.
+  admission_rss_high_watermark: 0.80
+  # A lease with no request for this long is released and its resources freed.
+  idle_release_seconds: 1800
+  # Retry-After seconds on 429 tenant-quota rejections at acquire (P8). The
+  # limits themselves are published to Redis by control-service and read from
+  # there; only the retry hint is runtime-local.
+  quota_retry_after_seconds: 60
+
+# ── Shared config (from platform.yaml) ──────────────────────────────────
+# database:    → platform.yaml → database (password: env DB_PASSWORD)
+# workspace:   → platform.yaml → workspace.base_path
+# logging:     → platform.yaml → logging.level
+#
+# Secrets are env-only:
+#   WORKSPACE_RUNTIME_INTERNAL_TOKEN   (guards /internal/*, fail closed)
+#   WORKSPACE_RUNTIME_DAGSTER_REMOTE_TOKEN  (remote mode GraphQL auth)
+#   DB_PASSWORD / REDIS_PASSWORD

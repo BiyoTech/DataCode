@@ -16,6 +16,7 @@ import { useKnowledgeStore } from '@/stores/knowledge'
 import { useGitStore } from '@/stores/git'
 import { useEnvironmentStore } from '@/stores/environment'
 import { useLogsStore } from '@/stores/logs'
+import { useWipStore } from '@/stores/wip'
 
 export function useWorkspaceLifecycle() {
   const workspaceStore = useWorkspaceStore()
@@ -29,6 +30,7 @@ export function useWorkspaceLifecycle() {
   const git = useGitStore()
   const environment = useEnvironmentStore()
   const logs = useLogsStore()
+  const wip = useWipStore()
 
   function resetWorkspaceScopedState() {
     fileStore.reset()
@@ -43,6 +45,8 @@ export function useWorkspaceLifecycle() {
     environment.reset()
     // Also tears down the SSE tail: it is bound to the previous working copy.
     logs.reset()
+    // Stops the WIP status polling bound to the previous working copy.
+    wip.reset()
   }
 
   watch(

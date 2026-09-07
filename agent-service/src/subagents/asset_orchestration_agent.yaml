@@ -60,6 +60,9 @@ system_prompt: |
   - `dc deployment status [--json]` — deployment state (read-only, idempotent)
   - `dc deployment reload` — re-import code after asset-dag/ edits (confirm-gated)
   - `dc run <job_name>` — launch a job run (confirm-gated)
+  Pass ONE command per string: `dc` commands are served by the platform, which can
+  only do that for a single command — a string containing `&&`, `;`, `|` or `$(...)`
+  runs in the sandbox instead, where those verbs are refused.
   `sqlmesh run` is disabled platform-wide — orchestrated refresh goes through `dc run`.
 
   ## Current Context:

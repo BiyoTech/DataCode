@@ -1,99 +1,74 @@
 #!/usr/bin/env bash
-# One-click development environment setup.
-# Installs all dependencies for backend and frontend services.
+# One-time dev environment setup: install every service's dependencies and
+# bootstrap .env. Starts nothing (that is dev-start.sh's job).
+#
+# Dev storage is PostgreSQL + Redis, both provided by deploy/docker-compose.infra.yml.
+# This script optionally brings them up (INFRA_MODE=auto, the default when
+# Docker is present); dev-start.sh will also start them on demand.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=scripts/dev-lib.sh
+. "$SCRIPT_DIR/dev-lib.sh"
 
-# Detect docker compose command
-if docker compose version &>/dev/null; then
-  DOCKER_COMPOSE="docker compose"
-elif docker-compose version &>/dev/null; then
-  DOCKER_COMPOSE="docker-compose"
+printf '\033[0;36m============================================\033[0m\n'
+printf '\033[0;36m  DataCode - Dev Environment Setup\033[0m\n'
+printf '\033[0;36m============================================\033[0m\n'
+printf '\n'
+
+dev_info "[1/6] checking toolchain"
+require_cmd go python3 node npm lsof nc openssl curl
+PY="$(find_python3)" || dev_die "no Python >= 3.11 found — install one (3.13 recommended)"
+dev_ok "toolchain OK (python: $PY, node: $(node --version), go: $(go version 2>/dev/null | awk '{print $3}'))"
+
+dev_info "[2/6] python services (per-service .venv)"
+# Probes live in dev-lib.sh (ensure_service_venvs) — one definition shared
+# with dev-start.sh.
+ensure_service_venvs
+
+dev_info "[3/6] go services"
+ensure_go_deps gateway
+ensure_go_deps identity-service
+
+dev_info "[4/6] frontend"
+if [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then
+  (cd "$ROOT_DIR/frontend" && npm install)
 else
-  echo "ERROR: Neither 'docker compose' nor 'docker-compose' found. Please install Docker."
-  exit 1
+  dev_ok "node_modules present (rm -rf frontend/node_modules to force a reinstall)"
 fi
 
-echo "============================================"
-echo "  DataCode - Dev Environment Setup"
-echo "============================================"
-echo ""
-
-# --- Infrastructure (optional) ---
-echo "==> [1/6] Starting infrastructure (PostgreSQL, Redis, Gitea)..."
-cd "$ROOT_DIR"
-$DOCKER_COMPOSE -f deploy/docker-compose.infra.yml up -d
-echo "    Infrastructure started."
-echo ""
-
-# --- Python services ---
-echo "==> [2/7] Setting up SQLMesh Service (Python)..."
-cd "$ROOT_DIR/sqlmesh-service"
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
+dev_info "[5/6] .env"
+if [ ! -f "$ROOT_DIR/.env" ]; then
+  cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
+  dev_ok "created .env from .env.example (AGENT_SERVICE_LLM_API_KEY is the only value worth setting there; the postgres password is managed in .data/postgres_password)"
+else
+  dev_ok ".env present"
 fi
-source .venv/bin/activate
-pip install -q -e "$ROOT_DIR/shared/python"
-pip install -q -e ".[dev]"
-deactivate
-echo "    SQLMesh Service ready."
-echo ""
 
-echo "==> [3/7] Setting up Agent Service (Python)..."
-cd "$ROOT_DIR/agent-service"
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
+dev_info "[6/6] dev storage (PostgreSQL 5432 + Redis 6379)"
+if [ "${INFRA_MODE:-auto}" != "none" ]; then
+  # Bring the containers up (or reuse them when already reachable); a machine
+  # with Docker therefore needs no manual storage setup at all.
+  ensure_infra
+elif check_port_open localhost 5432 && check_port_open localhost 6379; then
+  dev_ok "PostgreSQL and Redis reachable"
+else
+  dev_warn "PostgreSQL (5432) or Redis (6379) not reachable — dev-start.sh will try Docker, or start your own"
 fi
-source .venv/bin/activate
-pip install -q -e "$ROOT_DIR/shared/python"
-pip install -q -e ".[dev]"
-deactivate
-echo "    Agent Service ready."
-echo ""
 
-echo "==> [4/7] Setting up Ontology Service (Python)..."
-cd "$ROOT_DIR/ontology-service"
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
-source .venv/bin/activate
-pip install -q -e ".[dev]"
-deactivate
-echo "    Ontology Service ready."
-echo ""
+printf '\n'
+dev_ok "setup complete"
+cat <<'EOF'
 
-echo "==> [5/7] Setting up Dagster Service (Python)..."
-cd "$ROOT_DIR/dagster-service"
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
-source .venv/bin/activate
-pip install -q -e "$ROOT_DIR/shared/python"
-pip install -q -e ".[dev]"
-deactivate
-echo "    Dagster Service ready."
-echo ""
+  Next:
+    1. make dev        (or: scripts/dev-start.sh) — one command, storage included
+    2. make doctor     inspect the effective configuration (any profile)
+    3. make dev-logs   re-attach to service logs (.data/logs/)
+    4. make stop       stop everything
 
-# --- Go services ---
-echo "==> [6/7] Setting up Gateway (Go)..."
-cd "$ROOT_DIR/gateway"
-go mod tidy 2>/dev/null || echo "    (go mod tidy skipped - missing deps will be resolved on first build)"
-echo "    Gateway ready."
-echo ""
+  PostgreSQL password: managed in .data/postgres_password (created on first
+  run; change it with: make pg-set-password PASSWORD=...)
 
-# --- Frontend ---
-echo "==> [7/7] Setting up Frontend (Vue 3)..."
-cd "$ROOT_DIR/frontend"
-npm install
-echo "    Frontend ready."
-echo ""
-
-echo "============================================"
-echo "  Setup complete!"
-echo ""
-echo "  Next: run 'make dev' or './scripts/dev-start.sh'"
-echo "  Default dev uses SQLite (no Docker required)."
-echo "  For Docker infra: INFRA_MODE=docker make dev"
-echo "============================================"
+  Dev storage: PostgreSQL localhost:5432/datacode + Redis localhost:6379
+  (started automatically via Docker when not already reachable).
+EOF

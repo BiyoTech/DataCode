@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
 # ============================================================================
-# dc.sh — DataCode platform-domain CLI (dc = DataCode)
+# dc.sh — HUMAN-FACING DataCode platform CLI (dc = DataCode)
 # ============================================================================
-# Command model (all intercepted commands hit the dagster-service REST API):
+# WHO THIS IS FOR
+#   A person in a terminal. It is NOT on the agent's path any more: agent
+#   commands are routed by workspace-runtime before anything executes (see
+#   workspace-runtime/src/tools/command_router.py and the shared verb
+#   declaration in shared/python/datacode_common/command_verbs.py). Putting this
+#   back on a sandbox's PATH would require handing the sandbox the platform's
+#   address, which the L3-base NetworkPolicy denies by design.
+#
+# Command model (all intercepted commands hit the workspace-runtime Dagster
+# data-plane REST API via the gateway's /api/v1/dagster/* routes):
 #   dc assets [--json]                  → asset dependency graph (GET graph)
 #   dc deployment status [--json]       → idempotent ensure + deployment state
 #   dc deployment reload                → re-import code after asset-dag/ edits
 #   dc run <job_name> [--config-json J] → launch a job run in this environment
 #
-# `dc` also happens to be the POSIX desk calculator. The shim directory is
-# prepended to PATH by the shell tool, so it would shadow the system dc;
-# any subcommand we do not know is forwarded to the REAL dc binary
-# (resolution mirrors _resolve_real_sqlmesh in sqlmesh.sh: strip the shim
-# directory from PATH, then `command -v dc`, fallback /usr/bin/dc).
+# `dc` also happens to be the POSIX desk calculator. When this shim is on PATH
+# it would shadow the system dc; any subcommand we do not know is forwarded to
+# the REAL dc binary (resolution mirrors _resolve_real_sqlmesh in sqlmesh.sh:
+# strip the shim directory from PATH, then `command -v dc`, fallback
+# /usr/bin/dc).
 #
 # Environment governance:
-#   DATACODE_ENVIRONMENT, when injected by the shell tool, is sent as the
-#   `environment` CONFIRMATION field on deployment ensure/reload — the
-#   backend rejects a mismatch with the working copy (anti-hallucination,
-#   same semantics as sqlmesh.sh). env_type / schedules_enabled are
-#   intentionally NOT sent: they carry the environment registry's policy
-#   and default safely on the backend.
+#   DATACODE_ENVIRONMENT, when set, is sent as the `environment` CONFIRMATION
+#   field on deployment ensure/reload — the backend rejects a mismatch with the
+#   working copy. env_type / schedules_enabled are intentionally NOT sent: they
+#   carry the environment registry's policy and default safely on the backend.
 #
-# Environment variables (injected by shell.py or set manually):
-#   DATACODE_DAGSTER_SERVICE_URL  Dagster service base URL
-#                                    (default: http://localhost:8004)
+# Environment variables (set by the user or their shell profile):
+#   DATACODE_WORKSPACE_RUNTIME_URL  workspace-runtime API base URL
+#                                    (default: http://localhost:8002)
 #   DATACODE_WORKSPACE_PATH       Absolute path to the workspace root
 #   DATACODE_ENVIRONMENT          Authoritative active environment
 #
@@ -42,7 +49,7 @@ source "${SCRIPT_DIR}/dc-lib.sh"
 # -------------------------------------------------------------------
 # Resolve backend API base URL
 # -------------------------------------------------------------------
-API_URL="${DATACODE_DAGSTER_SERVICE_URL:-http://localhost:8004}"
+API_URL="${DATACODE_WORKSPACE_RUNTIME_URL:-http://localhost:8002}"
 
 # -------------------------------------------------------------------
 # Resolve the REAL system dc binary (avoid self-recursion)
@@ -87,7 +94,7 @@ _dc_usage() {
     cat >&2 <<'EOF'
 Usage: dc <command> [options]
 
-DataCode platform commands (dagster-service):
+DataCode platform commands (workspace-runtime Dagster data plane):
   assets [--json]                  Asset dependency graph of the active environment
   deployment status [--json]       Dagster deployment state (idempotent ensure)
   deployment reload                Re-import orchestration code after asset-dag/ edits

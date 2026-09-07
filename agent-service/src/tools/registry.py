@@ -148,7 +148,9 @@ class ToolRegistry:
         The threshold is read from ``run_context.context`` first (supports
         session-level override), falling back to ``DEFAULT_CONFIRMATION_THRESHOLD``.
         """
-        async def _needs_approval(run_context: t.Any, tool_parameters: t.Dict[str, t.Any], call_id: str) -> bool:
+        async def _needs_approval(
+    run_context: t.Any, tool_parameters: t.Dict[str, t.Any], call_id: str
+) -> bool:
             del tool_parameters, call_id
             tool_level = cls.get_tool_level(tool_name)
             context = getattr(run_context, "context", None)
@@ -199,7 +201,9 @@ class ToolRegistry:
         return int(metadata.get("level", default))
 
     @classmethod
-    def get_tool_risk_badge(cls, tool_name: str, default: int = DEFAULT_TOOL_LEVEL) -> t.Tuple[str, str]:
+    def get_tool_risk_badge(
+    cls, tool_name: str, default: int = DEFAULT_TOOL_LEVEL
+) -> t.Tuple[str, str]:
         """Convenience: ``risk_badge_for_level(get_tool_level(tool_name))``."""
         level = cls.get_tool_level(tool_name, default=default)
         return risk_badge_for_level(level)
@@ -273,7 +277,10 @@ def load_all_tools() -> None:
         ToolRegistry.register_metadata(
             "shell",
             level=5,
-            description="Execute shell commands in the agent workspace (subject to command policy).",
+            description=(
+    "Execute shell commands in the agent workspace "
+    "(subject to command policy)."
+),
         )
 
     logger.info("all_tools_loaded", count=len(ToolRegistry._tools))

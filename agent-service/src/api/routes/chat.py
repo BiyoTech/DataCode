@@ -7,15 +7,18 @@ from fastapi import APIRouter, HTTPException
 from src.api.schemas import ApprovalRequest, ChatMessageRequest
 from src.context.event_bus import event_bus
 from src.context.session import session_manager
-from src.protocol.messages import agent_finish, human_response, system_warning
-from src.runtime.approval import get_pending_approval, resolve_pending_approval
-from src.runtime.active_runs import active_chat_runs
+from src.protocol.messages import agent_finish, system_warning
+from src.runtime.active_runs import (
+    active_chat_runs,
+    cancel_chat_run,
+    register_chat_run,
+    track_chat_run,
+)
 from src.runtime.chat_executor import execute_chat
-from src.runtime.streaming import resume_after_approval
+from src.runtime.resume import is_resume_intent, peek_pending_resume
+from src.runtime.session_coordination import get_session_coordination
 from src.runtime.timeline import publish_and_persist
-from src.tools.command_approval import resolve_command_approval
 from src.utils.logging import get_logger
-from src.utils.tasks import spawn_background_task
 
 logger = get_logger(__name__)
 
@@ -28,10 +31,25 @@ async def post_chat_message(session_id: str, req: ChatMessageRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # Resume forwarding: a "continue" message for a run paused on ANOTHER
+    # replica must reach the replica holding the SDK run state — executing it
+    # here would silently downgrade to a fresh (stateless) run. Checked before
+    # the run registration below: the forwarded path registers on the owner.
+    if (
+        is_resume_intent(req.content)
+        and peek_pending_resume(session_id) is None
+        and await get_session_coordination().resume_pending_remotely(session_id)
+    ):
+        await get_session_coordination().broadcast_resume_chat(session_id, req.dict())
+        logger.info("resume_chat_forwarded_to_owner", session_id=session_id)
+        return {"status": "accepted", "session_id": session_id, "forwarded": True}
+
     # Serialize concurrent messages per session: if a run is already in flight,
     # reject the new request so two Runners never race on the same session's
     # messages / timeline / todo board. The frontend should wait for the current
     # run to finish (agent_finish / paused / error) before sending the next one.
+    # The local dict answers the common case; the distributed registration
+    # answers the case the dict cannot see — a run on ANOTHER replica.
     run_info = active_chat_runs.get(session_id)
     if run_info is not None:
         task = run_info.get("task")
@@ -46,29 +64,23 @@ async def post_chat_message(session_id: str, req: ChatMessageRequest):
             )
 
     event_bus.ensure_queue(session_id)
+    # SET NX in Redis: atomically claims the session across all replicas. A
+    # lost race means another replica just started a run for this session.
+    if not await register_chat_run(session_id):
+        logger.info(
+            "chat_run_already_in_progress_remote",
+            session_id=session_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="A chat run is already in progress for this session",
+        )
+
     task = asyncio.create_task(execute_chat(session, req))
-    active_chat_runs[session_id] = {
-        "task": task,
-        "result": None,
-        "agent_name": session.mode.value,
-    }
-
-    # Clean up the run registry when the task finishes so active_chat_runs does
-    # not grow unbounded, and surface any exception the task raised (a bare
-    # create_task swallows exceptions until GC). Only remove the entry if it is
-    # still the same task — a newer message may have replaced it.
-    def _on_chat_done(t: asyncio.Task, sid: str = session_id) -> None:
-        current = active_chat_runs.get(sid)
-        if current is not None and current.get("task") is t:
-            active_chat_runs.pop(sid, None)
-        if t.cancelled():
-            logger.info("chat_run_cancelled", session_id=sid)
-            return
-        exc = t.exception()
-        if exc is not None:
-            logger.error("chat_run_failed", session_id=sid, error=str(exc), exc_info=exc)
-
-    task.add_done_callback(_on_chat_done)
+    # track_chat_run owns everything that must follow the task: the local
+    # handle, the registration heartbeat, and the release of the registration
+    # when the task ends (whatever ends it).
+    track_chat_run(session_id, task, agent_name=session.mode.value)
     return {"status": "accepted", "session_id": session_id}
 
 
@@ -78,34 +90,12 @@ async def post_approval(session_id: str, req: ApprovalRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    cmd_resolved = resolve_command_approval(session_id, req.request_id, req.approved)
-    if cmd_resolved:
-        logger.info(
-            "command_approval_post_endpoint",
-            session_id=session_id,
-            request_id=req.request_id,
-            approved=req.approved,
-        )
-        # Persist the resolution so a reloaded session recovers the approval state.
-        await publish_and_persist(
-            session_id,
-            human_response(
-                session_id,
-                request_id=req.request_id,
-                approved=req.approved,
-                reason=req.reason or "",
-            ),
-        )
-        return {
-            "status": "resolved",
-            "request_id": req.request_id,
-            "approved": req.approved,
-            "type": "command_approval",
-        }
-
-    pending = get_pending_approval(session_id, req.request_id)
-    resolved = resolve_pending_approval(session_id, req.request_id, approved=req.approved)
-    if not resolved:
+    # Resolution handles both approval kinds and, when the future lives on
+    # another replica, routes the resolution there (broadcast + owner filter).
+    outcome = await get_session_coordination().resolve_approval(
+        session_id, req.request_id, req.approved, req.reason or ""
+    )
+    if outcome is None:
         await publish_and_persist(
             session_id,
             system_warning(
@@ -116,23 +106,19 @@ async def post_approval(session_id: str, req: ApprovalRequest):
         )
         raise HTTPException(status_code=404, detail=f"Approval not found: {req.request_id}")
 
-    # Persist the resolution so a reloaded session recovers the approval state.
-    await publish_and_persist(
-        session_id,
-        human_response(
-            session_id,
+    if outcome.get("status") == "forwarded":
+        # The owning replica resolves and publishes the human_response event
+        # (SSE fan-out delivers it to any connected client).
+        logger.info(
+            "approval_resolution_forwarded",
+            session_id=session_id,
             request_id=req.request_id,
-            approved=req.approved,
-            reason=req.reason or "",
-        ),
-    )
-
-    if pending is not None:
-        # Tracked background task: prevents premature GC and logs any failure.
-        spawn_background_task(
-            resume_after_approval(session, pending, req.approved),
-            name=f"resume_after_approval:{session_id}",
         )
+        return {
+            "status": "forwarded",
+            "request_id": req.request_id,
+            "approved": req.approved,
+        }
 
     if not req.approved:
         logger.info(
@@ -142,7 +128,12 @@ async def post_approval(session_id: str, req: ApprovalRequest):
             reason=req.reason,
         )
 
-    return {"status": "resolved", "request_id": req.request_id, "approved": req.approved}
+    return {
+        "status": "resolved",
+        "request_id": req.request_id,
+        "approved": req.approved,
+        **({"type": outcome["type"]} if "type" in outcome else {}),
+    }
 
 
 @router.post("/{session_id}/cancel")
@@ -152,14 +143,9 @@ async def post_cancel(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     logger.info("chat_cancel_received", session_id=session_id)
-    run_info = active_chat_runs.get(session_id)
-    if run_info:
-        streamed = run_info.get("result")
-        if streamed is not None and hasattr(streamed, "cancel"):
-            streamed.cancel()
-        task = run_info.get("task")
-        if task and not task.done():
-            task.cancel()
+    # cancel_chat_run tries this replica first, then broadcasts to whichever
+    # replica owns the run — a load-balanced cancel must still reach it.
+    if await cancel_chat_run(session_id):
         return {"status": "cancelled", "session_id": session_id}
 
     await publish_and_persist(

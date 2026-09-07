@@ -1,0 +1,351 @@
+# Overlay: global — the GLOBAL tier, identity only, in `datacode-global`.
+#
+# Everything the base defines that is not identity (or its migrate Job) is
+# removed: a namespace running a workload it does not own is how a cell's
+# blast radius stops being bounded. That includes the sandbox egress plane —
+# no user code ever runs in the global tier.
+#
+# The base's identity resources already declare DATACODE_ENV=k8s-global; the
+# remaining job of this overlay is (a) moving them into the datacode-global
+# namespace (the base hardcodes `datacode`, where the cell services live) and
+# (b) removing everything else.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+# NOTE: no `namespace:` field on purpose (it would rename the Namespace
+# objects into conflicts); the identity resources are re-namespaced by the
+# patches below.
+
+patches:
+  # ── Identity: the tier's one workload, moved into its own namespace ──
+  - target:
+      kind: Deployment
+      name: identity-service
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: datacode-global
+  - target:
+      kind: Service
+      name: identity-service
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: datacode-global
+  # The identity PDB follows its workload: a PDB left in `datacode` selects
+  # nothing there and is just orphaned policy.
+  - target:
+      kind: PodDisruptionBudget
+      name: identity-service
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: datacode-global
+
+  # ── Remove everything a cell owns ────────────────────────────────────
+  - target:
+      kind: Deployment
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: gateway
+  - target:
+      kind: Service
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: gateway
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: gateway
+  - target:
+      kind: PodDisruptionBudget
+      name: gateway
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: gateway
+  - target:
+      kind: Deployment
+      name: control-service
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: control-service
+  - target:
+      kind: Service
+      name: control-service
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: control-service
+  - target:
+      kind: PodDisruptionBudget
+      name: control-service
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: control-service
+  - target:
+      kind: Deployment
+      name: agent-service
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: agent-service
+  - target:
+      kind: Service
+      name: agent-service
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: agent-service
+  - target:
+      kind: StatefulSet
+      name: workspace-runtime
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: workspace-runtime
+  - target:
+      kind: Service
+      name: workspace-runtime
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: workspace-runtime
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: frontend
+  - target:
+      kind: Service
+      name: frontend
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: frontend
+  - target:
+      kind: PodDisruptionBudget
+      name: frontend
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: frontend
+  - target:
+      kind: Ingress
+      name: datacode
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: datacode
+  - target:
+      kind: Job
+      name: control-migrate
+    patch: |-
+      $patch: delete
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: control-migrate
+
+  # ── Remove the sandbox plane: user code never runs in the global tier ──
+  - target:
+      kind: Deployment
+      name: egress-dns
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: egress-dns
+  - target:
+      kind: Deployment
+      name: egress-proxy
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: egress-proxy
+  - target:
+      kind: Service
+      name: egress-dns
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: egress-dns
+  - target:
+      kind: Service
+      name: egress-proxy
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: egress-proxy
+  - target:
+      kind: ConfigMap
+      name: egress-dns
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: egress-dns
+  # The task-plane plumbing: nodepool contract, quotas, service account,
+  # policies. Selecting nothing is their best case; leaving them invites the
+  # next reader to assume the global tier runs tasks.
+  - target:
+      kind: ConfigMap
+      name: nodepool-user-code-contract
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: nodepool-user-code-contract
+  - target:
+      kind: ResourceQuota
+      name: task-namespace-ceiling
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: task-namespace-ceiling
+  - target:
+      kind: LimitRange
+      name: task-defaults
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: task-defaults
+  - target:
+      kind: ServiceAccount
+      name: task-runner-noperm
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: task-runner-noperm
+  - target:
+      kind: NetworkPolicy
+      name: task-runner-default-deny
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: task-runner-default-deny
+  - target:
+      kind: NetworkPolicy
+      name: warm-pool-policy
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: warm-pool-policy
+  - target:
+      kind: NetworkPolicy
+      name: egress-proxy-policy
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: egress-proxy-policy
+  - target:
+      kind: NetworkPolicy
+      name: egress-dns-policy
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: egress-dns-policy
+  - target:
+      kind: NetworkPolicy
+      name: code-location-policy
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: code-location-policy
+  - target:
+      kind: NetworkPolicy
+      name: dagster-user-code-egress
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: dagster-user-code-egress
+  - target:
+      kind: ConfigMap
+      name: dagster-instance
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: dagster-instance
+  - target:
+      kind: ConfigMap
+      name: codeloc-pod-contract
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: codeloc-pod-contract

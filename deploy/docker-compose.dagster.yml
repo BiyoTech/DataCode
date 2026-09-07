@@ -1,0 +1,88 @@
+# Dagster ORCHESTRATION plane — webserver + daemon + workspace-sync.
+#
+# Stackable on any stack (single-machine or cell): it only needs the shared
+# network, postgres (for run/event/schedule storage) and the runtime replicas
+# (whose /internal/code-locations the syncer polls).
+#
+#   make dagster-up      # = compose -f infra.yml -f <stack>.yml -f dagster.yml up -d
+#   open http://localhost:3000
+#
+# The daemon is intentionally a single service (no replicas): Dagster's daemon
+# must run exactly once or schedules/sensors fire repeatedly.
+
+name: datacode
+
+x-dagster: &dagster
+  build:
+    context: ..
+    dockerfile: deploy/orchestrator/Dockerfile.dagster
+  environment:
+    DAGSTER_HOME: /opt/dagster/dagster_home
+    DAGSTER_PG_HOST: postgres
+    DAGSTER_PG_PORT: "5432"
+    DAGSTER_PG_DB: dagster
+    DAGSTER_PG_USER: datacode
+    DAGSTER_PG_PASSWORD: ${DB_PASSWORD}
+  volumes:
+    # Instance config (storage/run_launcher/...) lives with the orchestrator
+    # deployment unit; workspace.yaml is written into the same home by the
+    # syncer.
+    - ./orchestrator/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+    - dagster_control_home:/opt/dagster/dagster_home
+  restart: unless-stopped
+
+services:
+  dagster-webserver:
+    <<: *dagster
+    command:
+      ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000",
+       "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:3000/server_info')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Single instance, hard constraint: see the header. Must point at the same
+  # rendered workspace.yaml as the webserver (written by workspace-sync).
+  dagster-daemon:
+    <<: *dagster
+    command:
+      ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dagster-webserver:
+        condition: service_started
+
+  # The single WRITER of the control plane's workspace.yaml: polls every data
+  # plane replica's /internal/code-locations, renders the file, reloads the
+  # webserver, and acknowledges loaded revisions back.
+  workspace-sync:
+    build:
+      context: ..
+      dockerfile: deploy/orchestrator/Dockerfile
+    environment:
+      # Comma-separated data-plane replica base URLs. Extend when adding
+      # replicas; the merge logic tolerates unreachable replicas.
+      DATACODE_DATA_PLANE_URLS: http://workspace-runtime-1:8002,http://workspace-runtime-2:8002
+      # Must match WORKSPACE_RUNTIME_INTERNAL_TOKEN on every data-plane replica.
+      DATACODE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+      DATACODE_DAGSTER_GRAPHQL_URL: http://dagster-webserver:3000/graphql
+      DATACODE_WORKSPACE_FILE: /opt/dagster/dagster_home/workspace.yaml
+      DATACODE_SYNC_INTERVAL_SECONDS: "15"
+    volumes:
+      - dagster_control_home:/opt/dagster/dagster_home
+    depends_on:
+      dagster-webserver:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  dagster_control_home:

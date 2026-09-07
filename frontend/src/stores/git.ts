@@ -615,7 +615,6 @@ export const useGitStore = defineStore('git', () => {
       const { data } = await api.get('/git/branch-diff', {
         params: {
           workspace_path: ws.path,
-          user_id: currentUserId(),
           source,
           target,
         },
@@ -644,7 +643,6 @@ export const useGitStore = defineStore('git', () => {
       const { data } = await api.get('/git/branch-diff', {
         params: {
           workspace_path: ws.path,
-          user_id: currentUserId(),
           source,
           target,
           file_path: filePath,

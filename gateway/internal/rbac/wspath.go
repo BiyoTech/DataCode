@@ -9,12 +9,14 @@ import (
 // service: a workspace id is always "ws-{tenant_id}-{slug}".
 const workspaceIDPrefix = "ws-"
 
-// envsDirName mirrors ENVS_DIR in sqlmesh-service/src/workspace/paths.py: every
-// environment working copy is a Git worktree living under this directory.
+// envsDirName mirrors ENVS_DIR in workspace-runtime's path layout
+// (datacode_common.workspace_paths): every environment working copy is a Git
+// worktree living under this directory.
 const envsDirName = "envs"
 
-// environmentIDSeparator mirrors naming.environment_id() in the sqlmesh service:
-// an environment id is always "{workspace_id}:{environment}".
+// environmentIDSeparator mirrors naming.environment_id() in the shared
+// datacode_common naming module: an environment id is always
+// "{workspace_id}:{environment}".
 const environmentIDSeparator = ":"
 
 // workingCopyDepth is the number of segments a working copy occupies below the

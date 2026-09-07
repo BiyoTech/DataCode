@@ -1,17 +1,50 @@
-    # Platform dev overrides.
+# Profile: dev — host development (DATACODE_ENV=dev)
 #
-# Loaded on top of platform.yaml when DATACODE_ENV=dev.
-# Deep merge: values here override the base file.
+# Selected automatically by scripts/dev-start.sh. Everything runs as a host
+# process against local PostgreSQL + Redis; `make dev` starts both for you.
+#
+# Only the DIFFERENCE from conf/platform.yaml is expressed here — deep-merged
+# on top of it, this layer wins. Anything absent is inherited.
+#
+# Engine choice: PostgreSQL, the same engine Docker and Kubernetes use. A
+# dialect defect therefore surfaces on a laptop rather than in production.
 
-# Dev: use MySQL locally with debug logging
 database:
-  type: "mysql"
   host: "localhost"
-  port: 3306
+  port: 5432
   name: "datacode"
-  username: "root"
+  username: "datacode"
   # password: env-only (DB_PASSWORD)
 
+redis:
+  host: "localhost"
+  port: 6379
+
+workspace:
+  # Expanded by each service at load time; keep it inside $HOME so a dev run
+  # never needs elevated permissions.
+  base_path: "~/.datacode/workspaces"
+
+services:
+  gateway:
+    http_url: "http://localhost:8000"
+  agent:
+    ws_url: "ws://localhost:8001"
+    grpc_url: "localhost:50051"
+    rest_url: "http://localhost:8001"
+  runtime:
+    rest_url: "http://localhost:8002"
+  identity:
+    rest_url: "http://localhost:8003"
+  control:
+    rest_url: "http://localhost:8004"
+  # egress_proxy / egress_dns intentionally unset: dev has no NetworkPolicy, so
+  # a configured proxy would mediate SOME sandbox traffic while the rest flowed
+  # freely. Unset means sandboxes get no proxy configuration at all, which is
+  # the honest local state. Run the containerized stack to exercise P6b.
+
 logging:
+  # Human-readable and verbose: these logs are read in a terminal, not shipped
+  # to a collector.
   level: "debug"
   format: "text"

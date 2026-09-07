@@ -1,75 +1,153 @@
-# Platform-level shared configuration.
+# Platform-level shared configuration — the NEUTRAL base.
 #
-# This file is the single source of truth for cross-cutting concerns shared
-# by all services: database, workspace storage, service topology, logging.
-# Each service ALSO reads its own <service>.yaml for service-specific settings.
+# This file is layer 2 of four. The full resolution order, identical for host
+# dev, Docker and Kubernetes:
 #
-# Environment overrides: set DATACODE_ENV=dev to load platform.dev.yaml on
-# top of this file (deep merge, env-specific wins).
+#   1. code defaults          (each service's Settings / Config struct)
+#   2. THIS FILE              cross-environment invariants only
+#   3. platform.{PROFILE}.yaml   selected by DATACODE_ENV, deep-merged on top
+#   4. environment variables  highest priority (secrets are env-ONLY)
 #
-# Secrets are NEVER stored here — see the `security` section below for the
-# list of env vars each service expects.
+# Where the files are found: $CONFIG_PATH first, otherwise the repository's
+# conf/ directory. Containers and Kubernetes both mount a conf/ directory at
+# /app/conf and set CONFIG_PATH — the MECHANISM never changes between
+# environments, only which profile is selected and which secrets are supplied.
+#
+# ── Why this file carries no addresses ────────────────────────────────────
+#
+# Every host / port / URL / path lives in a profile, never here. When the base
+# held dev values, each container deployment had to ship a COMPLETE copy of
+# this file to replace them, and those copies drifted (one lost the `cells`
+# section, another the `security` documentation, a third disabled Redis without
+# saying why). Profiles that carry only their DIFFERENCE cannot drift like
+# that: what they do not mention, they inherit.
+#
+# The consequence is deliberate: DATACODE_ENV must be set. A process started
+# without it gets structurally valid config with no usable addresses and fails
+# fast, instead of quietly connecting to whatever `localhost` happens to be.
+# Run `make doctor` to see the fully resolved values for any profile.
+#
+# Profiles (conf/platform.<name>.yaml):
+#   dev         host development — local PostgreSQL + Redis, services on localhost
+#   docker      single-machine all-container stack (compose service names)
+#   cell        containerized Cell stack       (cell-pg / cell-redis)
+#   global      containerized Global tier      (global-pg, identity only)
+#   k8s-cell    Kubernetes Cell overlay        (in-cluster Service DNS)
+#   k8s-global  Kubernetes Global overlay      (in-cluster Service DNS)
 
 # ── Database ──────────────────────────────────────────────────────────
-# Default database for all services. Individual services may override via
-# the `services` sub-map (e.g. gateway auth uses its own SQLite).
+# PostgreSQL everywhere: dev, Docker and Kubernetes run the SAME engine, so a
+# dialect-specific defect cannot reach production without appearing locally
+# first. The type is still a field (sqlite/mysql/postgresql all work) but
+# nothing in the shipped profiles selects anything else.
 #
-# Password is env-only: set DB_PASSWORD.
+# Addresses come from the profile. Password is env-only: DB_PASSWORD. On the
+# local flows that env value is itself injected from the single truth file
+# .data/postgres_password (see scripts/dev-lib.sh::ensure_pg_password), so
+# "what the clients declare" and "what the volume holds" cannot drift apart.
 database:
-  type: "mysql"                         # "sqlite" | "mysql" | "postgresql"
-  host: "localhost"
-  port: 3306
-  name: "datacode"
-  username: "root"
-  # password: env-only (DB_PASSWORD)
+  type: "postgresql"                    # "sqlite" | "mysql" | "postgresql"
+  # host / port / name / username: see the active profile.
+  # Connection pool sizing is an invariant of the workload, not of the
+  # environment, so it stays here.
   pool_size: 5
   pool_overflow: 10
 
-  # Per-service database routing.
+  # Per-service database routing — and the Global/Cell tier boundary (P7).
   #
-  # gateway_auth: When omitted, Gateway auth uses the base database above
-  #   (MySQL/PostgreSQL). To use a separate SQLite file for auth instead,
-  #   uncomment the gateway_auth entry below. This is useful for
-  #   zero-dependency dev mode.
+  # TWO TIERS, and the distinction is not stylistic:
   #
-  # agent: When omitted, agent-service uses the base database above.
-  #   Uncomment to use a separate SQLite file for zero-dependency dev mode.
-  #services:
-    # gateway_auth:
-    #   type: "sqlite"
-    #   sqlite_path: ".data/gateway.db"
-    # agent:
-    #   type: "sqlite"
-    #   sqlite_path: ".data/datacode.db"
+  #   Global  one instance for the whole platform. Identity: users, tenants,
+  #           roles, and `tenant_placement` (which cell a tenant lives in).
+  #           Every cell reads it; losing it stops new logins everywhere.
+  #   Cell    one instance per cell. That cell's workspaces, environments,
+  #           quotas and audit records. Losing it affects one cell's tenants —
+  #           which is the entire point of cells.
+  #
+  # `services.identity` is what performs the split, and only the cell/global
+  # profiles set it. A single-tier install leaves it unset and everything
+  # shares one database, which is correct for dev and for a one-cell deploy.
+  #
+  # A multi-cell install MUST also set `cells.expect_global_db: true`. Without
+  # it, a missing or misspelled override silently falls back to the CELL
+  # database: nothing fails, identity tables are created next to the cell's
+  # own, and every cell ends up sharing one cell's users. The declaration turns
+  # that into a startup error (datacode_common/db_topology.py).
+  #
+  # NOTE: the former `gateway_auth` entry is gone. The gateway opens no
+  # database at all since P5.5 — it proxies /auth to identity-service and
+  # decides from an authorization snapshot.
+
+# ── Cells ─────────────────────────────────────────────────────────────
+# The SHAPE of the installation. This instance's own identity comes from
+# DATACODE_CELL_ID (see datacode_common/cell.py), so every cell shares this
+# file AND its profile unchanged — one file per cell would drift the moment
+# one of them is edited.
+cells:
+  # Set to true once `database.services.identity` points at the Global
+  # instance. Guarded at startup: declaring the split without performing it is
+  # refused, because the failure mode is silent (see the note above).
+  expect_global_db: false
+  # Where the global edge sends a request that carries NO placement — a token
+  # issued before placement existed, or a tenant that has not been placed yet.
+  # NOT a fallback for a known-but-unreachable cell: sending a tenant to the
+  # wrong cell shows them an empty platform, which is worse than an error.
+  default_cell: "cell-0"
+
+# ── Redis ─────────────────────────────────────────────────────────────
+# Shared coordination backend. Everything that must be consistent ACROSS
+# replicas lives here: login rate limiting (identity-service), SQLMesh
+# environment locks, working-copy leases, and the SSE event bus / run registry.
+#
+# `key_prefix` namespaces every key this platform writes, so one Redis
+# instance can host several environments without collisions. Individual
+# domains append their own segment, e.g. "{key_prefix}:sm:env_lock:{id}".
+#
+# `enabled: false` makes every consumer fall back to its in-process
+# implementation. That fallback is correct for a SINGLE replica only —
+# with multiple replicas it silently disables cross-replica coordination,
+# which is why each consumer logs a warning when it takes that path.
+#
+# Address comes from the profile. Password is env-only: REDIS_PASSWORD.
+redis:
+  enabled: true
+  db: 0
+  key_prefix: "datacode"
+  # Bound how long a caller waits on a coordination primitive: these calls sit
+  # on the request path, so a stalled Redis must fail fast rather than hang.
+  connect_timeout_seconds: 3
+  operation_timeout_seconds: 3
+  max_connections: 32
 
 # ── Workspace Storage ──────────────────────────────────────────────────
-# Base directory for all workspace data. Must be consistent across
-# sqlmesh-service, dagster-service, and ontology-service.
-workspace:
-  base_path: "~/.datacode/workspaces"
+# Base directory for all workspace data — set per profile, because it is a
+# mount point and every environment mounts differently. It must be consistent
+# across every service of one deployment (they share the working-copy layout).
+#
+# workspace.base_path: see the active profile.
 
 # ── Service Topology ──────────────────────────────────────────────────
-# Single source of truth for inter-service URLs. Each service reads its
-# own entry plus the URLs of its dependencies.
-services:
-  gateway:
-    http_url: "http://localhost:8000"
-  agent:
-    ws_url: "ws://localhost:8001"
-    grpc_url: "localhost:50051"
-    rest_url: "http://localhost:8001"
-  sqlmesh:
-    rest_url: "http://localhost:8002"
-    grpc_url: "localhost:50052"
-  ontology:
-    rest_url: "http://localhost:8003"
-  dagster:
-    rest_url: "http://localhost:8004"
-    graphql_url: "http://localhost:3001/graphql"
+# Single source of truth for inter-service URLs; the addresses themselves live
+# in the profile. Each service reads its own entry plus its dependencies'.
+#
+# Ports are frozen platform-wide and identical in every environment, so only
+# the HOST part differs between profiles:
+#   8000 gateway   8001 agent (REST/WS) + 50051 gRPC   8002 workspace-runtime
+#   8003 identity  8004 control          3128 egress-proxy
+#
+# runtime (P3): the merged working-copy owner — SQLMesh engine + ontology +
+# dagster data plane + git + files + gated tools. The standalone sqlmesh /
+# ontology / dagster services were dissolved into it (P3) and their entries
+# removed (P5): leaving them would advertise dead ports.
+#
+# egress_proxy / egress_dns (P6b) are set ONLY by profiles that also deploy a
+# NetworkPolicy. Configuring a proxy without one mediates some traffic while
+# the rest flows freely — an illusion of control rather than the real thing,
+# which is why the dev profile leaves both unset.
 
 # ── Logging ───────────────────────────────────────────────────────────
-# Shared log settings. Individual services may still override via their
-# own YAML or env vars.
+# Level and format are per-profile (dev wants human-readable debug, everything
+# else wants json/info). The workspace mirroring POLICY is an invariant.
 logging:
   level: "info"
   format: "json"                        # "json" | "text"
@@ -88,17 +166,68 @@ logging:
     max_lines_per_sec: 200              # per workspace; excess is dropped
     retention_days: 7                   # older .ndjson files are pruned
 
-# ── Security (documentation only — values are env-only) ──────────────
-# This section documents which env vars each service requires.
-# DO NOT put actual secret values here.
+# ── Security: the environment variable registry ───────────────────────
+# DOCUMENTATION ONLY — never put a secret value in this file. This section is
+# the authoritative list of what each deployment must supply; `make doctor`
+# reads it to report which variables are missing.
+#
+# Format: "env:VAR_NAME" plus a note on who needs it and what breaks without it.
 security:
-  # Gateway JWT signing secret (Gateway only)
-  gateway_jwt_secret: "env:GW_JWT_SECRET"
-  # Database password (all DB-backed services)
+  # ── Required by every deployment ────────────────────────────────────
+  # Database password. Read by all DB-backed services (Python via
+  # DB_PASSWORD directly, identity-service the same). No default anywhere:
+  # a wrong-but-present password crash-loops in ways that look like anything
+  # but an auth failure, so absence must be loud. Locally the value is
+  # injected from .data/postgres_password by the dev scripts / make targets.
   db_password: "env:DB_PASSWORD"
-  # Dagster remote token (dagster-service, remote mode only)
-  dagster_remote_token: "env:DAGSTER_SERVICE_DAGSTER_REMOTE_TOKEN"
-  # Token encryption secret (sqlmesh-service)
-  token_encryption_secret: "env:SQLMESH_SERVICE_TOKEN_ENCRYPTION_SECRET"
-  # LLM API keys (agent-service) — per-model or global fallback
-  # See agent-service.yaml for the full env var naming scheme.
+
+  # Access-token signing secret. SHARED between identity-service (which mints)
+  # and the gateway (which verifies locally, keeping identity off the hot
+  # path). A mismatch rejects every token; a per-cell value would make a token
+  # minted for cell-1 unverifiable by cell-1's own gateway.
+  gateway_jwt_secret: "env:GW_JWT_SECRET"
+
+  # ── Internal service-to-service tokens ──────────────────────────────
+  # Three DISTINCT tokens guarding three different /internal/* surfaces. They
+  # are separate on purpose: possessing one must not grant the others. A
+  # deployment may set them to the same value, but the platform never assumes
+  # it.
+  #
+  # identity-service's /internal/* — authorization snapshots the gateway
+  # decides with, plus the binding writes it delegates, plus tenant placement
+  # and cell registration. Held by identity-service, gateway and
+  # control-service. Unset -> the endpoints are disabled AND the gateway denies
+  # every authorization-requiring route (fail closed, by design).
+  identity_internal_token: "env:IDENTITY_SERVICE_INTERNAL_TOKEN"
+
+  # workspace-runtime's /internal/* — the env-control command channel, lease
+  # accept/drain, code-location inventory. Held by workspace-runtime (which
+  # verifies) and by every caller: the gateway, agent-service and the Dagster
+  # workspace-sync sidecar.
+  runtime_internal_token: "env:WORKSPACE_RUNTIME_INTERNAL_TOKEN"
+
+  # The value control-service SENDS on that same channel. Must equal
+  # WORKSPACE_RUNTIME_INTERNAL_TOKEN on every runtime replica.
+  control_to_runtime_token: "env:CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN"
+
+  # ── Sandbox plane (P6b) ─────────────────────────────────────────────
+  # Signing secret for scoped per-task egress tokens: workspace-runtime mints,
+  # egress-proxy verifies. Deliberately NOT GW_JWT_SECRET — that authenticates
+  # users, this authenticates a sandbox, and the two must not be
+  # interchangeable.
+  task_token_secret: "env:DATACODE_TASK_TOKEN_SECRET"
+
+  # ── Optional ────────────────────────────────────────────────────────
+  # Redis password. Leave unset for a local Redis without requirepass.
+  redis_password: "env:REDIS_PASSWORD"
+
+  # Guards control-service's cell-migration data plane (export / import /
+  # verify / purge). Fail closed: unset disables the endpoints, so a migration
+  # cannot be driven by accident. Only needed while migrating tenants between
+  # cells (scripts/ops/cell-migrate.py).
+  cell_migration_token: "env:CONTROL_SERVICE_CELL_MIGRATION_TOKEN"
+
+  # LLM API keys (agent-service) — a global fallback plus per-model overrides.
+  # Without any key every LLM call fails at runtime. Naming scheme for the
+  # per-model form: see conf/agent-service.yaml.
+  llm_api_key: "env:AGENT_SERVICE_LLM_API_KEY"

@@ -1,5 +1,6 @@
 """Agent Service entry point — app factory and lifespan."""
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -23,12 +24,39 @@ async def lifespan(app: FastAPI):
     load_all_tools()
     SkillRegistry._load_builtin()
     await init_db()
+    # Cross-replica coordination: makes chat runs visible to every replica and
+    # routes cancellation to whichever replica owns the run. Degrades to
+    # single-replica behaviour when Redis is unavailable.
+    from src.runtime.active_runs import start_run_registry, stop_run_registry
+    from src.runtime.session_coordination import get_session_coordination
+
+    await start_run_registry()
+    # Session-state coordination (approval/resume routing, cache invalidation)
+    # shares the same degradation doctrine: Redis down means local-only.
+    await get_session_coordination().start()
+
+    # Session data retention (design 05 §2.3): timeline/memory events are pure
+    # append streams; this is their expiry.
+    retention_task = None
+    if settings.retention_enabled:
+        from src.context.retention import get_session_retention
+
+        retention_task = asyncio.create_task(
+            get_session_retention().start_periodic(settings.retention_interval)
+        )
+
     logger.info("agent_service_starting", ws_port=settings.ws_port)
     logger.info("registered_agents", agents=AgentRegistry.list_agents())
     logger.info("registered_skills", skills=SkillRegistry.list_all())
-    yield
-    await close_db()
-    logger.info("agent_service_stopping")
+    try:
+        yield
+    finally:
+        if retention_task is not None:
+            retention_task.cancel()
+        await get_session_coordination().stop()
+        await stop_run_registry()
+        await close_db()
+        logger.info("agent_service_stopping")
 
 
 def create_app() -> FastAPI:

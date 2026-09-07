@@ -1,0 +1,243 @@
+# Dagster container data plane (design 04 §3.6, roadmap P6c).
+#
+# Two things move to containers here:
+#
+#   1. RUN WORKERS — Dagster's own K8sRunLauncher launches each run as a Pod.
+#      The launcher config below is the only integration point: Dagster reads
+#      it from the instance YAML, no DataCode code involved. What WE provide is
+#      the pod template: the same L3-base hardening envelope the task plane
+#      applies, because a run worker imports the user's code location.
+#
+#   2. CODE LOCATIONS — each environment's gRPC server as an independent Pod
+#      (design 03 §3.6). The runtime-side vehicle switch (process manager ->
+#      pod manager) is the remaining P6c item; this manifest fixes the Pod
+#      CONTRACT it must produce so the two sides cannot drift: labels for
+#      Endpoints-based discovery, the working copy mounted with a narrowing
+#      subPath, no service account token, no service links, user-code pool.
+#
+# Applied to namespace `datacode` (the platform namespace): run workers and
+# code locations are data plane, but they dial the orchestrator rather than
+# being dialed by sandboxes, so they live with the platform — under the same
+# egress NetworkPolicy shape as task sandboxes (see egress-plane.yaml, which
+# selects on the labels defined here).
+---
+# The Dagster instance: K8sRunLauncher with the hardened pod template.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dagster-instance
+  namespace: datacode
+data:
+  dagster.yaml: |
+    run_launcher:
+      module: dagster_k8s
+      class: K8sRunLauncher
+      config:
+        load_incluster_config: true
+        job_namespace: datacode
+        # The template every run Pod inherits. Job name/labels are set by the
+        # launcher; everything below is our envelope.
+        pod_template_spec:
+          metadata:
+            labels:
+              app: dagster-run-worker
+              datacode.io/plane: user-code
+          spec:
+            service_account_name: task-runner-noperm
+            automount_service_account_token: false
+            enable_service_links: false
+            restart_policy: Never
+            node_selector:
+              datacode.io/workload: user-code
+            tolerations:
+              - key: datacode.io/user-code
+                operator: Exists
+                effect: NoSchedule
+            security_context:
+              run_as_non_root: true
+              run_as_user: 65534
+              run_as_group: 65534
+              fs_group: 65534
+              seccomp_profile: { type: RuntimeDefault }
+            containers:
+              - name: run-worker
+                # The code location's image: user code + dagster. The launcher
+                # overrides the command; the envelope below still applies.
+                image_pull_policy: IfNotPresent
+                security_context:
+                  allow_privilege_escalation: false
+                  read_only_root_filesystem: true
+                  capabilities: { drop: ["ALL"] }
+                resources:
+                  requests: { cpu: 250m, memory: 512Mi, ephemeral-storage: 1Gi }
+                  limits:   { cpu: "2",  memory: 4Gi,   ephemeral-storage: 8Gi }
+                volume_mounts:
+                  - name: scratch
+                    mount_path: /tmp
+            volumes:
+              - name: scratch
+                empty_dir: { medium: Memory, size_limit: 2Gi }
+---
+# Code location Pod template — the CONTRACT the pod-mode code location manager
+# must produce (see the manifest header). Checked in as YAML so the manager's
+# output can be diffed against it in review and by
+# workspace-runtime/tests/test_codeloc_pod.py, which loads this ConfigMap and
+# compares it field by field with what src/codeloc/pod.py builds.
+#
+# Keys below are snake_case (descriptive); the manager emits camelCase, which
+# is what the Kubernetes API expects. The test bridges the two spellings — a
+# contract written to be read should not have to be written to be applied.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codeloc-pod-contract
+  # The task plane, NOT the platform namespace: a code location is user code,
+  # so it belongs with the other user-code vehicles — that is where the
+  # ResourceQuota, the LimitRange, the user-code taint and the egress
+  # infrastructure already are. Its NetworkPolicy (code-location-policy) lives
+  # in deploy/egress/egress-plane.yaml, next to the rules for tasks.
+  namespace: datacode-tasks
+data:
+  contract.yaml: |
+    # One Pod per (environment, code location). Owned by the runtime replica
+    # holding the lease; deleted when the deployment is torn down or the
+    # runtime restarts (re-created lazily on next sync).
+    #
+    # Deliberately NOT pinned here: resources and the security context come
+    # from the L3_base isolation profile, which is the single source of
+    # hardening and sizing. A second copy here would drift from it.
+    metadata:
+      labels:
+        app: dagster-code-location
+        datacode.io/plane: user-code
+        datacode.io/environment: "<environment-name>"
+    spec:
+      service_account_name: task-runner-noperm
+      automount_service_account_token: false
+      enable_service_links: false
+      restart_policy: Never
+      node_selector:
+        # Same node as the lease-holding runtime: the code location reads the
+        # working copy, whose hand-off constraints match the task plane's (S1).
+        kubernetes.io/hostname: "<lease-node>"
+        datacode.io/workload: user-code
+      tolerations:
+        - key: datacode.io/user-code
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: code-location
+          # Same image family as the run worker: user code + dagster.
+          command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000"]
+          working_dir: /workspace/asset-dag
+          env:
+            - name: DATACODE_ENVIRONMENT
+              value: "<environment-name>"
+          ports:
+            - name: grpc
+              containerPort: 4000
+          security_context:
+            allow_privilege_escalation: false
+            read_only_root_filesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 2Gi }
+          volume_mounts:
+            - name: workcopy
+              mount_path: /workspace
+              # subPath narrowed to this environment's working copy — the same
+              # T1 closure the task plane applies.
+              sub_path: "<working-copy-subpath>"
+            - name: scratch
+              mount_path: /tmp
+      volumes:
+        - name: workcopy
+          persistent_volume_claim:
+            claim_name: "<per-replica-workcopy-pvc>"
+        - name: scratch
+          empty_dir: { medium: Memory, size_limit: 1Gi }
+---
+# Discovery: a headless Service per code location, so workspace-sync reads
+# K8s Endpoints instead of the runtime's in-process port registry. The
+# pod-mode manager creates this alongside each Pod; the name is deterministic
+# so re-creation after a runtime restart converges on the same object.
+#
+#   apiVersion: v1
+#   kind: Service
+#   metadata:
+#     name: codeloc-<environment-name>
+#     namespace: datacode-tasks
+#   spec:
+#     clusterIP: None
+#     selector:
+#       app: dagster-code-location
+#       datacode.io/environment: "<environment-name>"
+#     ports:
+#       - name: grpc
+#         port: 4000
+#
+# The Endpoints object Kubernetes maintains for this Service IS the registry
+# workspace-sync consumes: present = dialable, absent = gone. No second
+# source of truth to keep consistent.
+---
+# Run workers — the Pods K8sRunLauncher creates for Dagster runs. This policy
+# is the platform-namespace copy of task-runner-default-deny
+# (egress-plane.yaml) and lives here because it selects the labels defined in
+# the pod_template_spec above.
+#
+# SCOPE: run workers ONLY. Code location Pods (app: dagster-code-location) are
+# created in the TASK plane and are covered by `code-location-policy` in
+# deploy/egress/egress-plane.yaml instead — a NetworkPolicy selects within its
+# own namespace, so this rule cannot reach them. Two vehicle kinds, two
+# policies, one namespace each.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: dagster-user-code-egress
+  namespace: datacode
+spec:
+  podSelector:
+    matchExpressions:
+      - key: datacode.io/plane
+        operator: In
+        values: [user-code]
+  policyTypes: [Ingress, Egress]
+  # Ingress: the orchestrator and the code-location dialers only.
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: dagster
+      ports:
+        - protocol: TCP
+          port: 4000
+  egress:
+    # DNS (the platform's own resolver is fine here — these Pods are in the
+    # platform namespace and must resolve the orchestrator, not the internet).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The egress proxy — the same only-outbound-path rule as task sandboxes.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: datacode-tasks
+          podSelector:
+            matchLabels:
+              app: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+    # The orchestrator's gRPC/websocket ports — runs report back to it.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: dagster
+      ports:
+        - protocol: TCP
+          port: 3030

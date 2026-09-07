@@ -24,6 +24,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote_plus
 
 from pydantic import BaseModel
 
@@ -41,11 +42,11 @@ _PACKAGE_FILE = Path(__file__)
 class DatabaseServiceConfig(BaseModel):
     """Per-service database override (subset of :class:`DatabaseConfig`)."""
 
-    type: str = "sqlite"           # "sqlite" | "mysql" | "postgresql"
+    type: str = "postgresql"       # "sqlite" | "mysql" | "postgresql"
     host: str = "localhost"
-    port: int = 3306
+    port: int = 5432
     name: str = "datacode"
-    username: str = "root"
+    username: str = "datacode"
     sqlite_path: str = ".data/datacode.db"
     pool_size: int = 5
     pool_overflow: int = 10
@@ -60,13 +61,22 @@ class DatabaseConfig(BaseModel):
 
     The password is **always** read from the ``DB_PASSWORD`` environment
     variable — it is never stored in YAML.
+
+    The code defaults describe a local PostgreSQL instance (the platform's
+    "PostgreSQL everywhere" decision) and are NOT a supported way to run a
+    service: every shipped profile sets these fields explicitly. They exist
+    so a process started without a profile fails against a coherent target.
+    They must never carry a second dialect's parameters — the previous
+    MySQL-era pair (``port=3306``/``username=root``) combined with the base
+    file's ``type: postgresql`` into a chimera URL that connected to whatever
+    MySQL happened to listen locally.
     """
 
-    type: str = "sqlite"
+    type: str = "postgresql"
     host: str = "localhost"
-    port: int = 3306
+    port: int = 5432
     name: str = "datacode"
-    username: str = "root"
+    username: str = "datacode"
     pool_size: int = 5
     pool_overflow: int = 10
     sqlite_path: str = ".data/datacode.db"
@@ -96,18 +106,88 @@ class DatabaseConfig(BaseModel):
         )
 
 
+class RedisConfig(BaseModel):
+    """Shared coordination backend.
+
+    Redis holds the state that must be identical across replicas: login rate
+    limiting, SQLMesh environment locks and the SSE event bus. It is therefore
+    read from the platform file rather than per-service files — two services
+    disagreeing on the instance or the key prefix would silently stop
+    coordinating with each other.
+
+    The password is **always** read from the ``REDIS_PASSWORD`` environment
+    variable — it is never stored in YAML.
+    """
+
+    enabled: bool = True
+    host: str = "localhost"
+    port: int = 6379
+    db: int = 0
+    key_prefix: str = "datacode"
+    connect_timeout_seconds: float = 3.0
+    operation_timeout_seconds: float = 3.0
+    max_connections: int = 32
+
+    @property
+    def password(self) -> str:
+        """Return the Redis password from the environment (empty when unset)."""
+        return os.getenv("REDIS_PASSWORD", "")
+
+    def url(self) -> str:
+        """Build a ``redis://`` URL for this instance.
+
+        The password is embedded because redis-py's ``from_url`` is the single
+        construction path used across services; callers must therefore treat
+        the result as a secret and never log it.
+        """
+        auth = f":{quote_plus(self.password)}@" if self.password else ""
+        return f"redis://{auth}{self.host}:{self.port}/{self.db}"
+
+    def safe_url(self) -> str:
+        """Return the connection target without credentials, safe to log."""
+        return f"redis://{self.host}:{self.port}/{self.db}"
+
+    def key(self, *segments: str) -> str:
+        """Join *segments* into a fully namespaced key.
+
+        Namespacing every key under ``{key_prefix}:{cell_id}`` lets one Redis
+        instance host several environments (dev/staging) AND several cells
+        without collisions. The cell segment is injected here — not at call
+        sites — so no domain can accidentally build an un-cell-scoped key.
+        """
+        # Imported lazily: cell.py must stay importable even if this config
+        # module is used by a tool that never configured cells.
+        from datacode_common.cell import cell_id
+
+        return ":".join((self.key_prefix, cell_id(), *segments))
+
+
 class ServiceTopology(BaseModel):
     """Inter-service endpoint map — single source of truth.
 
     Each attribute is a ``dict[str, str]`` of endpoint keys (e.g.
     ``{"rest_url": "http://localhost:8002"}``).
+
+    Only services that exist are listed. A field absent here makes its
+    ``services.<name>`` block in the YAML unreadable — which is how
+    ``services.control`` was silently dropped on the Python side while the Go
+    loader read it: the profile declared the address, the model discarded it,
+    and every consumer fell back to an empty string.
     """
 
     gateway: dict[str, str] = {}
     agent: dict[str, str] = {}
-    sqlmesh: dict[str, str] = {}
-    ontology: dict[str, str] = {}
-    dagster: dict[str, str] = {}
+    # runtime: workspace-runtime, the merged owner of working copies (P3).
+    runtime: dict[str, str] = {}
+    # control: control-service, the control plane (P5).
+    control: dict[str, str] = {}
+    # identity: identity-service, the global identity/authz source (P2).
+    identity: dict[str, str] = {}
+    # egress_proxy / egress_dns: the sandbox egress plane (P6b). Only populated
+    # by profiles that also deploy the NetworkPolicies making the proxy a
+    # sandbox's ONLY outbound path.
+    egress_proxy: dict[str, str] = {}
+    egress_dns: dict[str, str] = {}
 
     def url(self, service: str, key: str = "rest_url") -> str:
         """Return the endpoint URL for *service* and *key*.
@@ -147,13 +227,36 @@ class LoggingConfig(BaseModel):
     workspace_file: WorkspaceFileLoggingConfig = WorkspaceFileLoggingConfig()
 
 
+class CellsConfig(BaseModel):
+    """Cell topology declarations (design 03 §2, P7).
+
+    These describe the SHAPE of the installation, not this instance's identity —
+    that comes from ``DATACODE_CELL_ID`` (see :mod:`datacode_common.cell`), so a
+    single file can be shared by every cell.
+    """
+
+    # Whether identity lives in a separate Global database. Declaring it makes a
+    # failed split loud: without the declaration, a missing
+    # ``database.services.identity`` override silently falls back to the CELL
+    # database and every cell ends up sharing one cell's users. See
+    # :mod:`datacode_common.db_topology`.
+    expect_global_db: bool = False
+    # Cell whose stack the global edge should reach when a request carries no
+    # placement (a token issued before placement existed, or an unplaced tenant).
+    # Not a fallback for a KNOWN-but-unreachable cell: routing a tenant to the
+    # wrong cell would show them an empty platform, which is worse than an error.
+    default_cell: str = "cell-0"
+
+
 class PlatformConfig(BaseModel):
     """Top-level shared platform configuration."""
 
     database: DatabaseConfig = DatabaseConfig()
+    redis: RedisConfig = RedisConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     services: ServiceTopology = ServiceTopology()
     logging: LoggingConfig = LoggingConfig()
+    cells: CellsConfig = CellsConfig()
 
     # ── Convenience accessors ──────────────────────────────────────────
 
@@ -204,6 +307,26 @@ def _load_platform() -> PlatformConfig:
         if override:
             logger.debug("Loaded platform.%s.yaml: %s keys", env, len(override))
             base = _deep_merge(base, override)
+        else:
+            # A typo in DATACODE_ENV is otherwise indistinguishable from "no
+            # profile": the base loads fine and the process runs on defaults.
+            logger.warning(
+                "config_profile_not_found profile=%s expected_file=platform.%s.yaml "
+                "-- running on base defaults, which carry no usable addresses",
+                env,
+                env,
+            )
+    else:
+        # conf/platform.yaml is deliberately address-free, so without a profile
+        # every host/URL falls back to a code default. Those defaults are not
+        # wrong so much as arbitrary, and connecting to an arbitrary localhost
+        # is the failure this warning exists to make visible. `make doctor`
+        # treats the same condition as an error.
+        logger.warning(
+            "config_profile_unset var=DATACODE_ENV "
+            "-- expected one of dev|docker|cell|global|k8s-cell|k8s-global; "
+            "platform addresses will fall back to code defaults"
+        )
 
     # YAML keys whose sub-values are all comments parse as None (e.g.
     # "services:" followed by only commented-out lines). Remove these None

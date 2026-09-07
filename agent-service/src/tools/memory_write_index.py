@@ -8,7 +8,6 @@ automatically injected into agent prompts for context continuity.
 import uuid
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.database import MemoryEventRow, get_session_factory
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry

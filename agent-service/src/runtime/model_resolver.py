@@ -45,6 +45,7 @@ def resolve_model(model_id: str) -> t.Optional[t.Any]:
 
     if model_cfg.base_url or model_cfg.api_key:
         from openai import AsyncOpenAI
+
         from agents import OpenAIChatCompletionsModel
 
         cache_key = (model_cfg.api_key or "", model_cfg.base_url or "", model_cfg.name)

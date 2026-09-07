@@ -6,6 +6,8 @@
  */
 import { watch, ref, computed, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
+import { extractApiMessage } from '@/utils/notifyError'
 import router from '@/router'
 import { useFileStore, type FileNode } from '@/stores/files'
 import { useWorkspaceStore } from '@/stores/workspace'
@@ -240,10 +242,30 @@ async function handleDelete() {
   const ws = workspaceStore.currentWorkspace
   const node = contextMenu.value.node
   if (!ws || !node) return
-
-  await fileStore.deleteFile(ws.path, node.path)
-  await fileStore.loadFileTree(ws.path)
   closeContextMenu()
+
+  // The only irreversible action in the explorer, and the backend's delete is
+  // recursive for directories — so it is named twice (title + body: the folder
+  // itself and everything inside it) before a single request is sent.
+  const dialog = DialogPlugin.confirm({
+    header: node.isDirectory ? t('files.deleteDirTitle') : t('files.deleteFileTitle'),
+    body: node.isDirectory
+      ? t('files.deleteDirConfirm', { name: node.name })
+      : t('files.deleteFileConfirm', { name: node.name }),
+    theme: 'warning',
+    confirmBtn: t('common.delete'),
+    cancelBtn: t('common.cancel'),
+    onConfirm: async () => {
+      dialog.hide()
+      try {
+        await fileStore.deleteFile(ws.path, node.path)
+        await fileStore.loadFileTree(ws.path)
+        MessagePlugin.success(t('files.deleted'))
+      } catch (e: any) {
+        MessagePlugin.error(extractApiMessage(e, 'Delete failed'))
+      }
+    },
+  })
 }
 
 async function handleRefresh() {

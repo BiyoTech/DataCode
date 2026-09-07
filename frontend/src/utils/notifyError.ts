@@ -44,6 +44,12 @@ export interface ApiErrorBody {
   git_remote_host?: string
   /** Redacted git stderr, kept for support/diagnostics only. */
   git_detail?: string
+  /** Which tenant quota was exhausted (QUOTA_EXCEEDED, inlined at top level). */
+  quota_resource?: string
+  /** Ceiling of the exhausted quota. */
+  quota_limit?: number
+  /** Live usage at the moment of the rejection. */
+  quota_current?: number
 }
 
 export interface ParsedApiError {
@@ -131,11 +137,14 @@ function stringifyDetail(detail: ApiErrorDetail): string {
 /**
  * Reason codes a rejected remote Git operation can carry, mapped to i18n keys.
  *
- * The backend answers `GIT_REMOTE_ACCESS_DENIED` with a stable
- * `git_error_reason` instead of raw git stderr, so the user reads an
- * actionable sentence in their own language ("the token has no write access to
- * this repository") rather than "The requested URL returned error: 403".
- * Unknown reasons fall through to the backend's English message.
+ * The backend answers `GIT_REMOTE_ACCESS_DENIED` / `GIT_OPERATION_FAILED` with a
+ * stable `git_error_reason`, so the user reads an actionable sentence in their
+ * own language ("the token has no write access to this repository") rather than
+ * "The requested URL returned error: 403".
+ *
+ * This map is the frontend's copy of `datacode_common.git_reasons`; a shared
+ * contract test fails when the two disagree, because a missing key here
+ * silently degrades the error to the generic fallback message.
  */
 const GIT_REASON_KEYS: Record<string, string> = {
   credential_missing: 'errors.git.credentialMissing',
@@ -145,7 +154,31 @@ const GIT_REASON_KEYS: Record<string, string> = {
   non_fast_forward: 'errors.git.nonFastForward',
   branch_not_found: 'errors.git.branchNotFound',
   host_unreachable: 'errors.git.hostUnreachable',
+  repo_creation_denied: 'errors.git.repoCreationDenied',
+  repo_creation_failed: 'errors.git.repoCreationFailed',
+  remote_empty: 'errors.git.remoteEmpty',
   unknown: 'errors.git.unknown',
+}
+
+/** Upper bound on the raw git output appended to a message. */
+const GIT_DETAIL_MAX_CHARS = 400
+
+/**
+ * Collapse the redacted git output into something a toast can carry.
+ *
+ * Git writes multi-line stderr with repeated `remote:` prefixes; keeping the
+ * line structure but trimming the noise is what makes the original wording
+ * ("Repository not found.") recognizable to the user.
+ */
+function formatGitDetail(detail: string): string {
+  const cleaned = detail
+    .split('\n')
+    .map((line) => line.replace(/^remote:\s*/, '').trim())
+    .filter((line) => line.length > 0)
+    .join(' ')
+  return cleaned.length > GIT_DETAIL_MAX_CHARS
+    ? `${cleaned.slice(0, GIT_DETAIL_MAX_CHARS)}…`
+    : cleaned
 }
 
 function localizeGitError(data?: ApiErrorBody): string {
@@ -160,13 +193,51 @@ function localizeGitError(data?: ApiErrorBody): string {
   const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
   const message = t(key, { host: data?.git_remote_host || '' })
 
-  // "unknown" is the only reason with no actionable sentence of its own, so the
-  // redacted git stderr is the whole diagnosis. Showing it here saves a trip to
-  // the log panel for the one case that most needs it.
-  if (reason === 'unknown' && data?.git_detail) {
-    return `${message} ${data.git_detail}`
+  // The remote's own wording is appended for EVERY reason, not just "unknown":
+  // the localized sentence explains the class of problem, while the raw output
+  // names the concrete object ("repository 'https://.../x.git' not found"). The
+  // absence of that line is what made these failures unactionable.
+  const detail = data?.git_detail ? formatGitDetail(data.git_detail) : ''
+  return detail ? `${message} (${detail})` : message
+}
+
+/**
+ * Resource codes the quota endpoint and the 429 payload share, mapped to i18n
+ * keys. The same vocabulary must localize both places: a user rejected with
+ * "concurrent_leases quota reached" and then shown a quota panel saying "open
+ * working copy" must recognize they are the same thing.
+ */
+const QUOTA_RESOURCE_KEYS: Record<string, string> = {
+  workspace: 'errors.quota.workspace',
+  environment: 'errors.quota.environment',
+  concurrent_leases: 'errors.quota.concurrent_leases',
+  runtime_replicas: 'errors.quota.runtime_replicas',
+}
+
+/**
+ * Localized message for a quota rejection (QUOTA_EXCEEDED / 429).
+ *
+ * The backend inlines `quota_resource`, `quota_limit` and `quota_current` at the
+ * top level of the error body. Without this path the user sees the backend's
+ * English message with the raw resource code in it ("Tenant t1 reached its
+ * concurrent_leases quota"); with it they get a localized sentence naming the
+ * budget in the platform's own vocabulary and their actual numbers.
+ */
+function localizeQuotaError(data?: ApiErrorBody): string {
+  if (!data?.quota_resource && data?.error_code !== 'QUOTA_EXCEEDED') {
+    return ''
   }
-  return message
+  const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
+  const resourceKey = QUOTA_RESOURCE_KEYS[data?.quota_resource || '']
+  const resource = resourceKey ? t(resourceKey) : (data?.quota_resource || '')
+  const limit = typeof data?.quota_limit === 'number' ? data.quota_limit : undefined
+  const current =
+    typeof data?.quota_current === 'number' ? data.quota_current : undefined
+
+  if (resource && limit !== undefined && current !== undefined) {
+    return t('errors.quota.exceeded', { resource, current, limit })
+  }
+  return t('errors.quota.default')
 }
 
 /**
@@ -195,6 +266,18 @@ export function extractApiError(error: unknown, fallback = 'Request failed'): Pa
       message: gitMessage,
       errorCode: data?.error_code,
       detail: data?.git_detail || data?.detail,
+    }
+  }
+
+  // Quota rejections: the numbers make the sentence actionable and localized,
+  // and the 429 means the user did nothing wrong — same reasoning as the
+  // authorization path below.
+  const quotaMessage = localizeQuotaError(data)
+  if (quotaMessage) {
+    return {
+      message: quotaMessage,
+      errorCode: data?.error_code,
+      detail: data?.detail,
     }
   }
 

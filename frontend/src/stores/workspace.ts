@@ -12,6 +12,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '@/utils/api'
 import { notifyError } from '@/utils/notifyError'
+import { useQuotaStore } from './quotas'
 
 /** Reason codes returned by the backend when a workspace cannot be opened. */
 export type OpenBlockedReason = '' | 'no_git_repo'
@@ -297,17 +298,27 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     dialect = 'duckdb',
     gitRepoUrl = ''
   ): Promise<WorkspaceInfo> {
-    const { data } = await api.post('/workspaces', {
-      name,
-      dialect,
-      git_repo_url: gitRepoUrl,
-    })
+    try {
+      const { data } = await api.post('/workspaces', {
+        name,
+        dialect,
+        git_repo_url: gitRepoUrl,
+      })
 
-    const ws = toWorkspaceInfo(data)
-    workspaces.value.push(ws)
-    // The creator's local scaffold already exists; open it to obtain its path.
-    await openWorkspace(ws.id)
-    return ws
+      const ws = toWorkspaceInfo(data)
+      workspaces.value.push(ws)
+      // The creator's local scaffold already exists; open it to obtain its path.
+      await openWorkspace(ws.id)
+      return ws
+    } catch (err) {
+      // A quota rejection must refresh the cached overview, so the panel the
+      // user opens next shows the server's numbers rather than a stale budget.
+      if ((err as { response?: { data?: { error_code?: string } } })?.response
+        ?.data?.error_code === 'QUOTA_EXCEEDED') {
+        void useQuotaStore().refresh()
+      }
+      throw err
+    }
   }
 
   /**
@@ -349,11 +360,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   /**
    * Delete a workspace (owner only).
+   *
+   * Deletion is complete and irreversible on the platform side: rows, leases,
+   * working copies, derived data. The remote Git repository is always preserved,
+   * which is why this takes no options — there is nothing left to choose.
    */
-  async function deleteWorkspace(workspaceId: string, deleteRemote = false): Promise<void> {
-    await api.delete(`/workspaces/${workspaceId}`, {
-      params: { delete_remote: deleteRemote },
-    })
+  async function deleteWorkspace(workspaceId: string): Promise<void> {
+    await api.delete(`/workspaces/${workspaceId}`)
     removeWorkspace(workspaceId)
   }
 

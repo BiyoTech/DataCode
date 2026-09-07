@@ -1,0 +1,247 @@
+# One CELL's complete stack (design 03 §2, design 06 P7) — profile: cell.
+#
+# Parameterized, not copied per cell: a second file for cell-1 would drift from
+# cell-0's the first time one of them is changed, and the drift would show up as
+# "this tenant's platform behaves differently", which is very hard to attribute.
+#
+# Usage — the compose PROJECT name is what separates the cells:
+#
+#   DATACODE_CELL_ID=cell-0 \
+#     docker compose -f deploy/docker-compose.global.yml -p datacode-global up -d
+#   DATACODE_CELL_ID=cell-0 \
+#     docker compose -f deploy/docker-compose.cell.yml -p datacode-cell-0 up -d
+#
+#   # A second cell on the same host: copy deploy/.env.cell-1.example to
+#   # deploy/.env.cell-1 and pass --env-file, so every published port is an
+#   # EXPLICIT variable (compose cannot do arithmetic, and the previous
+#   # ${CELL_PORT_BASE} string-prefix trick produced ports like 1008000,
+#   # which compose rejects outright).
+#
+# What a cell owns
+# ----------------
+# Its own Postgres, Redis, gateway, control-service, agent-service and
+# workspace-runtime replicas. NOTHING is shared with another cell — that is the
+# definition of the unit, and it is what bounds the blast radius: losing this
+# stack affects exactly the tenants placed here.
+#
+# What it does NOT own:
+#   * identity        — the global tier (docker-compose.global.yml), reached
+#                       over the `datacode-global` network;
+#   * the frontend    — served by whichever tier fronts this cell (the
+#                       single-machine stack or the ingress);
+#   * Dagster         — stackable via docker-compose.dagster.yml;
+#   * egress plane    — Kubernetes only (a proxy without a NetworkPolicy is an
+#                       illusion of control).
+
+name: datacode-cell
+
+x-cell-env: &cell-env
+  # Every service in this stack learns its cell identity from ONE variable, and
+  # it lands in log lines, metric labels and Redis key prefixes. A cell whose
+  # services disagreed about their id would silently split its own coordination
+  # state (two lease namespaces over one filesystem), so it is set once here.
+  DATACODE_CELL_ID: ${DATACODE_CELL_ID:?set DATACODE_CELL_ID, e.g. cell-0}
+  # ONE config mechanism, same as every other stack: the repository's conf/
+  # mounted read-only, profile `cell` on top of the shared base.
+  CONFIG_PATH: /app/conf
+  DATACODE_ENV: cell
+  DB_PASSWORD: ${DB_PASSWORD}
+  WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+  CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+  IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+
+services:
+  cell-pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: datacode
+      POSTGRES_USER: datacode
+      # Password from the truth file (see deploy/docker-compose.infra.yml's
+      # postgres for the rationale): the Makefile injects DB_PASSWORD from
+      # the same file for every client, and only `make pg-set-password` may
+      # change it. The file must exist before `docker compose up` —
+      # `scripts/pg-password.sh ensure` creates it.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    ports:
+      - "${CELL_PG_PORT:-5432}:5432"
+    volumes:
+      - cell_pg_data:/var/lib/postgresql/data
+      - ../.data/postgres_password:/run/secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datacode -d datacode"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  cell-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${CELL_REDIS_PORT:-6379}:6379"
+    volumes:
+      - cell_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # One-shot migration for the CELL database only (identity tables live in the
+  # global tier and are migrated there). Creates the control-plane tables and
+  # runs the alembic chain — the ONLY creator of the control-owned tables
+  # (control-service/src/db_migrate.py). Idempotent; services wait for it.
+  migrate:
+    build:
+      context: ..
+      dockerfile: control-service/Dockerfile
+    environment:
+      <<: *cell-env
+    volumes:
+      - ../conf:/app/conf:ro
+    command: ["python", "-m", "src.db_migrate"]
+    depends_on:
+      cell-pg:
+        condition: service_healthy
+    restart: "no"
+
+  # The cell's edge. Verifies tokens minted by the GLOBAL identity service (same
+  # GW_JWT_SECRET), then refuses any request whose `cell_id` claim names another
+  # cell — answering 421 with that cell's address rather than proxying, so this
+  # cell's availability never depends on another's.
+  gateway:
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    environment:
+      <<: *cell-env
+      GW_JWT_SECRET: ${GW_JWT_SECRET:?injected by make from .data/gateway_jwt_secret}
+    volumes:
+      - ../conf:/app/conf:ro
+    ports:
+      - "${CELL_GATEWAY_PORT:-8000}:8000"
+    depends_on:
+      cell-redis:
+        condition: service_healthy
+      control-service:
+        condition: service_healthy
+    networks: [default, global]
+    restart: unless-stopped
+
+  # Registers this cell's endpoint in the global registry at startup, so the
+  # global edge has an address to send misdirected clients to. Fail-open: a cell
+  # that cannot reach the global tier still serves the tenants already on it.
+  control-service:
+    build:
+      context: ..
+      dockerfile: control-service/Dockerfile
+    environment:
+      <<: *cell-env
+      AUTO_MIGRATE: "0"
+      CONTROL_SERVICE_ENV_LOCK_BACKEND: redis
+      # The address the GLOBAL edge should dial for this cell. Env-only: it
+      # depends on the ingress in front of THIS cell, which no shared config
+      # file can know. Unset means "do not register", the single-cell default.
+      DATACODE_CELL_ENDPOINT: ${DATACODE_CELL_ENDPOINT:-}
+      DATACODE_CELL_REGION: ${DATACODE_CELL_REGION:-}
+      # Declare the Global/Cell split so a misconfigured database.services
+      # override is refused at startup instead of quietly putting identity
+      # tables in this cell's database.
+      DATACODE_EXPECT_GLOBAL_DB: "1"
+    volumes:
+      - ../conf:/app/conf:ro
+    ports:
+      - "${CELL_CONTROL_PORT:-8004}:8004"
+    depends_on:
+      cell-pg:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [default, global]
+    restart: unless-stopped
+
+  agent-service:
+    build:
+      context: ..
+      dockerfile: agent-service/Dockerfile
+    environment:
+      <<: *cell-env
+      AGENT_SERVICE_LLM_API_KEY: ${AGENT_SERVICE_LLM_API_KEY:-}
+    volumes:
+      - ../conf:/app/conf:ro
+    ports:
+      - "${CELL_AGENT_PORT:-8001}:8001"
+    depends_on:
+      cell-pg:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Data plane. Two replicas because the lease router's single-writer property
+  # is only exercised with more than one — a single replica would make every
+  # routing bug invisible until production.
+  workspace-runtime-1: &workspace-runtime
+    build:
+      context: ..
+      dockerfile: workspace-runtime/Dockerfile
+    environment:
+      <<: *cell-env
+      # Leases ON with per-replica volumes: the lease is the single-writer
+      # guarantee, and a volume per replica makes a lease violation a visible
+      # error instead of silent Git corruption across replicas.
+      WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
+      WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: instance_local
+      WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /data/workspaces
+      WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
+      DATACODE_RUNTIME_ID: workspace-runtime-1
+      DATACODE_REPLICA_ID: workspace-runtime-1
+      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
+    volumes:
+      - ../conf:/app/conf:ro
+      - cell_workspaces_1:/data/workspaces
+    ports:
+      - "${CELL_RUNTIME_PORT:-8002}:8002"
+    depends_on:
+      cell-pg:
+        condition: service_healthy
+      cell-redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  workspace-runtime-2:
+    <<: *workspace-runtime
+    environment:
+      <<: *cell-env
+      WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
+      WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: instance_local
+      WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /data/workspaces
+      WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
+      DATACODE_RUNTIME_ID: workspace-runtime-2
+      DATACODE_REPLICA_ID: workspace-runtime-2
+      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
+    volumes:
+      - ../conf:/app/conf:ro
+      - cell_workspaces_2:/data/workspaces
+    ports:
+      - "${CELL_RUNTIME2_PORT:-8012}:8002"
+
+volumes:
+  cell_pg_data:
+  cell_redis_data:
+  cell_workspaces_1:
+  cell_workspaces_2:
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME:-datacode-cell}-internal
+  # The global tier's network, created by docker-compose.global.yml. External so
+  # a cell fails to start with a clear error when the global stack was never
+  # brought up, rather than silently creating an empty network and reporting
+  # "identity unreachable" from every service.
+  global:
+    name: datacode-global
+    external: true

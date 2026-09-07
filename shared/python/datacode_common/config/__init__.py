@@ -10,6 +10,7 @@ from datacode_common.config.platform import (
     platform_config,
 )
 from datacode_common.config.yaml_loader import (
+    drop_env_provided_keys,
     find_config_file,
     flatten_yaml_mapping,
     load_yaml_config,
@@ -17,6 +18,7 @@ from datacode_common.config.yaml_loader import (
 
 __all__ = [
     # YAML loader
+    "drop_env_provided_keys",
     "find_config_file",
     "flatten_yaml_mapping",
     "load_yaml_config",

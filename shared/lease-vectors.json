@@ -1,0 +1,96 @@
+{
+  "_comment": [
+    "Cross-language lease-key vectors (design 06 P4a).",
+    "Read by BOTH shared/go/lease/key_test.go and",
+    "shared/python/tests/test_lease_contract.py, so the Go and Python",
+    "implementations are checked against the same expectations instead of",
+    "against each other's source.",
+    "Why a shared fixture: a lease key formatted differently in Go than in",
+    "Python does not fail loudly. It produces a Redis miss, the gateway asks",
+    "for a new lease, and a working copy already mounted elsewhere gets",
+    "mounted a second time -- the exact corruption the lease prevents.",
+    "Add a case here whenever either side's parsing changes."
+  ],
+  "valid_keys": [
+    {
+      "tenant_id": "t1",
+      "workspace_id": "ws-t1-shop",
+      "user_id": "u1",
+      "environment": "dev",
+      "key": "t1/ws-t1-shop/u1/dev"
+    },
+    {
+      "tenant_id": "tenant-a",
+      "workspace_id": "ws-tenant-a-analytics",
+      "user_id": "user.name",
+      "environment": "prod",
+      "key": "tenant-a/ws-tenant-a-analytics/user.name/prod"
+    },
+    {
+      "tenant_id": "t2",
+      "workspace_id": "ws-t2-x",
+      "user_id": "u_2",
+      "environment": "feature_branch_1",
+      "key": "t2/ws-t2-x/u_2/feature_branch_1"
+    }
+  ],
+  "invalid_keys": [
+    {"key": "", "why": "empty"},
+    {"key": "t1/ws-t1-shop/u1", "why": "too few segments"},
+    {"key": "t1/ws-t1-shop/u1/dev/extra", "why": "too many segments"},
+    {"key": "t1//u1/dev", "why": "empty workspace segment"},
+    {"key": "t1/ws-t1-shop//dev", "why": "empty user segment"},
+    {"key": "t1/ws-t1-shop/u1/", "why": "empty environment segment"},
+    {"key": "t1/ws-t1-shop/u1/Dev", "why": "uppercase environment"},
+    {"key": "t1/ws-t1-shop/u1/1dev", "why": "environment must start with a letter"},
+    {"key": "t1/ws-t1-shop/u1/d", "why": "environment shorter than two characters"},
+    {"key": "t1/ws-t1-shop/u1/envs", "why": "environment name is reserved"},
+    {"key": "t1/ws-t1-shop/u1/dev-x", "why": "hyphen not allowed in environment"}
+  ],
+  "working_copy_paths": [
+    {
+      "path": "/var/lib/datacode/workcopies/t1/ws-t1-shop/u1/envs/dev",
+      "key": "t1/ws-t1-shop/u1/dev"
+    },
+    {
+      "path": "/home/user/.datacode/workspaces/t1/ws-t1-shop/u1/envs/dev",
+      "key": "t1/ws-t1-shop/u1/dev"
+    },
+    {
+      "path": "/base/t1/ws-t1-shop/u1/envs/dev/",
+      "key": "t1/ws-t1-shop/u1/dev"
+    }
+  ],
+  "invalid_working_copy_paths": [
+    {"path": "", "why": "empty"},
+    {"path": "/base/t1/ws-t1-shop/u1", "why": "user root is not leasable"},
+    {"path": "/base/t1/ws-t1-shop/u1/.repo", "why": "shared object database is not leasable"},
+    {"path": "/base/t1/ws-t1-shop/u1/other/dev", "why": "missing envs level"},
+    {"path": "/base/t1/ws-t1-shop/u1/envs/dev/models", "why": "nested path below a working copy"}
+  ],
+  "_routing_comment": [
+    "The two vectors below pin the ROUTING half of the contract, which the",
+    "gateway (Go) and agent-service (Python) both compute. Both must reach",
+    "the same replica for one working copy: if they disagree, two writers",
+    "end up on one Git worktree, which is what the lease exists to prevent.",
+    "normalize_addr mirrors lease.NormalizeAddr /",
+    "datacode_common.lease.normalize_runtime_addr; stable_hash mirrors",
+    "lease.StableHashIndex / datacode_common.lease.stable_hash_index (FNV-1a",
+    "32-bit over the lease key, modulo the candidate count)."
+  ],
+  "normalize_addr": [
+    {"addr": "10.1.2.3:8002", "expected": "http://10.1.2.3:8002", "why": "holder stores host:port; the scheme is the caller's concern"},
+    {"addr": "workspace-runtime-0.runtime:8002", "expected": "http://workspace-runtime-0.runtime:8002", "why": "pod DNS name"},
+    {"addr": "http://10.1.2.3:8002/", "expected": "http://10.1.2.3:8002", "why": "trailing slash would double up when a path is appended"},
+    {"addr": "https://runtime.internal:8443", "expected": "https://runtime.internal:8443", "why": "an explicit scheme passes through so TLS needs no code change"},
+    {"addr": "", "expected": "", "why": "nothing to dial"}
+  ],
+  "stable_hash": [
+    {"key": "t1/ws-t1-shop/u1/dev", "count": 1, "index": 0},
+    {"key": "t1/ws-t1-shop/u1/dev", "count": 3, "index": 1},
+    {"key": "t1/ws-t1-shop/u1/prod", "count": 3, "index": 2},
+    {"key": "t1/ws-t1-shop/u2/dev", "count": 3, "index": 1},
+    {"key": "tenant-a/ws-tenant-a-analytics/user.name/prod", "count": 7, "index": 6},
+    {"key": "t2/ws-t2-x/u_2/feature_branch_1", "count": 16, "index": 11}
+  ]
+}

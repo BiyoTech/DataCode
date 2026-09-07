@@ -25,9 +25,9 @@ import typing as t
 from pathlib import Path
 
 import yaml
-from agents import Agent, handoff
 
-from src.agents.handoff_filters import HandoffFilterRegistry, resolve_handoff_config
+from agents import Agent, handoff
+from src.agents.handoff_filters import resolve_handoff_config
 from src.context.execution_style import compose_execution_instructions
 from src.skills.registry import SkillRegistry
 from src.tools.registry import ToolRegistry
@@ -106,7 +106,10 @@ def load_agent_config(name: str) -> t.Dict[str, t.Any]:
     # private — callers access config via normal dict keys.
     config["_source_mtime"] = current_mtime
     _config_cache[name] = config
-    logger.info("agent_config_loaded", agent=name, path=str(yaml_path), cache="miss" if cached else "init")
+    logger.info(
+    "agent_config_loaded", agent=name, path=str(yaml_path),
+    cache="miss" if cached else "init",
+)
     return config
 
 
@@ -285,7 +288,10 @@ def create_agent(
                 environment=environment,
             )
             tools.append(shell_tool)
-            logger.info("shell_tool_injected", agent=name, workspace_path=workspace_path, user_id=user_id, environment=environment)
+            logger.info(
+    "shell_tool_injected", agent=name, workspace_path=workspace_path,
+    user_id=user_id, environment=environment,
+)
         except Exception as e:
             logger.warning("shell_tool_injection_failed", agent=name, error=str(e))
 
@@ -295,7 +301,8 @@ def create_agent(
     # when the key is ABSENT — so a present-but-empty key would yield None and
     # crash the loop below with 'NoneType' object is not iterable.
     handoff_names = config.get("handoffs") or []
-    handoff_context_cfg = config.get("handoff_context")  # optional: dict with default_filter + targets
+    # optional: dict with default_filter + targets
+    handoff_context_cfg = config.get("handoff_context")
     handoffs = []
     for entry in handoff_names:
         # Support both plain string names and {name: ..., ...} dict entries

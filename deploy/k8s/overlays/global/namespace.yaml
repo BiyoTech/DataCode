@@ -1,0 +1,9 @@
+# The global tier's own namespace. datacode-tasks is NOT created here: no user
+# code ever runs in the global tier.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: datacode-global
+  labels:
+    name: datacode-global

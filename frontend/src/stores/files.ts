@@ -1,10 +1,18 @@
 /**
  * File store - manages file tree state, open files, and file content.
  * Provides file operations backed by the Gateway API.
+ *
+ * Also owns the editor draft autosave layer (design 07 Q6): keystrokes are
+ * debounced for 5 seconds into `file_drafts` in the database, so typed-but-
+ * unsaved work survives even the loss of a replica's disk. The draft is
+ * deleted on save and restored (as a dirty buffer) when a file is opened.
  */
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { MessagePlugin } from 'tdesign-vue-next'
 import api from '@/utils/api'
+import { i18n } from '@/i18n'
+import { useWorkspaceStore } from '@/stores/workspace'
 
 export interface FileNode {
   path: string          // Relative to workspace root
@@ -29,6 +37,8 @@ export interface OpenFile {
 }
 
 export const useFileStore = defineStore('files', () => {
+  const workspaceStore = useWorkspaceStore()
+
   // File tree state
   const fileTree = ref<FileNode[]>([])
   const isLoadingTree = ref(false)
@@ -175,16 +185,18 @@ export const useFileStore = defineStore('files', () => {
     const name = filePath.split('/').pop() || filePath
     const language = detectLanguage(name)
 
-    openFiles.value.push({
+    const file: OpenFile = {
       path: filePath,
       name,
       content: data.content,
       language,
       isDirty: false,
       originalContent: data.content,
-    })
-
+    }
+    openFiles.value.push(file)
     activeFilePath.value = filePath
+
+    await restoreDraftIfNewer(workspacePath, file)
   }
 
   /**
@@ -202,6 +214,10 @@ export const useFileStore = defineStore('files', () => {
 
     file.isDirty = false
     file.originalContent = file.content
+
+    // The draft has served its purpose; keeping it would make the next open
+    // offer keystrokes that were already saved.
+    discardDraft(workspacePath, filePath)
   }
 
   /**
@@ -271,6 +287,9 @@ export const useFileStore = defineStore('files', () => {
     if (!file || file.readOnly) return
     file.content = content
     file.isDirty = content !== file.originalContent
+    // Durability contract <=5 s layer: schedule the draft flush.
+    draftDirty.add(filePath)
+    scheduleDraftFlush()
   }
 
   /**
@@ -279,6 +298,25 @@ export const useFileStore = defineStore('files', () => {
   function closeFile(filePath: string) {
     const idx = openFiles.value.findIndex((f) => f.path === filePath)
     if (idx === -1) return
+
+    // The debounce timer might not have fired yet; flush the draft now or the
+    // last keystrokes are lost with the tab.
+    const wsPath = workspaceStore.currentWorkspace?.path
+    const file = openFiles.value[idx]
+    if (wsPath && draftDirty.has(filePath)) {
+      draftDirty.delete(filePath)
+      void api
+        .put('/files/draft', {
+          workspace_path: wsPath,
+          file_path: filePath,
+          content: file.content,
+        })
+        .catch(() => {
+          /* best-effort: the durability contract is 5 s, not zero */
+        })
+    } else {
+      draftDirty.delete(filePath)
+    }
 
     openFiles.value.splice(idx, 1)
 
@@ -313,14 +351,24 @@ export const useFileStore = defineStore('files', () => {
 
   /**
    * Delete a file or directory.
+   *
+   * The backend has one delete semantic: a directory goes with everything under
+   * it, and neither case can be undone. The confirmation therefore lives in the
+   * caller (the explorer's dialog) — by the time this runs, the user has agreed.
    */
   async function deleteFile(workspacePath: string, filePath: string): Promise<void> {
     await api.post('/files/delete', {
       workspace_path: workspacePath,
       file_path: filePath,
     })
-    // Close tab if open
-    closeFile(filePath)
+    // Close the deleted path's tab and every tab that lived inside it. The
+    // trailing slash matters: "models" must not close "models_old/x.sql".
+    const prefix = `${filePath}/`
+    for (const file of [...openFiles.value]) {
+      if (file.path === filePath || file.path.startsWith(prefix)) {
+        closeFile(file.path)
+      }
+    }
   }
 
   /**
@@ -344,10 +392,96 @@ export const useFileStore = defineStore('files', () => {
     }
   }
 
+  // ── Editor draft autosave (durability contract <=5 s layer, design 07 Q6) ──
+  //
+  // Debounced rather than on-every-keystroke: a draft write is a DB round
+  // trip, and 5 s is exactly the window the contract publishes.
+
+  const DRAFT_DEBOUNCE_MS = 5000
+  const draftDirty = new Set<string>()
+  let draftTimer: ReturnType<typeof setTimeout> | null = null
+
+  function scheduleDraftFlush(): void {
+    if (draftTimer !== null) clearTimeout(draftTimer)
+    draftTimer = setTimeout(() => {
+      draftTimer = null
+      void flushDrafts()
+    }, DRAFT_DEBOUNCE_MS)
+  }
+
+  /** Persist every dirty draft; a failure keeps it dirty for the next edit. */
+  async function flushDrafts(): Promise<void> {
+    const wsPath = workspaceStore.currentWorkspace?.path
+    if (!wsPath || draftDirty.size === 0) return
+    for (const filePath of [...draftDirty]) {
+      const file = openFiles.value.find((f) => f.path === filePath)
+      if (!file) {
+        draftDirty.delete(filePath)
+        continue
+      }
+      const snapshot = file.content
+      try {
+        await api.put('/files/draft', {
+          workspace_path: wsPath,
+          file_path: filePath,
+          content: snapshot,
+        })
+        // Only clear when nothing was typed mid-flight; otherwise the next
+        // keystroke's schedule covers it.
+        if (file.content === snapshot) draftDirty.delete(filePath)
+      } catch {
+        /* silent: the draft layer is best-effort within its 5 s bound */
+      }
+    }
+  }
+
+  /** Delete the draft after a save (or after the user discards a recovery). */
+  function discardDraft(workspacePath: string, filePath: string): void {
+    draftDirty.delete(filePath)
+    void api
+      .post('/files/draft/delete', {
+        workspace_path: workspacePath,
+        file_path: filePath,
+      })
+      .catch(() => {
+        /* a stale draft resurfaces as an already-saved buffer; harmless */
+      })
+  }
+
+  /**
+   * Offer recovery when a newer draft exists (crash restore / the seam with
+   * the WIP snapshot layer: a snapshot can be up to 10 min old, a draft at
+   * most 5 s). The draft replaces the buffer and marks it dirty, so the user
+   * stays in control: save to keep it, close the tab to drop it.
+   */
+  async function restoreDraftIfNewer(
+    workspacePath: string,
+    file: OpenFile,
+  ): Promise<void> {
+    try {
+      const { data } = await api.get('/files/draft', {
+        params: { workspace_path: workspacePath, file_path: file.path },
+      })
+      if (typeof data?.content !== 'string') return
+      if (data.content === file.content) return
+      file.content = data.content
+      file.isDirty = true
+      const t = i18n.global.t as (key: string, named?: Record<string, unknown>) => string
+      MessagePlugin.info(t('editor.draftRestored', { file: file.name }))
+    } catch {
+      /* 404 = no draft: the normal case after every clean save */
+    }
+  }
+
   /**
    * Reset store state (on workspace switch).
    */
   function reset() {
+    if (draftTimer !== null) {
+      clearTimeout(draftTimer)
+      draftTimer = null
+    }
+    draftDirty.clear()
     fileTree.value = []
     flatFiles.value = []
     flatFilesWorkspacePath = ''

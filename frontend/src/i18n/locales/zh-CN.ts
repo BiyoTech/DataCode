@@ -195,8 +195,27 @@ export default {
       nonFastForward: '远端分支存在本地没有的提交，请先执行 Pull，再重新 Push。',
       branchNotFound: '{host} 上不存在所请求的分支。',
       hostUnreachable: '无法连接 {host}，请检查网络与服务器地址。',
+      repoCreationDenied:
+        '当前 {host} 的令牌无权在该 owner 下创建仓库。请为令牌开启目标组织的仓库创建权限（GitHub 细粒度令牌需对该组织开启 Administration: Read and write；经典令牌需勾选 repo 并授权该组织），或将地址改为令牌有写权限的 owner。',
+      repoCreationFailed: '在 {host} 上创建仓库失败。请确认仓库名未被占用且凭据仍然有效。',
+      remoteEmpty: '{host} 上的仓库已存在，但还没有任何分支。',
       unknown: '{host} 上的 Git 操作失败，详情请查看工作区日志。',
     },
+    // 配额超限（429）。后端会附带资源类型、上限与当前用量，因此文案可以
+    // 指明是哪一项额度用尽 —— 否则用户只能看到一个"请求失败"。
+    quota: {
+      default:
+        '已达到组织在该资源上的配额上限。请释放资源，或联系管理员提升限额。',
+      exceeded:
+        '组织已达到{resource}配额上限（{current}/{limit}）。请释放资源，或联系管理员提升限额。',
+      workspace: '工作区',
+      environment: '环境',
+      concurrent_leases: '打开的工作副本',
+      runtime_replicas: '运行时容量',
+    },
+    // 工作副本迁移（503 WORKSPACE_RELOCATING，设计 03 §4.3）。API 客户端会
+    // 透明重试；用户在此期间看到的是这一行 —— 平台正在迁移副本，并非失败。
+    relocating: '工作副本正在迁移到其他运行节点，请求将自动继续…',
   },
   rbac: {
     title: '角色与权限',
@@ -236,14 +255,17 @@ export default {
     gitRepoUrl: 'Git 仓库地址',
     gitRepoUrlPlaceholder: 'https://gitea.example.com/org/repo.git',
     gitRepoUrlHint: '可选。绑定远程 Git 仓库进行版本管理。',
+    gitRepoAutoCreateHint:
+      '仓库不存在时会自动创建为私有仓库，并推送工作区代码模版；仓库已有代码时直接复用其代码，不写入任何模版。',
     bindGit: '绑定 Git 仓库',
     bindGitHint: '将工作区现有代码推送到此远程仓库。',
     bind: '绑定',
     bindGitFailed: '绑定 Git 仓库失败',
     delete: '删除工作区',
     deleteTitle: '删除工作区',
-    deleteConfirm: '确认删除「{name}」？所有成员的本地副本都会被移除，该操作不可撤销。',
-    deleteAlsoRemote: '同时删除远程仓库：{url}',
+    deleteConfirm:
+      '确认删除「{name}」？其工作副本、环境、租约、草稿、知识库与执行历史都会被彻底删除，该操作不可撤销。',
+    deleteKeepsRemote: '远程仓库会被保留，不做任何改动：{url}',
     deleteFailed: '删除工作区失败',
     noPermission: '你没有执行该操作的权限。',
     syncToRemote: '同步到远程',
@@ -601,6 +623,17 @@ export default {
     mdSplit: '分屏视图',
     mdPreview: '预览',
     closeTab: '关闭标签页',
+    // 草稿自动保存（design 07 Q6）：恢复到更新的未保存草稿时提示。
+    draftRestored: '已恢复 {file} 的未保存草稿',
+  },
+  // 资源管理器。删除是其中唯一的不可逆操作，删除文件夹会带走整个子树——
+  // 因此确认弹窗会在标题与正文中两次点名即将消失的对象。
+  files: {
+    deleteFileTitle: '删除文件',
+    deleteFileConfirm: '确定删除「{name}」？此操作无法撤销。',
+    deleteDirTitle: '删除文件夹',
+    deleteDirConfirm: '确定删除「{name}」及其中的所有内容？此操作无法撤销。',
+    deleted: '已删除',
   },
   workspaceInfo: {
     title: '工作区',
@@ -608,6 +641,26 @@ export default {
     dialect: 'SQL 方言',
     environment: '环境',
     status: '状态',
+  },
+  // 组织配额面板（设置 → 企业 → 配额）。键由 QuotaPanel.vue 与
+  // notifyError.ts 的 429 本地化共同读取。
+  quotas: {
+    title: '配额与用量',
+    description:
+      '组织在各资源上的配额上限与当前用量。创建工作区与环境时，平台按这些额度进行限制。',
+    loading: '正在加载配额…',
+    loadFailed: '配额加载失败。',
+    retry: '重试',
+    exhausted: '已达上限',
+    // "未知"是真实状态：平台在无法计数时选择放行，此时显示 0 等于声称
+    // 一次从未发生的测量。
+    unknown: '未知',
+    workspace: '工作区',
+    environment: '环境',
+    concurrent_leases: '打开的工作副本',
+    runtime_replicas: '运行时容量',
+    peakLeases: '近期观测到的打开工作副本峰值：{peak}。该数值用于容量规划，上方实时计数可能更低。',
+    contactAdmin: '如需提升限额，请释放资源或联系组织管理员。',
   },
   settings: {
     title: '设置',
@@ -1004,6 +1057,28 @@ export default {
       deleted: '已删除',
       conflict: '冲突',
       containsChanges: '内部存在变更',
+    },
+    // WIP 数据持久性契约（design 07 Q6）：把"崩溃最多丢失一个快照周期"
+    // 的承诺以可见的方式呈现给用户。
+    wip: {
+      lastProtected: '保护于 {time}',
+      neverProtected: '尚未保护',
+      neverProtectedTooltip: '还没有生成任何 WIP 快照',
+      unprotectedBanner: '当前改动未受保护：最近一次快照失败',
+      pendingBanner: '有未提交改动的快照等待处理',
+      review: '处理',
+      pendingTitle: '发现未提交改动',
+      pendingBody: '在 Git 服务器上发现一份 {time}的未提交改动快照。',
+      pendingBodyUnknownAge: '在 Git 服务器上发现一份未提交改动快照。',
+      pendingPausedHint: '在您决定之前，此工作副本的新改动不会受到保护。',
+      pendingDiscardHint: '丢弃将永久删除该快照，无法恢复。',
+      recover: '恢复',
+      discard: '丢弃',
+      decideLater: '稍后决定',
+      recoverSuccess: '快照已恢复到工作副本',
+      recoverFailed: '恢复快照失败',
+      discardSuccess: '快照已丢弃',
+      discardFailed: '丢弃快照失败',
     },
   },
   time: {

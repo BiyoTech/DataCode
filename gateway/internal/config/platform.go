@@ -7,6 +7,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -17,20 +18,43 @@ import (
 // conf/platform.yaml. It is read alongside the gateway-specific config.
 type PlatformConfig struct {
 	Database  PlatformDatabase  `yaml:"database"`
+	Redis     PlatformRedis     `yaml:"redis"`
 	Workspace PlatformWorkspace `yaml:"workspace"`
 	Services  PlatformServices  `yaml:"services"`
 	Logging   PlatformLogging   `yaml:"logging"`
 }
 
+// PlatformRedis holds the shared coordination backend used for state that must
+// be identical across gateway replicas (currently login rate limiting).
+//
+// Enabled is a pointer so an override file can turn Redis OFF: mergePlatform
+// only copies non-zero values, and a plain `false` bool is indistinguishable
+// from "not set in this file".
+//
+// The password is env-only (REDIS_PASSWORD) and never read from YAML.
+type PlatformRedis struct {
+	Enabled                 *bool   `yaml:"enabled"`
+	Host                    string  `yaml:"host"`
+	Port                    int     `yaml:"port"`
+	DB                      int     `yaml:"db"`
+	KeyPrefix               string  `yaml:"key_prefix"`
+	ConnectTimeoutSeconds   float64 `yaml:"connect_timeout_seconds"`
+	OperationTimeoutSeconds float64 `yaml:"operation_timeout_seconds"`
+	MaxConnections          int     `yaml:"max_connections"`
+}
+
 // PlatformDatabase holds the default database connection shared across
-// services. The Gateway only uses the `services.gateway_auth` entry to
-// locate its auth SQLite database.
+// services. The Gateway reads it, optionally narrowed by the
+// `services.gateway_auth` entry, to locate its auth database.
 type PlatformDatabase struct {
-	Type     string                          `yaml:"type"`
-	Host     string                          `yaml:"host"`
-	Port     int                             `yaml:"port"`
-	Name     string                          `yaml:"name"`
-	Username string                          `yaml:"username"`
+	Type     string `yaml:"type"`
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Name     string `yaml:"name"`
+	Username string `yaml:"username"`
+	// SSLMode applies to PostgreSQL only. Left empty, the driver's own default
+	// is used rather than a hardcoded downgrade.
+	SSLMode  string                          `yaml:"ssl_mode"`
 	Services map[string]PlatformDatabaseSpec `yaml:"services"`
 }
 
@@ -42,6 +66,7 @@ type PlatformDatabaseSpec struct {
 	Port       int    `yaml:"port"`
 	Name       string `yaml:"name"`
 	Username   string `yaml:"username"`
+	SSLMode    string `yaml:"ssl_mode"`
 }
 
 // PlatformWorkspace holds the shared workspace storage path.
@@ -49,13 +74,16 @@ type PlatformWorkspace struct {
 	BasePath string `yaml:"base_path"`
 }
 
-// PlatformServices is the inter-service endpoint topology.
+// PlatformServices is the inter-service endpoint topology. The retired
+// sqlmesh/ontology/dagster entries (standalone services merged into
+// workspace-runtime at P3) are gone: nothing registers them and nothing
+// consumes them.
 type PlatformServices struct {
 	Gateway  PlatformServiceEntry `yaml:"gateway"`
 	Agent    PlatformServiceEntry `yaml:"agent"`
-	SQLMesh  PlatformServiceEntry `yaml:"sqlmesh"`
-	Ontology PlatformServiceEntry `yaml:"ontology"`
-	Dagster  PlatformServiceEntry `yaml:"dagster"`
+	Runtime  PlatformServiceEntry `yaml:"runtime"`
+	Identity PlatformServiceEntry `yaml:"identity"`
+	Control  PlatformServiceEntry `yaml:"control"`
 }
 
 // PlatformServiceEntry holds endpoint URLs for a single service.
@@ -73,22 +101,32 @@ type PlatformLogging struct {
 	Format string `yaml:"format"`
 }
 
-// LoadPlatform reads conf/platform.yaml + optional platform.{DATACODE_ENV}.yaml
-// override, then merges them (env override wins). Returns a zero-value
-// PlatformConfig when no file is found.
+// LoadPlatform reads conf/platform.yaml + the profile override selected by
+// DATACODE_ENV, then merges them (the profile wins).
+//
+// Addresses have NO code defaults on purpose. A built-in "http://localhost:8004"
+// makes a deployment that failed to mount its config, or forgot to select a
+// profile, dial an arbitrary local port instead of failing — and a gateway that
+// proxies to the wrong process is far harder to diagnose than one that reports
+// an empty upstream. The Python loader behaves identically, so the two
+// implementations cannot disagree about what "unconfigured" means.
+//
+// Non-address defaults (pool sizes, timeouts, key prefix, log level) ARE set
+// here: they are properties of the workload, valid in every environment, and
+// their absence would only produce noise.
 func LoadPlatform() *PlatformConfig {
 	cfg := &PlatformConfig{
 		Database: PlatformDatabase{
 			Services: map[string]PlatformDatabaseSpec{},
 		},
-		Services: PlatformServices{
-			Agent:    PlatformServiceEntry{WSURL: "ws://localhost:8001", GRPCURL: "localhost:50051", RestURL: "http://localhost:8001"},
-			SQLMesh:  PlatformServiceEntry{RestURL: "http://localhost:8002", GRPCURL: "localhost:50052"},
-			Ontology: PlatformServiceEntry{RestURL: "http://localhost:8003"},
-			Dagster:  PlatformServiceEntry{RestURL: "http://localhost:8004", GraphqlURL: "http://localhost:3001/graphql"},
-			Gateway:  PlatformServiceEntry{HTTPURL: "http://localhost:8000"},
-		},
 		Logging: PlatformLogging{Level: "info", Format: "json"},
+		Redis: PlatformRedis{
+			Port:                    6379,
+			KeyPrefix:               "datacode",
+			ConnectTimeoutSeconds:   3,
+			OperationTimeoutSeconds: 3,
+			MaxConnections:          32,
+		},
 	}
 
 	// Load base platform.yaml.
@@ -96,11 +134,23 @@ func LoadPlatform() *PlatformConfig {
 		applyYAML(path, cfg)
 	}
 
-	// Load optional env override.
+	// Load the profile override selected by DATACODE_ENV. conf/platform.yaml is
+	// deliberately address-free, so without a profile every URL below stays at
+	// its code default — not wrong so much as arbitrary, and dialing an
+	// arbitrary localhost is precisely what these warnings exist to surface.
+	// `make doctor` treats the same conditions as errors.
 	if env := os.Getenv("DATACODE_ENV"); env != "" {
 		if path := resolveConfigPath(fmt.Sprintf("platform.%s.yaml", env)); path != "" {
 			applyYAML(path, cfg)
+		} else {
+			// A typo here is otherwise indistinguishable from "no profile".
+			log.Printf("config_profile_not_found profile=%s expected_file=platform.%s.yaml"+
+				" -- running on base defaults, which carry no usable addresses", env, env)
 		}
+	} else {
+		log.Printf("config_profile_unset var=DATACODE_ENV" +
+			" -- expected one of dev|docker|cell|global|k8s-cell|k8s-global;" +
+			" platform addresses will fall back to code defaults")
 	}
 
 	return cfg
@@ -141,6 +191,9 @@ func mergePlatform(base, override *PlatformConfig) {
 	if override.Database.Username != "" {
 		base.Database.Username = override.Database.Username
 	}
+	if override.Database.SSLMode != "" {
+		base.Database.SSLMode = override.Database.SSLMode
+	}
 	for k, v := range override.Database.Services {
 		base.Database.Services[k] = v
 	}
@@ -150,12 +203,15 @@ func mergePlatform(base, override *PlatformConfig) {
 		base.Workspace.BasePath = override.Workspace.BasePath
 	}
 
+	// Redis
+	mergeRedis(&base.Redis, override.Redis)
+
 	// Services — only override non-empty fields.
 	mergeServiceEntry(&base.Services.Gateway, override.Services.Gateway)
 	mergeServiceEntry(&base.Services.Agent, override.Services.Agent)
-	mergeServiceEntry(&base.Services.SQLMesh, override.Services.SQLMesh)
-	mergeServiceEntry(&base.Services.Ontology, override.Services.Ontology)
-	mergeServiceEntry(&base.Services.Dagster, override.Services.Dagster)
+	mergeServiceEntry(&base.Services.Runtime, override.Services.Runtime)
+	mergeServiceEntry(&base.Services.Identity, override.Services.Identity)
+	mergeServiceEntry(&base.Services.Control, override.Services.Control)
 
 	// Logging
 	if override.Logging.Level != "" {
@@ -164,6 +220,43 @@ func mergePlatform(base, override *PlatformConfig) {
 	if override.Logging.Format != "" {
 		base.Logging.Format = override.Logging.Format
 	}
+}
+
+// mergeRedis copies non-zero fields from override into base.
+// Enabled is a pointer precisely so `enabled: false` survives this merge.
+func mergeRedis(base *PlatformRedis, override PlatformRedis) {
+	if override.Enabled != nil {
+		base.Enabled = override.Enabled
+	}
+	if override.Host != "" {
+		base.Host = override.Host
+	}
+	if override.Port != 0 {
+		base.Port = override.Port
+	}
+	if override.DB != 0 {
+		base.DB = override.DB
+	}
+	if override.KeyPrefix != "" {
+		base.KeyPrefix = override.KeyPrefix
+	}
+	if override.ConnectTimeoutSeconds != 0 {
+		base.ConnectTimeoutSeconds = override.ConnectTimeoutSeconds
+	}
+	if override.OperationTimeoutSeconds != 0 {
+		base.OperationTimeoutSeconds = override.OperationTimeoutSeconds
+	}
+	if override.MaxConnections != 0 {
+		base.MaxConnections = override.MaxConnections
+	}
+}
+
+// RedisEnabled reports whether the shared coordination backend should be used.
+// Absent configuration means enabled: Redis is a platform dependency, and a
+// gateway that silently kept per-replica state would widen the brute-force
+// window it is supposed to close.
+func (p *PlatformConfig) RedisEnabled() bool {
+	return p.Redis.Enabled == nil || *p.Redis.Enabled
 }
 
 // mergeServiceEntry copies non-empty fields from override into base.
@@ -185,84 +278,19 @@ func mergeServiceEntry(base *PlatformServiceEntry, override PlatformServiceEntry
 	}
 }
 
-// AuthDBDialect returns the database dialect for the gateway auth store.
+// AuthDBDialect and the auth-database resolution chain were removed in P5.5
+// (see the note further down): the gateway opens no database.
+
+// authDBParams and its resolution were removed with the auth database.
+
+// P5.5 NOTE — the gateway opens NO database.
 //
-// Resolution order:
-//  1. If database.services.gateway_auth exists, use its type.
-//  2. Otherwise, use the platform base database type.
-//
-// Returns "sqlite" or "mysql". Unknown types default to "sqlite".
-func (p *PlatformConfig) AuthDBDialect() string {
-	if svc, ok := p.Database.Services["gateway_auth"]; ok && svc.Type != "" {
-		return svc.Type
-	}
-	if p.Database.Type != "" {
-		return p.Database.Type
-	}
-	return "sqlite"
-}
-
-// AuthDBDSN builds the DSN for the gateway auth database connection.
-//
-// For SQLite: returns a file path (resolved relative to the repo root).
-//   - Uses database.services.gateway_auth.sqlite_path when present.
-//   - Falls back to defaultSQLitePath.
-//
-// For MySQL: builds a go-sql-driver/mysql DSN string.
-//   - Uses database.services.gateway_auth for host/port/name/username when present.
-//   - Falls back to the platform base database connection params.
-//   - Password is read from the DB_PASSWORD env var (never stored in YAML).
-//
-// The defaultSQLitePath is used only when the dialect resolves to SQLite and
-// no gateway_auth override is configured.
-func (p *PlatformConfig) AuthDBDSN(defaultSQLitePath string) string {
-	dialect := p.AuthDBDialect()
-
-	if dialect == "mysql" {
-		return p.buildMySQLDSN()
-	}
-
-	// SQLite: resolve file path.
-	svc, ok := p.Database.Services["gateway_auth"]
-	if ok && svc.SQLitePath != "" {
-		return resolveDataPath(svc.SQLitePath, resolveConfigPath("platform.yaml"))
-	}
-	return resolveDataPath(defaultSQLitePath, resolveConfigPath("platform.yaml"))
-}
-
-// buildMySQLDSN constructs a go-sql-driver/mysql DSN from platform config.
-// Password comes from the DB_PASSWORD environment variable.
-func (p *PlatformConfig) buildMySQLDSN() string {
-	// Use gateway_auth override if present, else fall back to base config.
-	host := p.Database.Host
-	port := p.Database.Port
-	name := p.Database.Name
-	user := p.Database.Username
-
-	if svc, ok := p.Database.Services["gateway_auth"]; ok {
-		if svc.Host != "" {
-			host = svc.Host
-		}
-		if svc.Port != 0 {
-			port = svc.Port
-		}
-		if svc.Name != "" {
-			name = svc.Name
-		}
-		if svc.Username != "" {
-			user = svc.Username
-		}
-	}
-
-	password := os.Getenv("DB_PASSWORD")
-	if port == 0 {
-		port = 3306
-	}
-	// parseTime=true is required for the driver to scan DATETIME columns into time.Time.
-	// multiStatements=true is NOT enabled for security.
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4",
-		user, password, host, port, name)
-}
+// This file used to resolve an "auth database" connection (dialect, DSN,
+// per-service overrides, MySQL/Postgres DSN builders). identity-service owns
+// the identity tables since P2 and is their only writer since P5.5, so the
+// gateway holds no connection at all and that whole resolution chain was
+// removed. `database.services.gateway_auth` in platform.yaml is likewise
+// obsolete: identity-service reads its own entry.
 
 // AgentServiceURL returns the agent service URL from platform topology.
 func (p *PlatformConfig) AgentServiceURL() string {
@@ -272,19 +300,27 @@ func (p *PlatformConfig) AgentServiceURL() string {
 	return p.Services.Agent.WSURL
 }
 
-// SQLMeshServiceURL returns the sqlmesh service REST URL from platform topology.
-func (p *PlatformConfig) SQLMeshServiceURL() string {
-	return p.Services.SQLMesh.RestURL
+// RuntimeServiceURL returns the workspace-runtime URL from platform topology
+// (P3). Empty until the deployment adds services.runtime to platform.yaml —
+// the gateway's working-copy routes then have no upstream, which surfaces
+// immediately as proxy errors rather than silently routing somewhere else.
+func (p *PlatformConfig) RuntimeServiceURL() string {
+	return p.Services.Runtime.RestURL
 }
 
-// OntologyServiceURL returns the ontology service REST URL from platform topology.
-func (p *PlatformConfig) OntologyServiceURL() string {
-	return p.Services.Ontology.RestURL
+// ControlServiceURL returns the control-service URL from platform topology
+// (P5). Empty until the deployment adds services.control to platform.yaml —
+// the metadata routes then have no upstream, which surfaces immediately as
+// proxy errors rather than silently routing somewhere else.
+func (p *PlatformConfig) ControlServiceURL() string {
+	return p.Services.Control.RestURL
 }
 
-// DagsterServiceURL returns the dagster service REST URL from platform topology.
-func (p *PlatformConfig) DagsterServiceURL() string {
-	return p.Services.Dagster.RestURL
+// IdentityServiceURL returns the identity service REST URL from platform
+// topology (P2). The gateway proxies /auth, /me and /rbac there and resolves
+// authorization snapshots from it.
+func (p *PlatformConfig) IdentityServiceURL() string {
+	return p.Services.Identity.RestURL
 }
 
 // LogLevel returns the shared log level.

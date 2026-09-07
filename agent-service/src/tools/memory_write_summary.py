@@ -7,10 +7,8 @@ on-demand when they need more context about a specific event.
 
 import json
 import uuid
-import typing as t
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.database import MemorySummaryRow, get_session_factory
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry

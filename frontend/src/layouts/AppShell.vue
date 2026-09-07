@@ -14,6 +14,7 @@ import Toolbar from '@/components/layout/Toolbar.vue'
 import SplitHandle from '@/components/common/SplitHandle.vue'
 import IconButton from '@/components/common/IconButton.vue'
 import IdentitySelect from '@/components/auth/IdentitySelect.vue'
+import WipRecoveryDialog from '@/components/git/WipRecoveryDialog.vue'
 import { notifyError } from '@/utils/notifyError'
 import type { MembershipInfo } from '@/utils/authSession'
 
@@ -226,6 +227,11 @@ watch(
         />
       </t-loading>
     </t-dialog>
+
+    <!-- WIP snapshot decision (design 07 Q6): rendered once, driven by the
+         WIP store whenever a materialized working copy is found to hold
+         uncommitted work from a previous session. -->
+    <WipRecoveryDialog />
 
     <div v-if="isFullPage" class="body-area">
       <RouterView />

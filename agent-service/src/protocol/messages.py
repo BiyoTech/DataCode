@@ -22,13 +22,12 @@ Client → Server:
   - context.file_open
 """
 
+import json
 import typing as t
 import uuid
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-
 
 # ============================================================
 # Client → Server 消息类型
@@ -144,6 +143,27 @@ class ACPEvent:
             "timestamp": self.timestamp,
             "payload": self.payload,
         }, ensure_ascii=False)
+
+    @classmethod
+    def from_json(cls, data) -> "ACPEvent":
+        """Rebuild an event from its JSON form (used by the Redis fan-out).
+
+        Accepts the event as a nested object (the fan-out envelope embeds it
+        parsed) or as a JSON string. Raises ValueError on an unknown event
+        type — e.g. a rolling upgrade where a newer replica publishes a type
+        this process does not know yet. Callers treat that as a dropped
+        message rather than an error: the event also reaches clients through
+        the producing replica directly.
+        """
+        obj = data if isinstance(data, dict) else json.loads(data)
+        return cls(
+            type=EventType(obj["type"]),
+            session_id=obj.get("session_id", ""),
+            event_id=obj.get("event_id", ""),
+            parent_event_id=obj.get("parent_event_id"),
+            timestamp=obj.get("timestamp", ""),
+            payload=obj.get("payload", {}),
+        )
 
 
 # ============================================================

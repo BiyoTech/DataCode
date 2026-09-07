@@ -18,6 +18,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '@/utils/api'
+import { useQuotaStore } from './quotas'
 import { useWorkspaceStore } from '@/stores/workspace'
 
 /** Lifecycle status of an environment, as recorded by the registry. */
@@ -221,13 +222,23 @@ export const useEnvironmentStore = defineStore('environment', () => {
     if (payload.baseEnv) body.base_env = payload.baseEnv
     if (payload.ttlHours !== undefined) body.ttl_hours = payload.ttlHours
 
-    const { data } = await api.post(`/workspaces/${workspaceId}/environments`, body)
-    const created = toEnvironmentInfo(data)
-    environments.value = [
-      ...environments.value.filter((env) => env.environmentId !== created.environmentId),
-      created,
-    ]
-    return created
+    try {
+      const { data } = await api.post(`/workspaces/${workspaceId}/environments`, body)
+      const created = toEnvironmentInfo(data)
+      environments.value = [
+        ...environments.value.filter((env) => env.environmentId !== created.environmentId),
+        created,
+      ]
+      return created
+    } catch (err) {
+      // A quota rejection must refresh the cached overview so the quota panel
+      // the user opens next agrees with the rejection they just saw.
+      if ((err as { response?: { data?: { error_code?: string } } })?.response
+        ?.data?.error_code === 'QUOTA_EXCEEDED') {
+        void useQuotaStore().refresh()
+      }
+      throw err
+    }
   }
 
   /**

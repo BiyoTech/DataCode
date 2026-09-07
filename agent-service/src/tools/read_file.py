@@ -11,11 +11,9 @@ Beyond plain text and code files, the tool also reads office documents
 """
 
 import asyncio
-from pathlib import Path
 from typing import Optional
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
 from src.tools._file_utils import (
     DEFAULT_READ_LINES,
@@ -148,7 +146,10 @@ async def read_file(
     header = f"[Lines {offset}-{end_idx} / {total_lines} total]"
     if has_more:
         next_offset = end_idx + 1
-        header += f"  — {total_lines - end_idx} more line(s). Call read_file with offset={next_offset} to continue."
+        header += (
+    f"  — {total_lines - end_idx} more line(s). "
+    f"Call read_file with offset={next_offset} to continue."
+)
 
     # Render with line numbers so the agent can reference exact positions.
     numbered = "\n".join(

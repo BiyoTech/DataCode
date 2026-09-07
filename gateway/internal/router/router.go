@@ -10,25 +10,44 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"go.uber.org/zap"
 
 	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/authz"
+	"github.com/datacode/gateway/internal/cellrouter"
 	"github.com/datacode/gateway/internal/config"
 	"github.com/datacode/gateway/internal/handler"
+	"github.com/datacode/gateway/internal/leaserouter"
 	"github.com/datacode/gateway/internal/middleware"
-	"github.com/datacode/gateway/internal/rbac"
 )
 
 // Setup creates and configures the Chi router with all API routes.
-// authService owns identity verification; every non-public route requires a
-// valid access token. rbacService owns authorization: it is enforced once,
-// globally, by the Authorize middleware.
+//
+// issuer verifies the access tokens identity-service minted; every non-public
+// route requires a valid one. Authorization is enforced once, globally, by the
+// Authorize middleware, which decides against an authorization SNAPSHOT
+// fetched from identity-service (P2, ADR-007) rather than reading a database.
+//
+// bindings performs the authorization-binding WRITES the gateway used to do
+// against its own tables (P5.5): identity-service is the single writer of the
+// identity dataset, which is what makes the P7 Global/Cell split possible.
+//
+// leaseRouter resolves working-copy requests to the single runtime replica that
+// owns them (design 06 P4a). A nil/disabled router keeps every proxy target on
+// its static BaseURL, which is the pre-P4a behaviour.
+//
+// cellRouter refuses requests whose tenant lives in ANOTHER cell (design 06 P7),
+// answering 421 with that cell's address. A nil router serves everything
+// locally, which is correct for a single-cell installation.
 func Setup(
 	cfg *config.Config, logger *zap.Logger,
-	authService *auth.Service, rbacService *rbac.Service,
+	issuer *auth.TokenIssuer, authzResolver *authz.Resolver, bindings *authz.Bindings,
+	leaseRouter *leaserouter.Router, cellRouter *cellrouter.Router,
 ) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -51,7 +70,17 @@ func Setup(
 	// Authentication — must run after CORS so preflight requests still work.
 	// It publishes the verified identity and overwrites downstream identity
 	// headers, making client-supplied values unusable.
-	r.Use(middleware.JWTAuth(authService.Issuer(), logger))
+	r.Use(middleware.JWTAuth(issuer, logger))
+
+	// Cell routing — after authentication (it reads the VERIFIED cell claim)
+	// and before authorization (a request this cell must not serve should not
+	// consume an authorization lookup, and the caller's permissions here are
+	// meaningless: their tenant's data lives in another cell).
+	if cellRouter != nil {
+		r.Use(cellRouter.Middleware(func(req *http.Request) string {
+			return middleware.GetCellID(req.Context())
+		}))
+	}
 
 	// Replace any user_id carried in bodies/query strings with the verified
 	// identity, so proxied services cannot be tricked by a forged owner.
@@ -61,79 +90,118 @@ func Setup(
 	// runs before route matching, so the transparent catch-all proxies are
 	// covered as well; the required permission per route is declared in
 	// rbac.MatchRoute.
-	r.Use(middleware.Authorize(rbacService, logger))
+	r.Use(middleware.Authorize(authzResolver, logger))
 
-	authHandler := handler.NewAuthHandler(authService, rbacService, logger)
-	rbacHandler := handler.NewRBACHandler(rbacService, logger)
+	// The identity surface is served by identity-service; the gateway only
+	// forwards it (P5.5). Registered once and reused by the /auth, /me and
+	// /rbac groups below.
+	identityProxy := handler.IdentityProxy(cfg.Services.IdentityServiceURL, logger)
 
 	// Health check (optional deep upstream probe via ?deep=1)
 	r.Get("/health", handler.HealthCheck(cfg, logger))
 
 	// Define proxy targets — each target knows the backend URL and how to
 	// rewrite the path.
-	sqlmeshTarget := handler.ProxyTarget{
-		BaseURL:     cfg.Services.SQLMeshServiceURL,
-		PathRewrite: handler.StripPrefix("/sqlmesh"),
+	//
+	// P3: workspace-runtime is the merged owner of working copies (sqlmesh
+	// engine + ontology + dagster data plane + git + files + tools), and
+	// every working-copy-facing group targets it directly. The legacy
+	// per-service entries were removed from platform.yaml along with the
+	// services they named, so there is no fallback to configure — a missing
+	// services.runtime registration surfaces as proxy errors, not as traffic
+	// silently routed to the wrong place.
+	runtimeURL := cfg.Services.RuntimeServiceURL
+
+	// P5: control-service owns the control plane (environment registry,
+	// workspace metadata, Git credentials). It holds no working copy, so its
+	// routes are plain load-balanced — no lease resolution. A missing
+	// services.control registration surfaces as proxy errors rather than
+	// traffic silently routed elsewhere.
+	controlURL := cfg.Services.ControlServiceURL
+
+	// P4a: a working copy is owned by exactly ONE workspace-runtime replica, so
+	// requests for it must reach that replica rather than being load balanced.
+	// When the lease subsystem is off (no Redis, or pre-P4a deployment) the
+	// resolver returns "" and every target keeps its static BaseURL, which
+	// reproduces the previous behaviour exactly.
+	resolveWorkingCopyUpstream := func(r *http.Request) (string, error) {
+		if !leaseRouter.Enabled() {
+			return "", nil
+		}
+		// Read from context: Authorize already extracted it (possibly from the
+		// JSON body) and buffering the body a second time here is how a proxy
+		// starts forwarding empty POSTs.
+		workspacePath := middleware.GetWorkspacePath(r.Context())
+		if workspacePath == "" {
+			return "", nil
+		}
+		return leaseRouter.Resolve(r.Context(), workspacePath)
 	}
-	sqlmeshIdentity := handler.ProxyTarget{
-		BaseURL:     cfg.Services.SQLMeshServiceURL,
-		PathRewrite: handler.IdentityPath(),
+	invalidateWorkingCopyRoute := func(r *http.Request) {
+		if leaseRouter.Enabled() {
+			leaseRouter.Invalidate(middleware.GetWorkspacePath(r.Context()))
+		}
 	}
+
+	// One shape for every working-copy-affine route group: the lease decides
+	// which replica serves the request, and a forward failure invalidates the
+	// cached route so the next attempt re-resolves. Prefix handling is the only
+	// axis that varies across the groups — keeping a single constructor is what
+	// guarantees a change to lease semantics reaches every group at once
+	// (four hand-written copies here were how one of them drifted before).
+	workingCopyTarget := func(rewrite handler.PathRewriteFunc) handler.ProxyTarget {
+		return handler.ProxyTarget{
+			BaseURL:          runtimeURL,
+			PathRewrite:      rewrite,
+			ResolveUpstream:  resolveWorkingCopyUpstream,
+			OnForwardFailure: invalidateWorkingCopyRoute,
+		}
+	}
+	sqlmeshTarget := workingCopyTarget(handler.StripPrefix("/sqlmesh"))
+	// Every identity-path working-copy group (the sqlmesh/git/files/logs/
+	// knowledge identity routes, ontology, dagster, WIP) shares this ONE
+	// target: they differ in which validated route table selects them, not in
+	// routing behaviour.
+	runtimeIdentity := workingCopyTarget(handler.IdentityPath())
 	agentTarget := handler.ProxyTarget{
+		// agent-service is stateless: it owns no working copy, so it stays
+		// load balanced.
 		BaseURL:     cfg.Services.AgentServiceURL,
 		PathRewrite: handler.IdentityPath(),
 	}
-	ontologyTarget := handler.ProxyTarget{
-		BaseURL:     cfg.Services.OntologyServiceURL,
-		PathRewrite: handler.IdentityPath(),
-	}
-	dagsterTarget := handler.ProxyTarget{
-		BaseURL:     cfg.Services.DagsterServiceURL,
+
+	// P5: the control plane's identity-path routes. Plain load balancing: the
+	// registry is database-backed state, every replica can answer.
+	controlIdentity := handler.ProxyTarget{
+		BaseURL:     controlURL,
 		PathRewrite: handler.IdentityPath(),
 	}
 
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
 		// -----------------------------------------------------------------
-		// Authentication (gateway-owned, no proxy)
+		// Identity surface — proxied to identity-service (P5.5)
 		// -----------------------------------------------------------------
+		// Authentication, the current-user payload and role management all
+		// read and write the identity dataset, which identity-service owns
+		// exclusively. The gateway still AUTHORIZES these routes (the route
+		// map declares tenant:member:* / tenant:role:* for the member and
+		// role endpoints) and still authenticates them; it just no longer
+		// keeps its own copy of the tables behind them.
+		//
+		// Registered as nested Route + "/*" rather than HandleFunc("/auth/*"):
+		// chi matches a wildcard pattern only within the routing subtree that
+		// declares it, so the flat form silently 404s every /auth request.
 		r.Route("/auth", func(r chi.Router) {
-			// Public — reachable without an access token (see JWTAuth
-			// whitelist); select-tenant additionally accepts a pre-auth token.
-			r.Post("/register", authHandler.Register)
-			r.Post("/login", authHandler.Login)
-			r.Post("/select-tenant", authHandler.SelectTenant)
-			r.Post("/refresh", authHandler.Refresh)
-
-			// Authenticated
-			r.Post("/logout", authHandler.Logout)
-			r.Post("/change-password", authHandler.ChangePassword)
-			r.Get("/memberships", authHandler.ListMemberships)
-
-			// Minimal tenant directory for workspace-owner member pickers.
-			// Any authenticated tenant member may read it.
-			r.Get("/tenant-members", authHandler.ListTenantMemberCandidates)
-
-			// Tenant member management — guarded by the tenant:member:*
-			// permissions declared in the route map.
-			r.Get("/members", authHandler.ListMembers)
-			r.Post("/members", authHandler.AddMember)
+			r.HandleFunc("/*", identityProxy)
 		})
-
-		// Local handler (no proxy)
-		r.Get("/me", authHandler.CurrentUser)
-
-		// -----------------------------------------------------------------
-		// Role management (gateway-owned, no proxy)
-		// -----------------------------------------------------------------
+		r.Route("/me", func(r chi.Router) {
+			// The bare /me path plus its sub-resources (/me/preferences).
+			r.HandleFunc("/", identityProxy)
+			r.HandleFunc("/*", identityProxy)
+		})
 		r.Route("/rbac", func(r chi.Router) {
-			// The permission catalog is read-only: it is declared in code and
-			// synchronized into the database on startup.
-			r.Get("/permissions", rbacHandler.ListPermissions)
-			r.Get("/roles", rbacHandler.ListRoles)
-			r.Post("/roles", rbacHandler.CreateRole)
-			r.Put("/roles/{roleID}", rbacHandler.UpdateRole)
-			r.Delete("/roles/{roleID}", rbacHandler.DeleteRole)
+			r.HandleFunc("/*", identityProxy)
 		})
 
 		// -----------------------------------------------------------------
@@ -161,10 +229,7 @@ func Setup(
 		// -----------------------------------------------------------------
 		r.Route("/sqlmesh", func(r chi.Router) {
 			// Validated routes — check required query params, then proxy
-			for _, route := range handler.SQLMeshValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(sqlmeshTarget, route, logger))
-			}
+			handler.RegisterValidated(r, handler.SQLMeshValidatedRoutes, sqlmeshTarget, logger)
 
 			// SSE — streaming proxy with dedicated HTTP client
 			r.Get("/events", handler.SSEEvents(cfg, logger))
@@ -181,20 +246,17 @@ func Setup(
 		// -----------------------------------------------------------------
 		// SQLMesh Service — identity routes (not under /sqlmesh)
 		// -----------------------------------------------------------------
-		for _, route := range handler.SQLMeshIdentityValidatedRoutes {
-			r.Method(route.Method, route.Pattern,
-				handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
-		}
+		handler.RegisterValidated(r, handler.SQLMeshIdentityValidatedRoutes, runtimeIdentity, logger)
 		// Pure passthrough
-		r.Post("/external-models/import", handler.GenericProxy(sqlmeshIdentity, logger))
+		r.Post("/external-models/import", handler.GenericProxy(runtimeIdentity, logger))
 
 		// -----------------------------------------------------------------
 		// Workspace management (SQLMesh Service, identity path)
 		// -----------------------------------------------------------------
 		r.Route("/workspaces", func(r chi.Router) {
 			// Special handlers — identity injection (user_id + tenant_id)
-			r.Post("/", handler.CreateWorkspace(cfg, rbacService, logger))
-			r.Get("/", handler.ListWorkspaces(cfg, rbacService, logger))
+			r.Post("/", handler.CreateWorkspace(cfg, bindings, authzResolver, logger))
+			r.Get("/", handler.ListWorkspaces(cfg, authzResolver, logger))
 			r.Post("/bind-git", handler.BindGitRepo(cfg, logger))
 			r.Post("/sync", handler.SyncWorkspace(cfg, logger))
 
@@ -204,51 +266,57 @@ func Setup(
 
 			// Environment registry — the workspace's development lines. The
 			// backend derives tenant/user from the identity headers, so these
-			// are pure passthrough.
-			r.HandleFunc("/{workspaceID}/environments", handler.GenericProxy(sqlmeshIdentity, logger))
+			// are pure passthrough (control-service, P5).
+			r.HandleFunc("/{workspaceID}/environments", handler.GenericProxy(controlIdentity, logger))
 
-			// Membership management — owned by the gateway, which holds the
-			// role bindings; authorization is enforced by the route map.
-			r.Get("/{workspaceID}/members", handler.ListWorkspaceMembers(authService, rbacService, logger))
-			r.Post("/{workspaceID}/members", handler.AddWorkspaceMember(authService, rbacService, logger))
+			// Membership management — the bindings live in identity-service
+			// (P5.5); authorization is enforced by the route map.
+			r.Get("/{workspaceID}/members", handler.ListWorkspaceMembers(bindings, logger))
+			r.Post("/{workspaceID}/members",
+				handler.AddWorkspaceMember(bindings, authzResolver, logger))
 			r.Delete("/{workspaceID}/members/{memberUserID}",
-				handler.RemoveWorkspaceMember(cfg, rbacService, logger))
+				handler.RemoveWorkspaceMember(cfg, bindings, authzResolver, logger))
 
-			r.Delete("/{workspaceID}", handler.DeleteWorkspace(cfg, rbacService, logger))
+			r.Delete("/{workspaceID}", handler.DeleteWorkspace(cfg, bindings, authzResolver, logger))
 		})
 
 		// -----------------------------------------------------------------
-		// Environment registry (SQLMesh Service, identity path)
+		// Tenant quota and usage (control-service, identity path — P8)
+		// -----------------------------------------------------------------
+		// Scoped to the caller's own tenant by the identity header, so no
+		// permission beyond authentication is required (contract 08 §6): the
+		// identity IS the scope, and accepting a tenant id would turn this into
+		// an enumeration surface.
+		r.HandleFunc("/quotas", handler.GenericProxy(controlIdentity, logger))
+
+		// -----------------------------------------------------------------
+		// Environment registry (control-service, identity path — P5)
 		// -----------------------------------------------------------------
 		// Addressed by environment id ("{workspace_id}:{environment}"), from
 		// which the route map derives the workspace to authorize against.
 		//   GET    /{envID}          | DELETE /{envID}
 		//   POST   /{envID}/open     | GET    /{envID}/events
-		r.HandleFunc("/environments/*", handler.GenericProxy(sqlmeshIdentity, logger))
+		r.HandleFunc("/environments/*", handler.GenericProxy(controlIdentity, logger))
 
 		// -----------------------------------------------------------------
 		// Git operations (SQLMesh Service, identity path)
 		// -----------------------------------------------------------------
 		r.Route("/git", func(r chi.Router) {
 			// Validated GET routes
-			for _, route := range handler.GitValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
-			}
+			handler.RegisterValidated(r, handler.GitValidatedRoutes, runtimeIdentity, logger)
 
-			// Special handlers — user_id from context
-			r.Get("/credentials", handler.ListGitCredentials(cfg, logger))
-			r.Post("/credentials", handler.CreateGitCredential(cfg, logger))
-			r.Delete("/credentials/{credentialID}", handler.DeleteGitCredential(cfg, logger))
-			r.Patch("/credentials/{credentialID}/default", handler.SetDefaultGitCredential(cfg, logger))
-
-			// Pure passthrough PUT (no user_id injection needed)
-			r.Put("/credentials/{credentialID}", handler.GenericProxy(sqlmeshIdentity, logger))
+			// Credentials are user-scoped CONTROL PLANE data (P5), forwarded
+			// transparently: the control plane resolves the owner from the
+			// identity headers this gateway writes, and SanitizeIdentity has
+			// already overwritten any owner a client tried to name. There is
+			// nothing left for a per-method handler to add.
+			r.HandleFunc("/credentials", handler.GenericProxy(controlIdentity, logger))
+			r.HandleFunc("/credentials/*", handler.GenericProxy(controlIdentity, logger))
 
 			// Catch-all transparent proxy for pure-passthrough git routes:
 			//   POST /init | /stage | /unstage | /commit | /push | /pull
 			//   POST /checkout | /publish
-			r.HandleFunc("/*", handler.GenericProxy(sqlmeshIdentity, logger))
+			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
 		})
 
 		// -----------------------------------------------------------------
@@ -256,15 +324,25 @@ func Setup(
 		// -----------------------------------------------------------------
 		r.Route("/files", func(r chi.Router) {
 			// Validated routes
-			for _, route := range handler.FilesValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
-			}
+			handler.RegisterValidated(r, handler.FilesValidatedRoutes, runtimeIdentity, logger)
 
 			// Catch-all transparent proxy for:
 			//   GET  /list (forwards all query params)
 			//   POST /write | /delete | /mkdir | /rename
-			r.HandleFunc("/*", handler.GenericProxy(sqlmeshIdentity, logger))
+			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
+		})
+
+		// -----------------------------------------------------------------
+		// WIP durability contract (design 07 Q6) — the user-facing surface
+		// of the lease subsystem's snapshot machinery.
+		// -----------------------------------------------------------------
+		r.Route("/wip", func(r chi.Router) {
+			// Validated routes
+			handler.RegisterValidated(r, handler.WipValidatedRoutes, runtimeIdentity, logger)
+
+			// Catch-all transparent proxy for:
+			//   POST /recover | /discard (the user's snapshot decision)
+			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
 		})
 
 		// -----------------------------------------------------------------
@@ -274,25 +352,26 @@ func Setup(
 			// SSE tail — dedicated handler, the streaming client has no timeout.
 			r.Get("/stream", handler.SSELogs(cfg, logger))
 
-			for _, route := range handler.LogsValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
-			}
+			handler.RegisterValidated(r, handler.LogsValidatedRoutes, runtimeIdentity, logger)
 		})
 
 		// -----------------------------------------------------------------
-		// Knowledge documents (SQLMesh Service, identity path)
+		// Knowledge documents (identity path)
+		//
+		// Split along the P5 line (completed in P8): the LIST is pure
+		// metadata over the shared database and answers from the control
+		// plane (plain load balancing); everything else touches the working
+		// copy's files and stays lease-routed to workspace-runtime.
 		// -----------------------------------------------------------------
 		r.Route("/knowledge", func(r chi.Router) {
-			// Validated GET routes
-			for _, route := range handler.KnowledgeValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(sqlmeshIdentity, route, logger))
-			}
+			handler.RegisterValidated(r, handler.KnowledgeMetadataValidatedRoutes, controlIdentity, logger)
+
+			// Validated GET routes — runtime (file content lives there)
+			handler.RegisterValidated(r, handler.KnowledgeValidatedRoutes, runtimeIdentity, logger)
 
 			// Catch-all transparent proxy for:
 			//   POST /documents/create | /documents/upload | /documents/delete
-			r.HandleFunc("/*", handler.GenericProxy(sqlmeshIdentity, logger))
+			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
 		})
 
 		// -----------------------------------------------------------------
@@ -300,10 +379,7 @@ func Setup(
 		// -----------------------------------------------------------------
 		r.Route("/ontology", func(r chi.Router) {
 			// Validated routes — all ontology endpoints require workspace_path
-			for _, route := range handler.OntologyValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(ontologyTarget, route, logger))
-			}
+			handler.RegisterValidated(r, handler.OntologyValidatedRoutes, runtimeIdentity, logger)
 		})
 
 		// -----------------------------------------------------------------
@@ -311,10 +387,7 @@ func Setup(
 		// -----------------------------------------------------------------
 		r.Route("/dagster", func(r chi.Router) {
 			// Validated GET routes — require workspace_path for scoping
-			for _, route := range handler.DagsterValidatedRoutes {
-				r.Method(route.Method, route.Pattern,
-					handler.MakeValidatedProxy(dagsterTarget, route, logger))
-			}
+			handler.RegisterValidated(r, handler.DagsterValidatedRoutes, runtimeIdentity, logger)
 
 			// Catch-all transparent proxy for pure-passthrough routes:
 			//   GET    /health | /mode | /assets | /deployments | /deployments/diff
@@ -322,7 +395,7 @@ func Setup(
 			//   POST   /pipelines/run | /deployments/ensure | /deployments/reload
 			//   POST   /runs/{runID}/cancel
 			//   DELETE /deployments/{deployment}
-			r.HandleFunc("/*", handler.GenericProxy(dagsterTarget, logger))
+			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
 		})
 	})
 

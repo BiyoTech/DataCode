@@ -12,19 +12,21 @@ import os
 import typing as t
 from datetime import datetime, timezone
 
+from datacode_common.database.engine import create_async_engine_for_url
+from datacode_common.database.url import safe_url
 from sqlalchemy import (
     Column,
     DateTime,
+    ForeignKey,
+    Index,
     Integer,
     String,
     Text,
-    ForeignKey,
-    Index,
-    func,
-    inspect as sqla_inspect,
     text,
 )
-from datacode_common.database.engine import create_async_engine_for_url
+from sqlalchemy import (
+    inspect as sqla_inspect,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -75,7 +77,9 @@ class SessionRow(Base):
     last_environment: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(32), default="active")
     message_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_summarized_message_count: Mapped[t.Optional[int]] = mapped_column(Integer, nullable=True, default=None)
+    last_summarized_message_count: Mapped[t.Optional[int]] = mapped_column(
+    Integer, nullable=True, default=None
+)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -226,7 +230,7 @@ def get_engine() -> AsyncEngine:
             settings.database_url,
             db_type=settings.database_type,
         )
-        logger.info("database_engine_created", url=settings.database_url.split("///")[0] + "///***")
+        logger.info("database_engine_created", url=safe_url(settings.database_url))
     return _engine
 
 
@@ -247,8 +251,9 @@ async def init_db() -> None:
     if os.getenv("AUTO_MIGRATE", "").lower() in ("1", "true", "yes"):
         from pathlib import Path
 
-        from alembic import command
         from alembic.config import Config
+
+        from alembic import command
 
         ini_path = Path(__file__).resolve().parents[2] / "alembic.ini"
         cfg = Config(str(ini_path))
@@ -271,7 +276,7 @@ async def init_db() -> None:
 # Although all values currently come from ORM model definitions (not user
 # input), validating them before interpolation is defense-in-depth against a
 # future code path that might introduce dynamic names.
-import re as _re
+import re as _re  # noqa: E402
 
 _IDENTIFIER_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Allow standard SQL type expressions, e.g. VARCHAR(255), INTEGER, TIMESTAMP.

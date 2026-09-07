@@ -1,0 +1,90 @@
+# Data-plane stack: workspace-runtime replicas — the merged owner of working
+# copies (SQLMesh engine + Ontology + Dagster data plane + Git + files +
+# executor, design 06 P3), run with the lease subsystem ON.
+#
+# ROLE: this is the LEASE-VERIFICATION stack, not a deployment target —
+# workspace-runtime/tests/test_deploy_manifests.py pins its P4a transitional
+# shape (shared bind mount + leases + Redis env lock), and scripts/verify/
+# verify-lease-routing.py runs its acceptance checks against it. For actually
+# running the platform use `make up` (single-machine) or `make cell-up`.
+#
+# Usage — requires the infra stack first:
+#   make data-plane-up
+#   python3 scripts/verify/verify-lease-routing.py
+#
+# What this stack demonstrates (design 06 P4a):
+#   - TWO replicas with the lease subsystem on: the P4a transitional storage
+#     contract (shared volume + leases + Redis env lock) — single-writer
+#     routing across replicas;
+#   - Port segmentation: replicas share one dagster_home volume yet claim
+#     disjoint port segments via Redis and write per-replica shard files
+#     (code_location_ports.<replica>.json) — no write races;
+#   - workspace-sync (control plane) polls each replica's
+#     /internal/code-locations — registration stays a PULL channel.
+#
+# Workspaces are a host bind mount so a host-run gateway/agent and the
+# containerized replicas operate on the SAME working copies — that
+# interoperability is the point of this stack.
+
+name: datacode
+
+x-workspace-runtime: &workspace-runtime
+  build:
+    context: ..
+    dockerfile: workspace-runtime/Dockerfile
+  volumes:
+    # P4a transitional shape: working copies still on the shared bind mount.
+    # The storage contract accepts this ONLY because the Redis env lock stays
+    # enabled (env_lock_backend=auto with Redis reachable); P4b moves to
+    # per-replica volumes (see deploy/k8s/base/workspace-runtime.yaml).
+    - ${WORKSPACES_DIR:-./workspaces-data}:/workspaces
+    # SHARED across replicas: per-replica port shard files.
+    - dagster_data_home:/opt/datacode/dagster_home
+    # Same config mechanism as every other stack.
+    - ../conf:/app/conf:ro
+  environment: &workspace-runtime-env
+    CONFIG_PATH: /app/conf
+    DATACODE_ENV: docker
+    DB_PASSWORD: ${DB_PASSWORD}
+    # Lease subsystem (design 06 P4a): single-writer routing across the two
+    # replicas. Redis comes from the platform config (host: redis).
+    WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
+    WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: shared
+    WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /workspaces
+    WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /workspaces
+    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+    # The DagsterInstance lives in the control plane; this replica only hosts
+    # local code locations.
+    WORKSPACE_RUNTIME_DAGSTER_MODE: remote
+    WORKSPACE_RUNTIME_DAGSTER_HOME: /opt/datacode/dagster_home
+    WORKSPACE_RUNTIME_DAGSTER_WEBSERVER_ENABLED: "false"
+    WORKSPACE_RUNTIME_DAGSTER_DAEMON_ENABLED: "false"
+  restart: unless-stopped
+
+services:
+  # The gateway's LeaseRouter dials each replica DIRECTLY by container name
+  # (the lease addr), so each one needs a stable identity — explicit services
+  # rather than `deploy.replicas`, which a scaled service cannot express.
+  workspace-runtime-1:
+    <<: *workspace-runtime
+    container_name: datacode-workspace-runtime-1
+    environment:
+      <<: *workspace-runtime-env
+      # What peers and the gateway dial for lease-routed traffic.
+      WORKSPACE_RUNTIME_CODE_LOCATION_ADVERTISE_HOST: workspace-runtime-1
+      DATACODE_RUNTIME_ID: workspace-runtime-1
+      DATACODE_REPLICA_ID: workspace-runtime-1
+    ports:
+      - "8002:8002"
+
+  workspace-runtime-2:
+    <<: *workspace-runtime
+    container_name: datacode-workspace-runtime-2
+    environment:
+      <<: *workspace-runtime-env
+      WORKSPACE_RUNTIME_CODE_LOCATION_ADVERTISE_HOST: workspace-runtime-2
+      DATACODE_RUNTIME_ID: workspace-runtime-2
+      DATACODE_REPLICA_ID: workspace-runtime-2
+
+volumes:
+  dagster_data_home:

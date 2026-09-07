@@ -3,7 +3,31 @@ package rbac
 import (
 	"net/http"
 	"testing"
+
+	catalog "github.com/datacode/shared/rbac"
 )
+
+// TestWipRoutesAreWorkspaceScoped pins the durability-contract surface (design
+// 07 Q6): the status read is a code read, while recover/discard rewrite the
+// working copy or the Git server's hidden ref — a code write. Both must be
+// resolvable to a workspace, never degradable to "has the permission somewhere".
+func TestWipRoutesAreWorkspaceScoped(t *testing.T) {
+	rule := MatchRoute(http.MethodGet, "/api/v1/wip/status")
+	if rule.Permission != catalog.PermWorkspaceCodeRead ||
+		rule.Source != ScopeSourceWorkspacePath || rule.ScopeOptional {
+		t.Errorf("wip status = %+v, want a non-optional workspace code read", rule)
+	}
+
+	for _, path := range []string{
+		"/api/v1/wip/recover", "/api/v1/wip/discard",
+	} {
+		rule := MatchRoute(http.MethodPost, path)
+		if rule.Permission != catalog.PermWorkspaceCodeWrite ||
+			rule.Source != ScopeSourceWorkspacePath || rule.ScopeOptional {
+			t.Errorf("%s = %+v, want a non-optional workspace code write", path, rule)
+		}
+	}
+}
 
 // TestMatchRouteSpecificBeforeFallback verifies the declaration-order contract:
 // a specific rule must win over the per-group fallback.
@@ -19,7 +43,7 @@ func TestMatchRouteSpecificBeforeFallback(t *testing.T) {
 			name:           "tenant member write",
 			method:         http.MethodPost,
 			path:           "/api/v1/auth/members",
-			wantPermission: PermTenantMemberWrite,
+			wantPermission: catalog.PermTenantMemberWrite,
 			wantSource:     ScopeSourceTenant,
 		},
 		{
@@ -28,7 +52,7 @@ func TestMatchRouteSpecificBeforeFallback(t *testing.T) {
 			name:           "state schema repair is a code write",
 			method:         http.MethodPost,
 			path:           "/api/v1/sqlmesh/config/state-schema/repair",
-			wantPermission: PermWorkspaceCodeWrite,
+			wantPermission: catalog.PermWorkspaceCodeWrite,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
@@ -42,42 +66,42 @@ func TestMatchRouteSpecificBeforeFallback(t *testing.T) {
 			name:           "bind-git wins over the workspace id segment rule",
 			method:         http.MethodPost,
 			path:           "/api/v1/workspaces/bind-git",
-			wantPermission: PermWorkspaceGitBind,
+			wantPermission: catalog.PermWorkspaceGitBind,
 			wantSource:     ScopeSourceWorkspaceField,
 		},
 		{
 			name:           "workspace member revocation",
 			method:         http.MethodDelete,
 			path:           "/api/v1/workspaces/ws-t1-demo/members/u2",
-			wantPermission: PermWorkspaceMemberWrite,
+			wantPermission: catalog.PermWorkspaceMemberWrite,
 			wantSource:     ScopeSourceWorkspaceSegment,
 		},
 		{
 			name:           "environment creation is separated from workspace writes",
 			method:         http.MethodPost,
 			path:           "/api/v1/workspaces/ws-t1-demo/environments",
-			wantPermission: PermWorkspaceEnvCreate,
+			wantPermission: catalog.PermWorkspaceEnvCreate,
 			wantSource:     ScopeSourceWorkspaceSegment,
 		},
 		{
 			name:           "environment list only needs the read permission",
 			method:         http.MethodGet,
 			path:           "/api/v1/workspaces/ws-t1-demo/environments",
-			wantPermission: PermWorkspaceEnvRead,
+			wantPermission: catalog.PermWorkspaceEnvRead,
 			wantSource:     ScopeSourceWorkspaceSegment,
 		},
 		{
 			name:           "opening a working copy is an ordinary workspace read",
 			method:         http.MethodPost,
 			path:           "/api/v1/environments/ws-t1-demo:dev_alice/open",
-			wantPermission: PermWorkspaceRead,
+			wantPermission: catalog.PermWorkspaceRead,
 			wantSource:     ScopeSourceEnvironmentSegment,
 		},
 		{
 			name:           "environment destruction needs the delete permission",
 			method:         http.MethodDelete,
 			path:           "/api/v1/environments/ws-t1-demo:dev_alice",
-			wantPermission: PermWorkspaceEnvDelete,
+			wantPermission: catalog.PermWorkspaceEnvDelete,
 			wantSource:     ScopeSourceEnvironmentSegment,
 		},
 		{
@@ -86,42 +110,42 @@ func TestMatchRouteSpecificBeforeFallback(t *testing.T) {
 			name:           "reconciliation needs the create permission, not read",
 			method:         http.MethodPost,
 			path:           "/api/v1/environments/ws-t1-demo:dev_alice/reconcile",
-			wantPermission: PermWorkspaceEnvCreate,
+			wantPermission: catalog.PermWorkspaceEnvCreate,
 			wantSource:     ScopeSourceEnvironmentSegment,
 		},
 		{
 			name:           "environment events fall back to the group read rule",
 			method:         http.MethodGet,
 			path:           "/api/v1/environments/ws-t1-demo:dev_alice/events",
-			wantPermission: PermWorkspaceEnvRead,
+			wantPermission: catalog.PermWorkspaceEnvRead,
 			wantSource:     ScopeSourceEnvironmentSegment,
 		},
 		{
 			name:           "file write falls back to the group write rule",
 			method:         http.MethodPost,
 			path:           "/api/v1/files/write",
-			wantPermission: PermWorkspaceCodeWrite,
+			wantPermission: catalog.PermWorkspaceCodeWrite,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
 			name:           "file read falls back to the group read rule",
 			method:         http.MethodGet,
 			path:           "/api/v1/files/list",
-			wantPermission: PermWorkspaceCodeRead,
+			wantPermission: catalog.PermWorkspaceCodeRead,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
 			name:           "apply requires the apply permission, not plan preview",
 			method:         http.MethodPost,
 			path:           "/api/v1/sqlmesh/apply",
-			wantPermission: PermWorkspacePlanApply,
+			wantPermission: catalog.PermWorkspacePlanApply,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
 			name:           "git push is separated from generic code writes",
 			method:         http.MethodPost,
 			path:           "/api/v1/git/push",
-			wantPermission: PermWorkspaceGitPush,
+			wantPermission: catalog.PermWorkspaceGitPush,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
@@ -135,21 +159,21 @@ func TestMatchRouteSpecificBeforeFallback(t *testing.T) {
 			name:           "log reads need their own permission, not code read",
 			method:         http.MethodGet,
 			path:           "/api/v1/logs",
-			wantPermission: PermWorkspaceLogsRead,
+			wantPermission: catalog.PermWorkspaceLogsRead,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
 			name:           "the log tail is guarded like the log list",
 			method:         http.MethodGet,
 			path:           "/api/v1/logs/stream",
-			wantPermission: PermWorkspaceLogsRead,
+			wantPermission: catalog.PermWorkspaceLogsRead,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 		{
 			name:           "the error archive is part of the log surface",
 			method:         http.MethodGet,
 			path:           "/api/v1/logs/errors/ab12cd34-2026-08-21T09:30:12",
-			wantPermission: PermWorkspaceLogsRead,
+			wantPermission: catalog.PermWorkspaceLogsRead,
 			wantSource:     ScopeSourceWorkspacePath,
 		},
 	}
@@ -199,6 +223,35 @@ func TestLogRoutesRequireResolvableWorkspace(t *testing.T) {
 		rule := MatchRoute(http.MethodGet, path)
 		if rule.ScopeOptional {
 			t.Errorf("%s must require a resolvable workspace", path)
+		}
+	}
+}
+
+// TestQuotaRouteIsTenantScopedReadOnly pins the two properties that make the
+// quota endpoint safe to expose without a permission (contract 08 §6).
+//
+// The endpoint reports the CALLER'S OWN tenant, resolved from the identity
+// header, so there is no scope to authorize against — but that is only true
+// while (a) the scope is the tenant rather than something a client could name,
+// and (b) no write method inherits the rule. A future admin endpoint raising a
+// limit must be declared deliberately, not arrive by accident.
+func TestQuotaRouteIsTenantScopedReadOnly(t *testing.T) {
+	rule := MatchRoute(http.MethodGet, "/api/v1/quotas")
+	if rule.Deny {
+		t.Fatal("reading one's own quota must be allowed")
+	}
+	if rule.Source != ScopeSourceTenant {
+		t.Errorf("scope source = %v, want tenant", rule.Source)
+	}
+	if rule.Permission != "" {
+		t.Errorf("permission = %q, want authenticated-only", rule.Permission)
+	}
+
+	for _, method := range []string{
+		http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete,
+	} {
+		if r := MatchRoute(method, "/api/v1/quotas"); !r.Deny {
+			t.Errorf("%s /api/v1/quotas = %+v, want denied", method, r)
 		}
 	}
 }
@@ -358,34 +411,79 @@ func TestWorkspaceIDFromEnvironmentID(t *testing.T) {
 	}
 }
 
-// TestCatalogIntegrity guards the invariants the seeder relies on: unique codes
-// and role templates that only reference registered permissions of their scope.
-func TestCatalogIntegrity(t *testing.T) {
-	seen := make(map[string]struct{}, len(Catalog))
-	for _, def := range Catalog {
-		if _, duplicate := seen[def.Code]; duplicate {
-			t.Errorf("duplicate permission code: %s", def.Code)
+// TestRoutePermissionsAreRegistered is the check whose absence let a route be
+// guarded by a permission that does not exist: "git:credential:write" was
+// asserted by the control plane while being absent from the catalog, so the
+// endpoint answered 403 to every role including admin, with no way to grant it.
+//
+// Catalog integrity itself (unique codes, templates within their scope, every
+// permission reachable through some role) is asserted in the shared package,
+// against the JSON declaration both languages are generated from.
+func TestRoutePermissionsAreRegistered(t *testing.T) {
+	for _, rule := range rules {
+		if rule.Permission == "" {
+			continue
 		}
-		seen[def.Code] = struct{}{}
-		if !IsValidScope(string(def.Scope)) {
-			t.Errorf("permission %s has an unsupported scope %q", def.Code, def.Scope)
+		if !catalog.IsCatalogPermission(rule.Permission) {
+			t.Errorf("route %s %s requires %q, which is not a registered permission "+
+				"point — no role can ever hold it",
+				rule.Method, rule.Pattern, rule.Permission)
+			continue
+		}
+		if len(catalog.TemplatesGranting(rule.Permission)) == 0 {
+			t.Errorf("route %s %s requires %q, which no built-in role grants",
+				rule.Method, rule.Pattern, rule.Permission)
 		}
 	}
+}
 
-	for _, tpl := range BuiltinRoleTemplates {
-		if len(tpl.Permissions) == 0 {
-			t.Errorf("role template %s grants nothing", tpl.Code)
+// TestRoutePermissionScopeMatchesSource pins the other half of the mapping: a
+// rule resolving a workspace must require a workspace-scoped permission, and a
+// tenant rule a tenant-scoped one. A crossed pair is never a denial — it is a
+// permission checked against a role that cannot carry it.
+func TestRoutePermissionScopeMatchesSource(t *testing.T) {
+	for _, rule := range rules {
+		if rule.Permission == "" {
+			continue
 		}
-		for _, code := range tpl.Permissions {
-			scope, ok := ScopeOf(code)
-			if !ok {
-				t.Errorf("role template %s references unknown permission %s", tpl.Code, code)
-				continue
-			}
-			if scope != tpl.Scope {
-				t.Errorf("role template %s (%s) references %s from scope %s",
-					tpl.Code, tpl.Scope, code, scope)
-			}
+		scope, ok := catalog.ScopeOf(rule.Permission)
+		if !ok {
+			continue // Already reported by TestRoutePermissionsAreRegistered.
+		}
+		want := catalog.ScopeWorkspace
+		if rule.Source == ScopeSourceTenant {
+			want = catalog.ScopeTenant
+		}
+		if scope != want {
+			t.Errorf("route %s %s resolves a %s scope but requires %q, which is %s-scoped",
+				rule.Method, rule.Pattern, want, rule.Permission, scope)
+		}
+	}
+}
+
+// TestGitCredentialRoutesStayUserScoped pins the authorization semantics of a
+// personal access token: managing one's own credential is guarded by identity
+// and ownership, not by a role permission. The control plane must agree — it
+// once asserted an unregistered permission here, which is what made every
+// credential write impossible.
+func TestGitCredentialRoutesStayUserScoped(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/git/credentials"},
+		{http.MethodPost, "/api/v1/git/credentials"},
+		{http.MethodPut, "/api/v1/git/credentials/cred-1"},
+		{http.MethodPatch, "/api/v1/git/credentials/cred-1/default"},
+		{http.MethodDelete, "/api/v1/git/credentials/cred-1"},
+	} {
+		rule := MatchRoute(tc.method, tc.path)
+		if rule.Deny {
+			t.Errorf("%s %s must be reachable", tc.method, tc.path)
+		}
+		if rule.Permission != "" || rule.Source != ScopeSourceNone {
+			t.Errorf("%s %s = %+v, want an authenticated-only user-scoped rule",
+				tc.method, tc.path, rule)
 		}
 	}
 }

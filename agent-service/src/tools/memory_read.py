@@ -5,12 +5,10 @@ history) with optional time range and keyword filtering. This is the primary
 retrieval interface for the memory system.
 """
 
-import typing as t
-from datetime import datetime, timezone
+
+from sqlalchemy import desc, select
 
 from agents import RunContextWrapper, function_tool
-from sqlalchemy import select, desc
-
 from src.context.database import (
     MemoryEventRow,
     MemorySummaryRow,

@@ -1,10 +1,17 @@
+// Package auth holds the gateway's TOKEN VERIFICATION primitives.
+//
+// P5.5 scope change: this package no longer authenticates anyone. Login,
+// registration, refresh rotation, password changes and the identity tables all
+// moved to identity-service (design 06 P2); the gateway proxies those endpoints
+// and keeps only what it needs to enforce identity on EVERY request — verifying
+// the access token that identity-service minted.
+//
+// The Claims struct must therefore stay wire-compatible with
+// identity-service's: both sign and verify with the same GW_JWT_SECRET, and a
+// field the gateway cannot read is a field it cannot enforce.
 package auth
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,10 +38,17 @@ var (
 // Claims is the JWT payload. For pre-auth tokens TenantID and Role are empty
 // because the tenant identity has not been chosen yet.
 type Claims struct {
-	Username  string `json:"username"`
-	TenantID  string `json:"tenant_id,omitempty"`
-	Role      string `json:"role,omitempty"`
-	TokenType string `json:"typ"`
+	Username string `json:"username"`
+	TenantID string `json:"tenant_id,omitempty"`
+	Role     string `json:"role,omitempty"`
+	// CellID is the cell serving this tenant. Minted by identity-service; the
+	// gateway only reads it (the global edge routes on it).
+	CellID string `json:"cell_id,omitempty"`
+	// PermsVersion is the tenant's authorization generation at issue time.
+	// The authz resolver compares it against its cached snapshot so a
+	// revocation takes effect on the next request (design 03 §2.5).
+	PermsVersion int64  `json:"perms_version,omitempty"`
+	TokenType    string `json:"typ"`
 	jwt.RegisteredClaims
 }
 
@@ -131,65 +145,9 @@ func (ti *TokenIssuer) Verify(tokenString, expectedType string) (*Claims, error)
 // ---------------------------------------------------------------------------
 // Refresh token primitives
 // ---------------------------------------------------------------------------
+//
+// P5.5: minting and hashing refresh tokens moved to identity-service together
+// with the `refresh_tokens` table. The gateway never sees a refresh token any
+// more — it proxies /auth/refresh — so those helpers were removed rather than
+// left as an unused second implementation.
 
-// NewRefreshToken returns a cryptographically random opaque token. Only its
-// hash is persisted, so the raw value exists solely in the client's storage.
-func NewRefreshToken() (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("generate refresh token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
-
-// HashRefreshToken derives the lookup hash for a raw refresh token.
-func HashRefreshToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(sum[:])
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-// newID returns a random identifier for database primary keys.
-func newID() string {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand failure is unrecoverable for identity issuance.
-		panic(fmt.Sprintf("crypto/rand unavailable: %v", err))
-	}
-	return hex.EncodeToString(buf)
-}
-
-// formatUTC renders a timestamp for storage (always UTC, RFC3339 nanos).
-func formatUTC(t time.Time) string {
-	return t.UTC().Format(time.RFC3339Nano)
-}
-
-// parseUTC reads a stored timestamp back as UTC; unparsable values yield the
-// zero time so a corrupt row cannot crash a request.
-func parseUTC(value string) time.Time {
-	if value == "" {
-		return time.Time{}
-	}
-	t, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}
-	}
-	return t.UTC()
-}
-
-// isUniqueViolation reports whether err is a UNIQUE constraint violation.
-// It handles both SQLite and MySQL error formats:
-//   - SQLite: "UNIQUE constraint failed: ..."
-//   - MySQL:  "Error 1062: Duplicate entry '...' for key '...'"
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") ||
-		strings.Contains(msg, "Error 1062") ||
-		strings.Contains(msg, "Duplicate entry")
-}

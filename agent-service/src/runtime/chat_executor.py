@@ -1,7 +1,5 @@
 """Main agent chat execution pipeline."""
 
-import asyncio
-
 from datacode_common.logging.context import bind_workspace_context
 
 from src.agents.registry import AgentRegistry
@@ -49,7 +47,9 @@ def build_mention_context(mentions: list[dict]) -> str:
         mid = m.get("id", "")
         label = m.get("label", "")
         if mtype == "table":
-            lines.append(f"- Table: {label} (FQN: {mid}) — available for schema discovery and query")
+            lines.append(
+    f"- Table: {label} (FQN: {mid}) — available for schema discovery and query"
+)
         elif mtype == "knowledge":
             lines.append(f"- Knowledge: {label} (id: {mid}) — business knowledge document")
         elif mtype == "adhoc":
@@ -66,19 +66,11 @@ async def execute_chat(session: SessionContext, req: ChatMessageRequest) -> None
     mode = req.mode or session.mode.value
     model_id = req.model_id
 
-    # Reserve a slot in active_chat_runs immediately so the LRU eviction logic
-    # (which skips active sessions) considers this session "active" from the
-    # very start. Without this, the window between get_session_async() and
-    # run_agent_goal_loop()'s own registration could let the session be evicted
-    # from the in-memory cache, causing get_messages() to return [] and the
-    # agent to start with empty history. The real task reference is set below;
-    # the done_callback in chat.py will clean this up on completion.
-    from src.runtime.active_runs import active_chat_runs
-    active_chat_runs[session_id] = {
-        "task": asyncio.current_task(),
-        "result": None,
-        "agent_name": session.mode.value,
-    }
+    # The session is already recorded in active_chat_runs by track_chat_run
+    # (before this coroutine's first step), which is what keeps the LRU cache
+    # eviction from dropping the session mid-run — an eviction between
+    # get_session_async() and the first Runner call would make get_messages()
+    # return [] and the agent start with empty history.
 
     mention_ctx = build_mention_context(req.mentions)
     if mention_ctx:
@@ -129,7 +121,10 @@ async def execute_chat(session: SessionContext, req: ChatMessageRequest) -> None
             try:
                 await resume_after_max_turns(session, pending_resume)
             except Exception as e:
-                logger.error("resume_after_max_turns_unhandled", session_id=session_id, error=str(e), exc_info=True)
+                logger.error(
+    "resume_after_max_turns_unhandled",
+    session_id=session_id, error=str(e), exc_info=True,
+)
                 await publish_and_persist(
                     session_id,
                     system_error(session_id, code="AGENT_ERROR", message=str(e)),

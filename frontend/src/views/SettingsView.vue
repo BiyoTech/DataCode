@@ -21,6 +21,7 @@ import GitCredentialsList from '@/components/settings/GitCredentialsList.vue'
 import AccountSecurity from '@/components/settings/AccountSecurity.vue'
 import MemberManagement from '@/components/settings/MemberManagement.vue'
 import RoleManagement from '@/components/settings/RoleManagement.vue'
+import QuotaPanel from '@/components/QuotaPanel.vue'
 import { usePermission } from '@/composables/usePermission'
 import { useAuthStore } from '@/stores/auth'
 import { useRbacStore } from '@/stores/rbac'
@@ -66,6 +67,9 @@ const navSections = computed<NavSection[]>(() => [
     icon: '🏢',
     titleKey: 'settings.navOrganization',
     items: [
+      // No permission gate: the quota endpoint reports the caller's OWN tenant,
+      // resolved from the identity header, so authentication is the boundary.
+      { id: 'quota', labelKey: 'quotas.title' },
       ...(can('tenant:member:read') ? [{ id: 'member-management', labelKey: 'members.title' }] : []),
       ...(can('tenant:role:read') ? [{ id: 'role-management', labelKey: 'rbac.title' }] : []),
     ],
@@ -318,6 +322,14 @@ function changeTheme(mode: ThemeMode) {
         <p class="page-desc">{{ t('account.description') }}</p>
 
         <AccountSecurity />
+      </div>
+
+      <!-- Organization quota and usage -->
+      <div v-else-if="activeItem === 'quota'" class="content-page">
+        <h3 class="page-title">{{ t('quotas.title') }}</h3>
+        <p class="page-desc">{{ t('quotas.description') }}</p>
+
+        <QuotaPanel />
       </div>
 
       <!-- Tenant member management -->

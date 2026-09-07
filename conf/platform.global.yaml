@@ -1,0 +1,54 @@
+# Profile: global — the containerized GLOBAL tier (DATACODE_ENV=global)
+#
+# Used by deploy/docker-compose.global.yml. This stack runs identity-service
+# and nothing else.
+#
+# What belongs in this tier, and why exactly this: users, tenants, roles and
+# `tenant_placement` (which cell a tenant lives in). Every cell reads it on the
+# LOGIN path only, never on the hot path — the cell id travels in the token, so
+# an already-authenticated request needs nothing from here.
+#
+# That property is what makes this tier's availability tolerable: if it is
+# down, existing sessions keep working in their cells (the gateway decides from
+# a cached authorization snapshot) and only new logins fail. Anything that
+# would have to be reached on every request must NOT be moved here.
+
+database:
+  # The Global database. NOT a cell's database: identity is the one dataset
+  # every cell reads, and putting it in a cell would make that cell's failure a
+  # platform-wide login outage.
+  host: "global-pg"
+  port: 5432
+  name: "identity"
+  username: "datacode"
+  # password: env-only (DB_PASSWORD)
+
+  services:
+    # The same target, stated explicitly: identity-service reads this entry
+    # when it exists, so omitting it would work only for as long as the
+    # top-level values happen to match. Stating it removes that coupling.
+    identity:
+      type: "postgresql"
+      host: "global-pg"
+      port: 5432
+      name: "identity"
+      username: "datacode"
+
+cells:
+  # The global tier IS the split, so it declares it. Nothing here validates the
+  # cell side; each cell's control-service does that for itself.
+  expect_global_db: true
+
+redis:
+  # Off: identity-service uses Redis only for login rate limiting, and with a
+  # single global replica the in-process limiter is correct. Turn this on (with
+  # a global Redis) before running more than one identity replica, or the limit
+  # becomes per-replica — which is a weaker limit, not a broken service, hence
+  # a deliberate default rather than a guarded one.
+  enabled: false
+
+services:
+  # No other service runs in this stack, so no other URL is declared: an
+  # address published here would be one nothing in this tier can reach.
+  identity:
+    rest_url: "http://identity-service:8003"

@@ -1,0 +1,252 @@
+# Isolation profiles for task execution, referenced by task kind (design 04 §5).
+#
+# Loaded by `datacode_common.isolation`. Until P6 this file was documentation;
+# it is now the single executable declaration of where each kind of work runs.
+#
+# How a profile is chosen (see that module for the enforcement):
+#   1. Among the profiles that are BOTH `enabled` here AND executable by the
+#      running process, take the ones claiming the task kind, and pick the
+#      STRONGEST. Overlap is expected: `sqlmesh.plan` is an L2 task in
+#      production and an L3-proc task on a single-node box, and resolving it
+#      downward would silently weaken production.
+#   2. A task kind no profile claims runs under `default_profile` below.
+#
+# "Executable by the running process" is deliberately NOT expressed here: a
+# laptop without Kubernetes keeps this exact file and disables the container
+# profiles at startup (`IsolationPolicy.restricted_to`). Encoding availability
+# in the file would make a missing backend look like a policy decision, and
+# would need a second copy of the file per environment.
+#
+# Security default: when the isolation level of a task cannot be determined,
+# the platform falls back to the STRONGEST profile currently enabled
+# (`default_profile: strongest_enabled`, resolution order L3_strong ->
+# L3_base -> L3_proc; never L1/L2, which assume the input cannot execute
+# host code).
+#
+# Decisions frozen at P0 (2026-08-26):
+#   Q1 - SQLMesh Python models/macros stay SUPPORTED, so arbitrary user code
+#        must be really isolated rather than rejected at validation time.
+#        L3_proc ships in P3 together with the service merge.
+#   Q2 - gVisor/Kata is NOT adopted for now. L3_strong is kept as a DISABLED
+#        profile so enabling it later is a config change plus a capable node
+#        pool, not a redesign.
+
+profiles:
+  # ── L1: in-process, data-only ─────────────────────────────────────────
+  L1_inprocess:
+    enabled: true
+    # Runs inside workspace-runtime. Data-only inputs, no code execution.
+    isolation: in_process
+    allowed_task_kinds:
+      - file.read
+      - file.write
+      - file.list
+      - file.search
+      - ontology.load
+      - git.status
+      - git.diff
+      - log.read
+    guards:
+      path_validation: strict          # parse_workspace_path, 5-segment layout
+      yaml_loader: safe_load
+      git_hooks: disabled              # -c core.hooksPath=/dev/null
+
+  # ── L3-proc: separate process, ships in P3 ────────────────────────────
+  L3_proc:
+    enabled: true
+    # A persistent OS-level child process inside the workspace-runtime Pod.
+    # Not a container: it needs neither the lease mechanism nor Kubernetes, so
+    # it can land during the service merge and remove T2 (platform credential
+    # reads) months before the container plane exists.
+    #
+    # ROLE AFTER P6: the dev / single-node vehicle. It stays enabled here on
+    # purpose — where the container profiles are available they are stronger
+    # and win every overlapping task kind, and where they are not (a laptop,
+    # a single-node install) this is what the platform falls back to. It is
+    # also the documented rollback target if the container plane misbehaves.
+    isolation: process
+    # Distinct unprivileged uid per executor slot. The working copy is owned
+    # by the runtime's fsGroup, so the executor can write its own copy only.
+    run_as_user_base: 60000
+    # THE point of this profile: the child starts with an EMPTY environment
+    # and only the entries below are re-injected. os.environ can no longer
+    # surface DB_PASSWORD / LLM keys / TOKEN_ENCRYPTION_SECRET / internal
+    # tokens (threat T2, the one that defeats every other control).
+    env_policy: clear_except
+    env_allowlist:
+      - PATH
+      # A platform-owned directory INSIDE the working copy, never its root: a
+      # tool dotfile stays in the sandbox without landing among the user's
+      # models, and a .gitconfig arriving with the repository does not become
+      # the child's global Git configuration.
+      - HOME
+      # Pinned next to HOME because SQLMesh resolves it at IMPORT time, and the
+      # directory it names also holds a PERSONAL config that SQLMesh merges
+      # over the project's.
+      - SQLMESH_HOME
+      - LANG
+      - LC_ALL
+      - TZ
+      - DATACODE_WORKSPACE_PATH
+      - DATACODE_ENVIRONMENT
+      # This working copy's warehouse gateway only, never platform secrets.
+      - DATACODE_WAREHOUSE_*
+    rlimits:
+      # RLIMIT_AS caps address space; RLIMIT_CPU bounds CPU seconds; NPROC
+      # stops fork bombs; FSIZE stops filling the node disk.
+      address_space_bytes: 4294967296      # 4 GiB
+      cpu_seconds: 1800
+      max_processes: 256
+      max_file_size_bytes: 2147483648      # 2 GiB
+      max_open_files: 1024
+    cwd: "{workspace_path}"
+    guards:
+      git_hooks: disabled
+    # Persistent, one per working copy: the SQLMesh Context stays hot, so this
+    # profile costs ~1 ms (one UDS round trip) rather than a Context rebuild.
+    persistent: true
+    idle_stop_seconds: 900
+    allowed_task_kinds:
+      - agent.shell
+      - sqlmesh.plan
+      - sqlmesh.apply
+      - sqlmesh.plan_with_python
+      - sqlmesh.render_macro
+      - sqlmesh.render_project
+      - sqlmesh.evaluate
+      - sqlmesh.test
+      - dagster.codelocation
+    # Honest limits: same Pod, same netns, same filesystem view as the
+    # runtime. Does NOT cover T1 (other leases' working copies are visible)
+    # nor T3/T6/T7 (network). Single-tenant / trusted-tenant only.
+    covers_threats: [T2, T5-partial, T10]
+
+  # ── L2: standard container, ships in P6 ───────────────────────────────
+  L2_container:
+    enabled: true
+    # User SQL, no host-language code path.
+    isolation: container
+    runtime_class: runc
+    run_as_user: 65534
+    read_only_root_fs: true
+    drop_capabilities: ["ALL"]
+    seccomp: RuntimeDefault
+    # Same Pod-level hardening as L3_base. L2 runs no host-language code, but
+    # least privilege does not depend on that: a mounted service account token
+    # would let anything running here talk to the Kubernetes API, and the
+    # cluster service env vars would hand it the platform's internal addresses.
+    automount_service_account_token: false
+    enable_service_links: false
+    dns_policy: None
+    host_network: false
+    host_pid: false
+    host_ipc: false
+    resources:
+      cpu_limit: "2"
+      memory_limit: "4Gi"
+      pids_limit: 256
+      ephemeral_storage_limit: "8Gi"
+    network:
+      default: deny
+      egress_via_proxy: true
+      allowed_destinations: [warehouse, git]
+      # Mirrors L3_base: this profile holds the WRITABLE warehouse account, so
+      # reaching the platform's own networks from here would be worse, not
+      # better, than from L3_base.
+      denied_cidrs:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 127.0.0.0/8
+        - 9.0.0.0/8
+        - 11.0.0.0/8
+        - 21.0.0.0/8
+        - 30.0.0.0/8
+    credentials:
+      # The ONLY profile allowed a writable warehouse account: no
+      # host-language code runs here, so the account cannot be repurposed
+      # for arbitrary DDL (Q5 hard constraint).
+      warehouse: scoped_readwrite        # single gateway of this working copy
+      platform: none                     # never
+    # User SQL is still user input: keep it off the platform nodes.
+    node_pool: user-code
+    timeout_seconds: 3600
+    allowed_task_kinds:
+      - sqlmesh.plan
+      - sqlmesh.apply
+      - sqlmesh.query
+      - git.clone
+      - git.push
+    covers_threats: [T1, T2, T3, T5, T6, T7, T10]
+
+  # ── L3-base: hardened container, ships in P6 ──────────────────────────
+  L3_base:
+    enabled: true
+    # Gated user code: arbitrary Python / shell, in a container.
+    # Standard runtime (Q2): hardened but SHARING THE HOST KERNEL.
+    isolation: container
+    runtime_class: runc                  # gvisor deferred, see L3_strong
+    run_as_user: 65534
+    read_only_root_fs: true
+    drop_capabilities: ["ALL"]
+    seccomp: RuntimeDefault
+    automount_service_account_token: false
+    enable_service_links: false          # no cluster service env vars
+    dns_policy: None                     # controlled resolver only
+    host_network: false
+    host_pid: false
+    host_ipc: false
+    resources:
+      cpu_limit: "2"
+      memory_limit: "4Gi"
+      pids_limit: 512
+      ephemeral_storage_limit: "8Gi"
+    network:
+      default: deny
+      egress_via_proxy: true
+      allowed_destinations: [warehouse, git]
+      denied_cidrs:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 127.0.0.0/8
+        - 9.0.0.0/8
+        - 11.0.0.0/8
+        - 21.0.0.0/8
+        - 30.0.0.0/8
+    credentials:
+      # Read-only on purpose: write operations are split out to L2_container
+      # (Q5), because user code runs in this profile.
+      warehouse: scoped_readonly
+      platform: none
+    node_pool: user-code                 # physically separate from platform nodes
+    timeout_seconds: 1800
+    allowed_task_kinds:
+      - agent.shell
+      - dagster.run
+      - dagster.codelocation
+      - sqlmesh.plan_with_python
+      - sqlmesh.render_macro
+      # Phase 1 of the write split (design 04 §3.5): executes the project's
+      # Python models with a READ-ONLY account and writes an SQL-only rendering
+      # of them. Phase 2 (sqlmesh.apply, L2) applies that rendering, so the
+      # writable account never coexists with user code.
+      - sqlmesh.render_project
+    covers_threats: [T1, T2, T3, T5, T6, T7, T10]
+    # T8 (container escape) is NOT covered: see L3_strong.
+
+  # ── L3-strong: sandboxed kernel, DEFERRED (Q2) ────────────────────────
+  L3_strong:
+    # DISABLED. Identical to L3_base plus a sandboxed kernel. Enabling it is
+    # a config change plus a capable node pool (design 04 §8.1).
+    enabled: false
+    inherits: L3_base
+    runtime_class: gvisor                # or kata-containers
+    node_pool: user-code-sandboxed
+    covers_threats: [T1, T2, T3, T5, T6, T7, T8, T10]
+
+# Fail-safe: an unlisted task kind runs under the strongest ENABLED profile.
+# It is never L1/L2, because those assume the input cannot execute host code.
+default_profile: strongest_enabled

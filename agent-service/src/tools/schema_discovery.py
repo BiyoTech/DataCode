@@ -1,20 +1,22 @@
 """Tool: schema_discovery - query data source table/column schemas.
 
-Calls SQLMesh Service to discover available tables and their columns
-from the project's configured Gateway (database connection).
+Calls workspace-runtime to discover available tables and their columns from the
+project's configured Gateway (database connection).
 """
 
-import httpx
 from agents import RunContextWrapper, function_tool
-
-from src.config import settings
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry
+from src.tools.runtime_client import RuntimeUnavailable, get_runtime_client
 
 
 @ToolRegistry.register("schema_discovery", level=1)
 @function_tool
-async def schema_discovery(ctx: RunContextWrapper[ToolContext], schema_name: str, table_name: str = "") -> str:
+async def schema_discovery(
+    ctx: RunContextWrapper[ToolContext],
+    schema_name: str,
+    table_name: str = "",
+) -> str:
     """Discover table and column schemas from the data warehouse.
 
     Use this tool to understand what data sources are available for building models.
@@ -28,18 +30,18 @@ async def schema_discovery(ctx: RunContextWrapper[ToolContext], schema_name: str
     """
     workspace_path = ctx.context.workspace_path
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{settings.sqlmesh_service_url}/api/v1/schema/discover",
+    try:
+        data = await get_runtime_client().post(
+            "/api/v1/schema/discover",
+            workspace_path=workspace_path,
             json={
                 "workspace_path": workspace_path,
                 "schema_name": schema_name,
                 "table": table_name,
             },
-            timeout=30.0,
         )
-        response.raise_for_status()
-        data = response.json()
+    except RuntimeUnavailable as exc:
+        return f"Error: schema discovery failed: {exc}"
 
     tables = data.get("tables", [])
     if not tables:

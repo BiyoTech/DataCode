@@ -14,9 +14,8 @@ from pathlib import Path
 from typing import List, Tuple
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
-from src.tools._file_utils import EXCLUDE_DIRS, is_binary_file, resolve_safe_path
+from src.tools._file_utils import is_binary_file, iter_visible_entries
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
 
@@ -85,10 +84,14 @@ async def search_code(
     try:
         if regex:
             pattern = re.compile(query, re.IGNORECASE)
-            matcher = lambda line: bool(pattern.search(line))
+
+            def matcher(line: str) -> bool:
+                return bool(pattern.search(line))
         else:
             needle = query.lower()
-            matcher = lambda line: needle in line.lower()
+
+            def matcher(line: str) -> bool:  # noqa: F811
+                return needle in line.lower()
     except re.error as exc:
         return f"Error: invalid regex pattern: {exc}"
 
@@ -97,10 +100,9 @@ async def search_code(
     matches: List[Tuple[str, int, str, List[str]]] = []
     files_with_matches: dict[str, int] = {}
 
-    for filepath in root.rglob("*"):
-        # Skip excluded directories.
-        if any(part in EXCLUDE_DIRS for part in filepath.parts):
-            continue
+    # Pruned, not filtered: a dependency tree is skipped whole rather than
+    # enumerated and discarded file by file.
+    for filepath in iter_visible_entries(root, root, recursive=True):
         if not filepath.is_file():
             continue
 

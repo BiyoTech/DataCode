@@ -1,14 +1,12 @@
 """Tool: list_models - list all models in the project.
 
-Retrieves model metadata from the SQLMesh Service for project overview.
+Retrieves model metadata from workspace-runtime for project overview.
 """
 
-import httpx
 from agents import RunContextWrapper, function_tool
-
-from src.config import settings
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry
+from src.tools.runtime_client import RuntimeUnavailable, get_runtime_client
 
 
 @ToolRegistry.register("list_models", level=1)
@@ -20,21 +18,22 @@ async def list_models(ctx: RunContextWrapper[ToolContext], kind_filter: str = ""
     Use this to understand the current state of the project.
 
     Args:
-        kind_filter: Optional filter by model kind (e.g., "FULL", "VIEW", "INCREMENTAL_BY_TIME_RANGE").
+        kind_filter: Optional filter by model kind
+    (e.g., "FULL", "VIEW", "INCREMENTAL_BY_TIME_RANGE").
 
     Returns:
         A formatted list of models with their metadata.
     """
     workspace_path = ctx.context.workspace_path
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{settings.sqlmesh_service_url}/api/v1/models",
+    try:
+        data = await get_runtime_client().get(
+            "/api/v1/models",
+            workspace_path=workspace_path,
             params={"workspace_path": workspace_path, "kind": kind_filter},
-            timeout=30.0,
         )
-        response.raise_for_status()
-        data = response.json()
+    except RuntimeUnavailable as exc:
+        return f"Error: could not list models: {exc}"
 
     models = data.get("models", [])
     if not models:

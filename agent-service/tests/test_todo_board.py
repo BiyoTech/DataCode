@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -54,7 +53,7 @@ def test_build_todo_continuation_nudge_lists_items(workspace: str) -> None:
 
 def test_session_scoped_task_board_isolated(workspace: str) -> None:
     board_a = get_task_board(workspace, "session-a")
-    board_b = get_task_board(workspace, "session-b")
+    get_task_board(workspace, "session-b")
     board_a.create("only in a", "pending")
 
     assert has_incomplete_tasks(workspace, "session-a") is True

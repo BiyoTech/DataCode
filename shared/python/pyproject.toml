@@ -15,3 +15,18 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["datacode_common"]
+
+# Same lint contract as the services that consume this library. Without this
+# section ruff fell back to its defaults here, so the DTZ (naive datetime) rule
+# that P1 introduced platform-wide was silently NOT enforced on the shared
+# library -- the one place a naive timestamp would propagate everywhere.
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "DTZ"]
+
+[tool.pytest.ini_options]
+# Async fixtures/tests (the Redis coordination tests run against a live loop).
+asyncio_mode = "auto"

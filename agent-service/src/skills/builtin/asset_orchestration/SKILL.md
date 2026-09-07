@@ -119,7 +119,7 @@ Keep secrets in env vars and pull them via `dg.EnvVar` — never hard-code.
 SQLMesh models appear in the Dagster asset graph as external assets with key
 `["sqlmesh", "schema", "table"]` and group `sqlmesh`. The bridge
 (`defs/assets/sql_assets.py`, platform-managed) fetches SQLMesh lineage from
-sqlmesh-service at code-location load time. Your Dagster assets can depend on
+the workspace runtime at code-location load time. Your Dagster assets can depend on
 those keys — use the `list_models` tool to see which models exist and pick
 asset keys accordingly.
 

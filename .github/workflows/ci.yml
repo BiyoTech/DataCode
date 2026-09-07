@@ -12,19 +12,48 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          # 1.25 is the floor every go.mod in the repo declares (gateway,
+          # identity-service, shared/go); an older toolchain would fail module
+          # resolution before running a single vet.
+          go-version: "1.25"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Lint gateway
         run: cd gateway && go vet ./...
+      - name: Lint identity-service
+        run: cd identity-service && go vet ./...
+      - name: Lint shared Go library
+        run: cd shared/go && go vet ./...
       - name: Install ruff
         run: pip install ruff
       - name: Lint Python services
         run: |
           cd agent-service && ruff check src/ tests/
-          cd ../sqlmesh-service && ruff check src/ tests/
-          cd ../ontology-service && ruff check src/ tests/
+          cd ../control-service && ruff check src/ tests/
+          cd ../workspace-runtime && ruff check src/ tests/
+          cd ../task-runner && ruff check src/ tests/
+          cd ../egress-proxy && ruff check src/ tests/
+          cd ../shared/python && ruff check datacode_common/ tests/
+      - name: Permission catalog is in sync
+        # The catalog has one declaration (shared/rbac-catalog.json) and two
+        # generated constant tables (Go + Python). A hand edit to either table,
+        # or a JSON change without regenerating, means the gateway and the
+        # services can disagree on which permission codes exist — which ships as
+        # a route no role can pass.
+        run: python scripts/gen-rbac-catalog.py --check
+      - name: Configuration doctor
+        # Structural config invariants: every shipped profile resolves, no
+        # address in the base, no localhost in container profiles, the
+        # Global/Cell split is coherent. Catches config drift BEFORE it ships
+        # rather than after it boots somewhere wrong.
+        run: |
+          pip install -e shared/python
+          pip install pyyaml
+          python scripts/config-doctor.py
+      - name: Configuration profile contract tests
+        run: |
+          cd shared/python && python -m pytest tests/test_config_profiles.py -q
 
   test:
     runs-on: ubuntu-latest
@@ -32,28 +61,62 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.25"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Test gateway
         run: cd gateway && go test ./...
+      - name: Test identity-service
+        # Security-critical: this service owns authentication and the whole
+        # RBAC dataset. A regression here is a silent auth change, so it runs
+        # on every push, not on a schedule.
+        run: cd identity-service && go test ./...
+      - name: Test shared Go library
+        run: cd shared/go && go test ./...
       - name: Test agent-service
         run: |
           pip install -e shared/python
           cd agent-service
           pip install -e ".[dev]"
           python -m pytest tests/ -q
-      - name: Test sqlmesh-service
+      - name: Test control-service
         run: |
           pip install -e shared/python
-          cd sqlmesh-service
+          cd control-service
           pip install -e ".[dev]"
           python -m pytest tests/ -q
-      - name: Test ontology-service
+      - name: Test workspace-runtime
+        # `[usercode]` as well as `[dev]`: this service imports USER assets on
+        # its own interpreter, and tests/test_usercode_dependencies.py holds it
+        # to that promise. Installing only `[dev]` here would make the one place
+        # meant to catch a missing package the place that cannot see it.
         run: |
-          cd ontology-service
+          pip install -e shared/python
+          cd workspace-runtime
+          pip install -e ".[dev,usercode]"
+          python -m pytest tests/ -q
+      - name: Test task-runner
+        # The sandbox execution vehicle: the code that guarantees a task cannot
+        # escape its isolation profile. Unguarded changes here are exactly the
+        # kind CI exists for.
+        run: |
+          pip install -e shared/python
+          cd task-runner
           pip install -e ".[dev]"
+          python -m pytest tests/ -q
+      - name: Test egress-proxy
+        # The single outbound path for sandboxes; a regression reopens the
+        # network escape the whole P6b plane exists to close.
+        run: |
+          pip install -e shared/python
+          cd egress-proxy
+          pip install -e ".[dev]"
+          python -m pytest tests/ -q
+      - name: Test shared library
+        run: |
+          pip install -e shared/python
+          cd shared/python
           python -m pytest tests/ -q
 
   build:

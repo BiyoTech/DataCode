@@ -1,0 +1,59 @@
+[project]
+name = "datacode-egress-proxy"
+version = "0.1.0"
+description = "The single outbound path for DataCode sandboxes (design 04 §3.4)"
+requires-python = ">=3.11"
+
+# Short by design. This process is reachable from untrusted sandboxes, so every
+# dependency is attack surface:
+#   * no fastapi/uvicorn -- the CONNECT protocol is asyncio streams, not HTTP
+#     routing; an HTTP framework here would only add parsers we do not need.
+#   * no sqlalchemy      -- the proxy stores nothing.
+# datacode-common carries the policy (egress), the grant store and the token
+# verifier, all of which MUST be the same code the runtime mints against.
+#
+# pydantic is listed explicitly even though it is datacode-common's own
+# dependency: the grant store reaches Redis through the shared platform config,
+# which is a pydantic model. Relying on it arriving transitively is how a
+# dependency install that skips extras produces a proxy that denies every request
+# with "grant store unreachable" — a failure whose cause is three layers from its
+# symptom.
+dependencies = [
+    "datacode-common",
+    "redis>=5.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+datacode-egress-proxy = "src.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "DTZ", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101 assert / S105-S106 hardcoded credential: a test's fixture secret is the
+# point of the test, and asserting is how it reports.
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

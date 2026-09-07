@@ -1,11 +1,9 @@
 package middleware
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +11,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/datacode/gateway/internal/auth"
-	"github.com/datacode/gateway/internal/rbac"
+	"github.com/datacode/gateway/internal/authz"
+	rbac "github.com/datacode/shared/rbac"
 )
 
 const testSecret = "middleware-test-secret"
@@ -47,7 +46,7 @@ func identityEcho(captured *map[string]string) http.Handler {
 
 func TestJWTAuthPublishesIdentityAndOverwritesHeaders(t *testing.T) {
 	issuer := newTestIssuer(t, time.Hour)
-	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", auth.RoleAdmin)
+	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", rbac.RoleTenantAdmin)
 	if err != nil {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
@@ -71,7 +70,7 @@ func TestJWTAuthPublishesIdentityAndOverwritesHeaders(t *testing.T) {
 		"ctx_user_id":     "user-1",
 		"ctx_tenant_id":   "tenant-1",
 		"ctx_username":    "alice",
-		"ctx_role":        auth.RoleAdmin,
+		"ctx_role":        rbac.RoleTenantAdmin,
 		"header_user_id":  "user-1",
 		"header_tenant":   "tenant-1",
 		"header_username": "alice",
@@ -125,7 +124,7 @@ func TestJWTAuthRejectsMissingAndMalformedTokens(t *testing.T) {
 func TestJWTAuthSignalsExpiredToken(t *testing.T) {
 	// The frontend relies on this distinct code to trigger a silent refresh.
 	issuer := newTestIssuer(t, -time.Minute)
-	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", auth.RoleViewer)
+	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", rbac.RoleTenantViewer)
 	if err != nil {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
@@ -223,7 +222,6 @@ func TestJWTAuthAllowsPublicPathsAndPreflight(t *testing.T) {
 // to every built-in role, while writing it is reserved to administrators.
 func TestAuthorizeEnforcesTenantPermissions(t *testing.T) {
 	issuer := newTestIssuer(t, time.Hour)
-	rbacService := newTestRBACService(t, "tenant-1")
 
 	cases := []struct {
 		name       string
@@ -231,11 +229,11 @@ func TestAuthorizeEnforcesTenantPermissions(t *testing.T) {
 		method     string
 		wantStatus int
 	}{
-		{"admin reads members", auth.RoleAdmin, http.MethodGet, http.StatusOK},
-		{"developer reads members", auth.RoleDeveloper, http.MethodGet, http.StatusOK},
-		{"admin writes members", auth.RoleAdmin, http.MethodPost, http.StatusOK},
-		{"developer writes members", auth.RoleDeveloper, http.MethodPost, http.StatusForbidden},
-		{"viewer writes members", auth.RoleViewer, http.MethodPost, http.StatusForbidden},
+		{"admin reads members", rbac.RoleTenantAdmin, http.MethodGet, http.StatusOK},
+		{"developer reads members", rbac.RoleTenantDeveloper, http.MethodGet, http.StatusOK},
+		{"admin writes members", rbac.RoleTenantAdmin, http.MethodPost, http.StatusOK},
+		{"developer writes members", rbac.RoleTenantDeveloper, http.MethodPost, http.StatusForbidden},
+		{"viewer writes members", rbac.RoleTenantViewer, http.MethodPost, http.StatusForbidden},
 		{"unknown role writes members", "ghost", http.MethodPost, http.StatusForbidden},
 	}
 	for _, tc := range cases {
@@ -247,8 +245,9 @@ func TestAuthorizeEnforcesTenantPermissions(t *testing.T) {
 			terminal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			})
+			resolver := newTestResolver(t, "tenant-1", "user-1", tc.role)
 			handler := JWTAuth(issuer, zap.NewNop())(
-				Authorize(rbacService, zap.NewNop())(terminal))
+				Authorize(resolver, zap.NewNop())(terminal))
 
 			req := httptest.NewRequest(tc.method, "/api/v1/auth/members", nil)
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -266,16 +265,16 @@ func TestAuthorizeEnforcesTenantPermissions(t *testing.T) {
 // state-changing request that matches no rule must never reach the backend.
 func TestAuthorizeDeniesUnmappedWrites(t *testing.T) {
 	issuer := newTestIssuer(t, time.Hour)
-	rbacService := newTestRBACService(t, "tenant-1")
 
-	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", auth.RoleAdmin)
+	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", rbac.RoleTenantAdmin)
 	if err != nil {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
 
 	reached := false
 	handler := JWTAuth(issuer, zap.NewNop())(
-		Authorize(rbacService, zap.NewNop())(
+		Authorize(newTestResolver(t, "tenant-1", "user-1", rbac.RoleTenantAdmin),
+			zap.NewNop())(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				reached = true
 				w.WriteHeader(http.StatusOK)
@@ -300,15 +299,15 @@ func TestAuthorizeDeniesUnmappedWrites(t *testing.T) {
 // lacks — otherwise the UI can only show "status code 403".
 func TestAuthorizeDenialExplainsMissingPermission(t *testing.T) {
 	issuer := newTestIssuer(t, time.Hour)
-	rbacService := newTestRBACService(t, "tenant-1")
 
-	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", auth.RoleViewer)
+	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", rbac.RoleTenantViewer)
 	if err != nil {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
+	resolver := newTestResolver(t, "tenant-1", "user-1", rbac.RoleTenantViewer)
 
 	handler := JWTAuth(issuer, zap.NewNop())(
-		Authorize(rbacService, zap.NewNop())(
+		Authorize(resolver, zap.NewNop())(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			})))
@@ -360,16 +359,16 @@ func assertDenial(
 // its own capabilities: the headers are always produced by the gateway.
 func TestAuthorizeStripsClientCapabilityHeaders(t *testing.T) {
 	issuer := newTestIssuer(t, time.Hour)
-	rbacService := newTestRBACService(t, "tenant-1")
 
-	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", auth.RoleViewer)
+	token, _, err := issuer.IssueAccessToken("user-1", "alice", "tenant-1", rbac.RoleTenantViewer)
 	if err != nil {
 		t.Fatalf("IssueAccessToken: %v", err)
 	}
+	resolver := newTestResolver(t, "tenant-1", "user-1", rbac.RoleTenantViewer)
 
 	var forwarded string
 	handler := JWTAuth(issuer, zap.NewNop())(
-		Authorize(rbacService, zap.NewNop())(
+		Authorize(resolver, zap.NewNop())(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				forwarded = r.Header.Get(HeaderPermissions)
 				w.WriteHeader(http.StatusOK)
@@ -389,23 +388,45 @@ func TestAuthorizeStripsClientCapabilityHeaders(t *testing.T) {
 	}
 }
 
-// newTestRBACService builds an RBAC service on a throwaway SQLite database with
-// the catalog seeded and the tenant's built-in roles instantiated.
-func newTestRBACService(t *testing.T, tenantID string) *rbac.Service {
+// builtinRolePermissions returns the permission set of a built-in role, taken
+// from the code-side templates in internal/rbac.
+//
+// P5.5: these tests used to seed a throwaway SQLite database and ask a real
+// rbac.Service. The gateway no longer owns those tables — identity-service
+// does — so the reference is now the template declaration itself. The intent is
+// unchanged: assert against the platform's ACTUAL role definitions rather than
+// hand-written permission lists, so a role edit that breaks a route is caught.
+//
+// An unknown role code yields an EMPTY set, mirroring identity-service: a role
+// that does not exist grants nothing, which is what makes such a token safe.
+func builtinRolePermissions(scope rbac.Scope, roleCode string) []string {
+	for _, tpl := range rbac.BuiltinRoleTemplates {
+		if tpl.Scope == scope && tpl.Code == roleCode {
+			return tpl.Permissions
+		}
+	}
+	return []string{}
+}
+
+// newTestResolver builds an authz.Resolver preloaded with the snapshot the real
+// identity-service would return for (userID, tenantID, role).
+//
+// Tenant-scoped only: no workspace bindings are granted, which matches what
+// these middleware tests exercise.
+func newTestResolver(
+	t *testing.T, tenantID, userID, role string,
+) *authz.Resolver {
 	t.Helper()
 
-	store, err := auth.NewStore(auth.DialectSQLite, filepath.Join(t.TempDir(), "rbac.db"))
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-
-	service := rbac.NewService(rbac.NewStore(store.DB()), zap.NewNop())
-	if err := service.Bootstrap(context.Background()); err != nil {
-		t.Fatalf("Bootstrap: %v", err)
-	}
-	if err := service.EnsureTenantRoles(context.Background(), tenantID); err != nil {
-		t.Fatalf("EnsureTenantRoles: %v", err)
-	}
-	return service
+	resolver := authz.NewTestResolver(time.Minute)
+	resolver.Preload(userID, tenantID, &authz.Snapshot{
+		UserID:               userID,
+		TenantID:             tenantID,
+		TenantRole:           role,
+		TenantPermissions:    builtinRolePermissions(rbac.ScopeTenant, role),
+		WorkspaceRoles:       map[string]string{},
+		WorkspacePermissions: map[string][]string{},
+		PermsVersion:         1,
+	})
+	return resolver
 }

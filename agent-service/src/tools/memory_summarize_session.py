@@ -6,12 +6,12 @@ message count exceeds the auto_summarize_after_turns threshold.
 """
 
 import json
-import uuid
 import typing as t
+import uuid
+
+from sqlalchemy import desc, select
 
 from agents import RunContextWrapper, function_tool
-from sqlalchemy import select, desc
-
 from src.context.database import (
     MemoryEventRow,
     MemorySummaryRow,
@@ -82,6 +82,7 @@ async def _run_summarize_session(
 
     # Step 3: Call LLM for extraction using configured summarization model
     from openai import AsyncOpenAI
+
     from src.config import settings
 
     # Resolve API credentials from the model config referenced by summarization settings

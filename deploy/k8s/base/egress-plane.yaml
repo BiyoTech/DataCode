@@ -1,0 +1,542 @@
+# Egress plane for sandboxes (design 04 §3.4, roadmap P6b).
+#
+# Three objects, and the order they matter in:
+#
+#   1. egress-dns   — the ONLY resolver a sandbox can reach. Without it, a Pod
+#                     with `dnsPolicy: None` cannot resolve anything, and with
+#                     the cluster resolver a sandbox could enumerate internal
+#                     services by name.
+#   2. egress-proxy — the ONLY outbound path. Authenticates each task by its
+#                     scoped token, checks the tenant's allow-list, refuses every
+#                     internal address, accounts the bytes, audits all of it.
+#   3. NetworkPolicy — makes 1 and 2 the only options rather than the intended
+#                     ones. Everything not listed is denied: Postgres, Redis,
+#                     identity, control, the cloud metadata service, other
+#                     sandboxes.
+#
+# Applied to namespace `datacode-tasks` (workspace-runtime's `task_namespace`).
+#
+# ── Rollout note ─────────────────────────────────────────────────────────────
+# A default-deny policy is the one change here that can break working traffic in
+# a way nobody predicted. Roll it out in the order the roadmap states: deploy the
+# proxy and the resolver first, run with tasks pointed at the proxy while the
+# policy is NOT yet applied, confirm from the audit trail that every destination a
+# real workload uses is being allowed, and only then apply the NetworkPolicy.
+# Kubernetes has no "audit mode" for NetworkPolicy, so this observation window is
+# the substitute — see the roadmap's P6b entry.
+# NOTE: the datacode-tasks Namespace itself is declared in namespace.yaml (one
+# declaration per object — kustomize refuses duplicates), together with the
+# labels the policies here select on.
+---
+# The service account every task Pod runs as. It has NO RoleBinding anywhere,
+# deliberately: a sandbox must not be able to read a Secret, create a Pod or list
+# anything. The token is not even mounted (`automountServiceAccountToken: false`
+# on the Pod, from the isolation profile), so this exists only to avoid Pods
+# defaulting to the namespace's `default` account.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: task-runner-noperm
+  namespace: datacode-tasks
+automountServiceAccountToken: false
+---
+# ── egress-dns: the controlled resolver ──────────────────────────────────────
+# CoreDNS configured to forward only, with no knowledge of the cluster zone. A
+# sandbox therefore cannot resolve `postgres.datacode.svc.cluster.local` — not
+# because it is blocked, but because this resolver has never heard of it.
+#
+# Blocking the metadata service by name as well as by address is belt-and-braces:
+# the proxy refuses 169.254.169.254 regardless, but a name that never resolves
+# cannot even be attempted.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: egress-dns
+  namespace: datacode-tasks
+data:
+  Corefile: |
+    # Refuse the cluster's own zone outright: a sandbox has no business
+    # resolving internal service names, and answering would let it enumerate
+    # the platform.
+    cluster.local:53 {
+        template ANY ANY {
+            rcode NXDOMAIN
+        }
+        log
+    }
+
+    # The cloud metadata endpoints, by name.
+    metadata.google.internal:53 {
+        template ANY ANY {
+            rcode NXDOMAIN
+        }
+        log
+    }
+
+    .:53 {
+        errors
+        # Public resolvers only. NOT the cluster's, whose search domains and
+        # in-cluster answers are exactly what must stay unreachable.
+        forward . 1.1.1.1 8.8.8.8 {
+            max_concurrent 1000
+        }
+        cache 30
+        # Every query is logged: a sandbox resolving unexpected names is the
+        # first observable sign of something worth looking at.
+        log
+        health :8080
+        ready :8181
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-dns
+  namespace: datacode-tasks
+  labels:
+    app: egress-dns
+spec:
+  selector:
+    app: egress-dns
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+      targetPort: 53
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+      targetPort: 53
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-dns
+  namespace: datacode-tasks
+  labels:
+    app: egress-dns
+spec:
+  # Two replicas: a single resolver is a single point of failure for every
+  # sandbox's network, and a task cannot fall back to another one.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: egress-dns
+  template:
+    metadata:
+      labels:
+        app: egress-dns
+    spec:
+      serviceAccountName: task-runner-noperm
+      automountServiceAccountToken: false
+      # On the platform nodes, not the user-code pool: this is infrastructure a
+      # sandbox depends on, and it must not share a node with the code it serves.
+      containers:
+        - name: coredns
+          image: coredns/coredns:1.11.3
+          args: ["-conf", "/etc/coredns/Corefile"]
+          ports:
+            - containerPort: 53
+              protocol: UDP
+            - containerPort: 53
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/coredns
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          livenessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /ready, port: 8181 }
+      volumes:
+        - name: config
+          configMap:
+            name: egress-dns
+---
+# ── egress-proxy: the only outbound path ─────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-proxy
+  namespace: datacode-tasks
+  labels:
+    app: egress-proxy
+spec:
+  selector:
+    app: egress-proxy
+  ports:
+    - name: proxy
+      port: 3128
+      targetPort: proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: datacode-tasks
+  labels:
+    app: egress-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: egress-proxy
+  template:
+    metadata:
+      labels:
+        app: egress-proxy
+    spec:
+      serviceAccountName: task-runner-noperm
+      automountServiceAccountToken: false
+      containers:
+        - name: proxy
+          image: datacode/egress-proxy:latest
+          ports:
+            - name: proxy
+              containerPort: 3128
+          env:
+            - name: EGRESS_PROXY_PORT
+              value: "3128"
+            - name: TZ
+              value: UTC
+            # The token signing secret. The SAME value workspace-runtime mints
+            # with — a mismatch denies every request, which is the correct
+            # failure direction but an opaque one, so keep them in one Secret.
+            - name: DATACODE_TASK_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-task-token
+                  key: signing-secret
+            # Redis holds the per-task egress grants. Unreachable Redis denies
+            # all egress; it does NOT fall back to a local view, because two
+            # replicas with private views would disagree about what is allowed.
+            - name: REDIS_HOST
+              value: redis.datacode.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-redis
+                  key: password
+                  optional: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65533
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "2", memory: 512Mi }
+          # Liveness is "the port accepts a connection". No HTTP endpoint is
+          # exposed: this process is reachable from sandboxes, and an
+          # unauthenticated endpoint would be surface for no benefit.
+          livenessProbe:
+            tcpSocket: { port: proxy }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: proxy }
+            initialDelaySeconds: 2
+---
+# ── NetworkPolicy: default-deny for sandboxes ────────────────────────────────
+# This is the object that turns the two above from "the intended path" into
+# "the only path".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: task-runner-default-deny
+  namespace: datacode-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app: task-runner
+      # ONE-SHOT tasks only. Warm-pool Pods carry the same `app` label (so they
+      # inherit the same egress posture) plus `datacode.io/kind: warm-pool`, and
+      # are selected by `warm-pool-policy` below instead — they need one inbound
+      # path, which this rule must keep denying for everything else.
+      datacode.io/kind: one-shot
+  policyTypes: [Ingress, Egress]
+  # A one-shot sandbox accepts NO inbound connections. It is reached by nobody:
+  # the runtime reads its result from the Pod log, precisely so that no inbound
+  # path is needed.
+  ingress: []
+  egress:
+    # The controlled resolver.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The proxy. Everything else outbound goes through here or nowhere.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+  # Deliberately NOT listed, and therefore denied:
+  #   * Postgres / Redis / identity-service / control-service   (T3, T4)
+  #   * 169.254.169.254 cloud metadata                          (T6)
+  #   * 10/8, 172.16/12, 192.168/16 and the platform's own       (T7)
+  #   * other task-runner Pods                                  (T1 laterally)
+  #   * workspace-runtime itself — the result travels via the Pod log, so a
+  #     sandbox never needs to call the platform back. Design 04 §3.4 sketched
+  #     an 8010 callback; P6a chose the log instead, which removes this rule
+  #     and with it the surface it would have opened.
+---
+# Warm-pool runners (P6c). Same egress posture as a one-shot task — DNS and the
+# proxy, nothing else — plus the ONE inbound path that distinguishes them: the
+# runtime dials the Pod to hand it a task, instead of the Pod being created with
+# a spec file and read from its log.
+#
+# That inbound path is why these Pods need their own rule rather than sharing
+# task-runner-default-deny, whose premise ("no inbound at all") is what makes it
+# safe. Everything about the exception is narrowed:
+#   * only from the platform namespace, only from workspace-runtime;
+#   * only the runner port;
+#   * NOT from other Pods in this namespace, so one sandbox still cannot reach
+#     another's runner and feed it tasks (T1 laterally, and worse: the runner
+#     would execute them against a working copy the caller has no claim on).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: warm-pool-policy
+  namespace: datacode-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app: task-runner
+      datacode.io/kind: warm-pool
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: datacode
+          podSelector:
+            matchLabels:
+              app: workspace-runtime
+      ports:
+        - protocol: TCP
+          port: 8020
+  egress:
+    # The controlled resolver.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The proxy. Everything else outbound goes through here or nowhere.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+  # Deliberately NOT listed, and therefore denied — identical to the one-shot
+  # rule, because a resident runner runs the same user code:
+  #   * Postgres / Redis / identity-service / control-service   (T3, T4)
+  #   * 169.254.169.254 cloud metadata                          (T6)
+  #   * the platform's own ranges                               (T7)
+  #   * other task Pods and other warm runners                  (T1 laterally)
+---
+# The proxy itself may reach the internet and Redis; nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-proxy-policy
+  namespace: datacode-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app: egress-proxy
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Only sandboxes may connect, and only on the proxy port. "task-runner"
+    # covers one-shot tasks AND the warm sandbox (which reuses that label
+    # because it shares the envelope); code locations are long-lived user code
+    # with the SAME egress requirement, so they are named explicitly.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: task-runner
+        - podSelector:
+            matchLabels:
+              app: dagster-code-location
+      ports:
+        - protocol: TCP
+          port: 3128
+  egress:
+    # DNS, for resolving the destinations it is asked about.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Redis, for the grants and the byte counters.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: datacode
+          podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # The internet, minus the platform's own space. The proxy applies the real
+    # allow-list per task; these blocks are the second line — if the policy code
+    # were ever wrong, the packet still could not leave.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 9.0.0.0/8
+              - 11.0.0.0/8
+              - 21.0.0.0/8
+              - 30.0.0.0/8
+---
+# Code locations are user code that OUTLIVES a task: a Pod that keeps a user's
+# definitions.py loaded and is dialled by the orchestrator. They cannot share
+# task-runner-default-deny, whose whole premise is "a sandbox accepts no
+# inbound connections" — a code location exists to be dialled. Leaving them
+# unselected by any policy would be worse: their egress would be unrestricted.
+#
+# So they get their own rule, and it is the one place where ingress is allowed:
+# the orchestrator, on the gRPC port, and nothing else. Egress follows the same
+# shape as a task — DNS and the proxy — plus the orchestrator's own port, since
+# runs report back to it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: code-location-policy
+  namespace: datacode-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app: dagster-code-location
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # The orchestrator lives in the platform namespace; the selector relies
+        # on that namespace carrying the `name: datacode` label, the same
+        # convention egress-proxy-policy uses to reach Redis.
+        - namespaceSelector:
+            matchLabels:
+              name: datacode
+          podSelector:
+            matchLabels:
+              app: dagster
+      ports:
+        - protocol: TCP
+          port: 4000
+  egress:
+    # The controlled resolver.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The proxy — the only path out to anything else.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+    # The orchestrator's gRPC/websocket port: runs report back to it.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: datacode
+          podSelector:
+            matchLabels:
+              app: dagster
+      ports:
+        - protocol: TCP
+          port: 3030
+  # Deliberately NOT listed, and therefore denied — the same set that is denied
+  # for tasks, because a code location is the same class of untrusted code:
+  #   * Postgres / Redis / identity-service / control-service   (T3, T4)
+  #   * 169.254.169.254 cloud metadata                          (T6)
+  #   * other task Pods and other code locations                (T1 laterally)
+---
+# The resolver may reach upstream DNS and nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-dns-policy
+  namespace: datacode-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app: egress-dns
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: task-runner
+        - podSelector:
+            matchLabels:
+              app: egress-proxy
+        - podSelector:
+            matchLabels:
+              app: dagster-code-location
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

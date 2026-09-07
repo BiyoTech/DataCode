@@ -1,8 +1,0 @@
-# Agent Service — Docker overrides.
-#
-# Only service-specific overrides. Database, sqlmesh service URL, and logging
-# come from platform.docker.yaml (set DATACODE_ENV=docker).
-server:
-  ws_port: 8001
-  grpc_port: 50051
-  host: "0.0.0.0"

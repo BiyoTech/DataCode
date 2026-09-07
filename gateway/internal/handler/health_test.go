@@ -35,9 +35,9 @@ func TestHealthCheckShallow(t *testing.T) {
 func TestHealthCheckDeepDegradedWhenUpstreamMissing(t *testing.T) {
 	cfg := &config.Config{
 		Services: config.ServicesConfig{
-			AgentServiceURL:    "http://127.0.0.1:1",
-			SQLMeshServiceURL:  "http://127.0.0.1:1",
-			OntologyServiceURL: "http://127.0.0.1:1",
+			AgentServiceURL:   "http://127.0.0.1:1",
+			RuntimeServiceURL: "http://127.0.0.1:1",
+			ControlServiceURL: "http://127.0.0.1:1",
 		},
 	}
 	logger := zap.NewNop()
