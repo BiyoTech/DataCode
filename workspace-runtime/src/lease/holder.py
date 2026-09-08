@@ -134,10 +134,28 @@ class LeaseHolder:
         self._runtime_id = runtime_id()
         # lease_key -> (token, MountGuard, watchdog task)
         self._held: dict[str, _HeldLease] = {}
+        # Invoked after an INVOLUNTARY loss of ownership (see _evict).
+        self._on_lost: list[t.Callable[[str], t.Awaitable[None]]] = []
 
     @property
     def runtime_id(self) -> str:
         return self._runtime_id
+
+    def on_lost(self, callback: t.Callable[[str], t.Awaitable[None]]) -> None:
+        """Register a listener for leases lost without a release() call.
+
+        Ownership can end while this instance is still running: the watchdog
+        finds the claim expired or re-granted and evicts it locally. Anything
+        built ON TOP of that ownership — served copies, WIP snapshot
+        registrations, the lease count advertised to placement — must be torn
+        down in the same breath, or the instance keeps presenting itself as the
+        owner of a working copy it no longer owns.
+
+        A callback rather than the holder cleaning up directly: the holder
+        proves ownership and must not grow an opinion about what other layers
+        derived from it.
+        """
+        self._on_lost.append(callback)
 
     def held_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._held))
@@ -334,6 +352,17 @@ class LeaseHolder:
             return
         held.guard.release()
         logger.warning("lease_evicted", lease_key=lease_key)
+        # Notify AFTER both claims are gone: a listener that reacts by
+        # re-acquiring must not race this instance's own leftovers.
+        for callback in self._on_lost:
+            try:
+                await callback(lease_key)
+            except Exception as exc:  # noqa: BLE001 — cleanup must not raise
+                logger.error(
+                    "lease_lost_listener_failed",
+                    lease_key=lease_key,
+                    error=str(exc),
+                )
 
     async def _release_claim(self, full_key: str, token: str, lease_key: str) -> None:
         """Compare-and-delete our own claim; never a successor's."""

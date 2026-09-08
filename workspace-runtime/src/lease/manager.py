@@ -149,6 +149,13 @@ class LeaseManager:
             lease_provider=self._snapshot_targets,
             auth_provider=self._auth.get,
         )
+        # An involuntary ownership loss must invalidate this bookkeeping.
+        # Registered here rather than in wiring so no assembly can forget it:
+        # a served copy that outlives its lease makes serve()/adopt() answer
+        # "already yours" without re-taking the lease, while the request path
+        # answers 409 LEASE_NOT_HELD for the same copy — a loop only a restart
+        # could break.
+        holder.on_lost(self._handle_lease_lost)
 
     @property
     def draining(self) -> bool:
@@ -285,13 +292,13 @@ class LeaseManager:
         """
         split_lease_key(lease_key)
 
-        if (warm := self._served.get(lease_key)) is not None:
+        if (warm := self._warm(lease_key)) is not None:
             self._last_used[lease_key] = time.time()
             return warm
 
         async with self._lock_for(lease_key):
             # Re-check: another coroutine may have completed while we waited.
-            if (warm := self._served.get(lease_key)) is not None:
+            if (warm := self._warm(lease_key)) is not None:
                 return warm
 
             # Local admission control (design 07 Q3). Placement read a
@@ -335,26 +342,32 @@ class LeaseManager:
         have under ``serve`` — the first request pays the remaining cost, per
         the design's ``warmup: in_progress`` contract.
         """
-        if self._served.get(lease_key) is not None:
+        if self._warm(lease_key) is not None:
             return
 
         lock = self._lock_for(lease_key)
         await lock.acquire()
+        # The lock is handed to the background task, which releases it when
+        # materialization ends. Until that hand-off happens every exit path
+        # here — including the early return below — must release it, or the
+        # next request for this copy waits on a lock nobody will ever free.
+        handed_off = False
         try:
-            if self._served.get(lease_key) is not None:
+            if self._warm(lease_key) is not None:
                 return
             self._assert_admission()
             lease = await self._holder.acquire(lease_key)
             self._audit_soon(lease_key, ACTION_ACQUIRE, "adopt")
-        except BaseException:
-            lock.release()
-            raise
 
-        task = asyncio.create_task(
-            self._adopt_in_background(lease_key, lease, lock),
-            name=f"lease-adopt-{lease_key}",
-        )
-        task.add_done_callback(lambda t: _log_background_failure(t, lease_key))
+            task = asyncio.create_task(
+                self._adopt_in_background(lease_key, lease, lock),
+                name=f"lease-adopt-{lease_key}",
+            )
+            task.add_done_callback(lambda t: _log_background_failure(t, lease_key))
+            handed_off = True
+        finally:
+            if not handed_off:
+                lock.release()
 
     async def _adopt_in_background(
         self,
@@ -507,6 +520,66 @@ class LeaseManager:
 
     # ── internals ─────────────────────────────────────────────────────
 
+    def _warm(self, lease_key: str) -> t.Optional[ServedCopy]:
+        """The served copy for ``lease_key``, ONLY while its lease is held.
+
+        Every entry point short-circuits on the served set, so that set must
+        never claim a copy this instance stopped owning: the short circuit
+        would answer "already yours" without re-taking the lease, while the
+        request path (``src.api.deps``) answers 409 LEASE_NOT_HELD from the
+        holder — the two disagreeing is a permanent 409 for that working copy,
+        because placement keeps choosing this instance (its heartbeat still
+        counts the copy) and adoption keeps returning success without doing
+        anything.
+
+        The holder reports evictions (see :meth:`_handle_lease_lost`), so this
+        check is defence in depth: it makes the invariant "served implies
+        held" hold by construction, whatever future path breaks it.
+        """
+        served = self._served.get(lease_key)
+        if served is None:
+            return None
+        if self._holder.holds(lease_key):
+            return served
+        logger.warning(
+            "lease_bookkeeping_stale",
+            lease_key=lease_key,
+            detail="served without holding the lease; dropped so it can be re-acquired",
+        )
+        self._forget(lease_key)
+        return None
+
+    def _forget(self, lease_key: str) -> None:
+        """Drop the state that only makes sense while the lease is held.
+
+        ``_last_used`` deliberately survives: it is the disk reclaimer's
+        ordering signal for copies still on this volume, and a released lease
+        does not make the files any less warm.
+        """
+        self._served.pop(lease_key, None)
+        # Credentials must not outlive the lease they belong to.
+        self._auth.pop(lease_key, None)
+
+    async def _handle_lease_lost(self, lease_key: str) -> None:
+        """React to an ownership loss nobody asked for (holder listener).
+
+        No snapshot is taken on the way out, unlike :meth:`release`: ownership
+        is ALREADY gone, another instance may have materialized the copy and
+        pushed its own snapshot, and overwriting it would replace newer work
+        with older. Nothing is destroyed either — the files stay on this
+        volume, so a lease that comes back here finds them warm.
+        """
+        was_serving = self._served.get(lease_key) is not None
+        self._forget(lease_key)
+        if not was_serving:
+            return
+        self._audit_soon(lease_key, ACTION_RELEASE, "lease_lost")
+        logger.warning(
+            "lease_ownership_lost",
+            lease_key=lease_key,
+            effect="this instance stops serving the copy and stops advertising it",
+        )
+
     def _audit_soon(self, lease_key: str, action: str, reason: str = "") -> None:
         """Schedule an audit row off the request path (acquire/release)."""
         if self._auditor is not None:
@@ -580,11 +653,14 @@ class LeaseManager:
 
         A copy awaiting a recovery decision is EXCLUDED: snapshotting it would
         overwrite the very snapshot the user has not yet chosen to restore.
+        A copy whose lease is gone is excluded for the mirror reason: pushing
+        from here would overwrite the new holder's snapshot with our stale one.
         """
         return [
             (served.lease_key, served.workspace_path, served.repo_path)
             for served in self._served.values()
             if served.pending_snapshot is None
+            and self._holder.holds(served.lease_key)
         ]
 
     async def _clear_pending_snapshot(

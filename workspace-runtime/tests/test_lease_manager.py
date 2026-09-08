@@ -11,6 +11,7 @@ compare-and-swap semantics the holder relies on still hold.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
@@ -146,7 +147,7 @@ def root(tmp_path: Path) -> str:
     return str(path)
 
 
-def _manager(client, root, remote, **overrides) -> LeaseManager:
+def _manager(client, root, remote, ttl_seconds: int = 120, **overrides) -> LeaseManager:
     calls: list[str] = []
 
     async def source_provider(lease_key: str) -> RepositorySource:
@@ -157,7 +158,7 @@ def _manager(client, root, remote, **overrides) -> LeaseManager:
         client=client,
         materialize_root=root,
         runtime_addr="10.1.2.3:8002",
-        ttl_seconds=120,
+        ttl_seconds=ttl_seconds,
     )
     kwargs = {
         "holder": holder,
@@ -277,6 +278,104 @@ class TestFailureLeavesNoPartialState:
         working = _manager(client, root, remote)
         served = await working.serve(_KEY)
         assert Path(served.workspace_path, "model.sql").exists()
+
+
+class TestOwnershipLostUnderneath:
+    """What happens when a lease ends without anyone calling release().
+
+    The Redis record can vanish while this instance keeps running: the backend
+    restarts, the key is evicted, or the container is suspended past the TTL.
+    The watchdog then evicts locally — and everything derived from that
+    ownership has to go with it. Otherwise the instance still advertises the
+    copy to placement, still answers "already yours" to an adoption, and still
+    answers 409 LEASE_NOT_HELD on the request path: a permanent loop for that
+    working copy that only a restart breaks.
+    """
+
+    async def _wait_for(self, predicate, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.05)
+        return predicate()
+
+    async def test_lost_lease_stops_being_served_and_advertised(
+        self, client, root, remote
+    ):
+        # ttl=3 -> the watchdog renews every second.
+        manager = _manager(client, root, remote, ttl_seconds=3)
+        await manager.serve(_KEY)
+
+        # Ownership disappears underneath the holder.
+        client._values.pop(lease_redis_key(_KEY))
+
+        assert await self._wait_for(lambda: not manager.holds(_KEY))
+        # served_keys() feeds the heartbeat: an instance that keeps counting a
+        # copy it lost keeps winning placement for it.
+        assert await self._wait_for(lambda: manager.served_keys() == ())
+
+    async def test_lost_lease_can_be_adopted_again(self, client, root, remote):
+        """The regression: adoption must really re-take the lease.
+
+        A stale served entry made adopt() return success without acquiring,
+        so the gateway routed here on the strength of that answer and the
+        ownership gate rejected every request that followed.
+        """
+        manager = _manager(client, root, remote, ttl_seconds=3)
+        await manager.serve(_KEY)
+        client._values.pop(lease_redis_key(_KEY))
+        assert await self._wait_for(lambda: not manager.holds(_KEY))
+
+        await manager.adopt(_KEY)
+
+        assert manager.holds(_KEY)
+        assert await client.get(lease_redis_key(_KEY)) is not None
+        assert await self._wait_for(lambda: manager.served_keys() == (_KEY,))
+
+    async def test_serve_reacquires_when_bookkeeping_outlived_the_lease(
+        self, client, root, remote
+    ):
+        """Defence in depth: the served set is never trusted on its own.
+
+        The divergence is injected directly here rather than through the
+        watchdog, because the guarantee must hold for ANY future path that
+        drops ownership without telling the manager.
+        """
+        manager = _manager(client, root, remote)
+        await manager.serve(_KEY)
+
+        holder = manager._holder
+        held = holder._held.pop(_KEY)
+        held.watchdog.cancel()
+        held.guard.release()
+        client._values.pop(lease_redis_key(_KEY))
+
+        served = await manager.serve(_KEY)
+
+        assert manager.holds(_KEY)
+        assert Path(served.workspace_path, "model.sql").exists()
+
+    async def test_adopting_an_already_served_copy_frees_the_lock(
+        self, client, root, remote
+    ):
+        """A racing adoption must not strand the per-lease lock.
+
+        The loser takes the "already served" branch after waiting for the
+        winner's materialization; leaking the lock there would make every
+        later request for this copy wait forever.
+        """
+        manager = _manager(client, root, remote)
+        # Bounded: a leaked lock makes the loser wait forever, and a hanging
+        # test reports nothing useful.
+        await asyncio.wait_for(
+            asyncio.gather(manager.adopt(_KEY), manager.adopt(_KEY)), timeout=30
+        )
+
+        assert await self._wait_for(lambda: manager.served_keys() == (_KEY,))
+        assert not manager._locks[_KEY].locked()
+        # The observable consequence, not just the internal state.
+        await asyncio.wait_for(manager.serve(_KEY), timeout=5)
 
 
 class TestRelease:
