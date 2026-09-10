@@ -35,16 +35,22 @@ src/
 ├── skills/        built-in skills (SKILL.md manifests)
 ├── subagents/     agent YAML declarations (prompts, per-agent config)
 ├── sqlmesh_docs/  curated SQLMesh docs served to the docs tool
-├── tools/         the LLM tool surface; runtime_client.py is the lease-aware
-│                  HTTP client every gated tool goes through
+├── tools/         the LLM tool surface. `runtime_client.py` is the lease-aware
+│                  HTTP client every gated tool goes through; `workspace_fs.py`
+│                  is the ONLY door to a working copy's files
 └── utils/         logging helpers
 ```
 
 ## Boundaries
 
-- No filesystem access to working copies; no subprocesses running user code.
-- The shell CLI shims (`dc`, `sqlmesh` wrappers) get their upstream address
-  from lease resolution too — never from the raw Service URL.
+- No filesystem access to working copies. Reads, writes, listings, greps and
+  `.agent/` loading all cross `src/tools/workspace_fs.py` into the replica that
+  holds the lease — this service is given no volume for a copy in any container
+  deployment, and touching one would put a second writer in a leased Git
+  worktree. Asserted structurally in
+  `tests/test_no_local_workspace_files.py`.
+- No subprocesses running user code (the dev in-process shell fallback is the
+  documented exception, and only when no runtime endpoint is configured).
 - `AGENT_SERVICE_LLM_API_KEY` is the global fallback LLM key (env-only).
 
 ## Run

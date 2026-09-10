@@ -20,7 +20,7 @@ merge: `src.codeloc.bridge` and `src.ontology.sqlmesh_metadata` now call
 src/
 ├── sqlmesh/     engine: Context pool, plan/apply, lineage, models, env locks
 ├── git/         git ops (ops.py, merge.py) — worktree lifecycle
-├── files/       file IO (ops.py) + workspace layout
+├── files/       file IO (ops.py) + content search (search.py) + layout
 ├── ontology/    semantic-layer loading + cross-ref validation (in-process)
 ├── codeloc/     Dagster code locations, deployments, ports, GraphQL client
 ├── executor/    L3-proc: persistent child holding the EXECUTABLE Context

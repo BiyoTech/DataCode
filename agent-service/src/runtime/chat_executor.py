@@ -87,7 +87,9 @@ async def execute_chat(session: SessionContext, req: ChatMessageRequest) -> None
 
     if req.workspace_path:
         session.workspace_path = req.workspace_path
-        session.workspace_context = session_manager._init_workspace_context(req.workspace_path)
+        session.workspace_context = await session_manager._init_workspace_context(
+            req.workspace_path
+        )
     if req.environment:
         session.environment = req.environment
     if req.workspace_path or req.environment:

@@ -19,19 +19,21 @@ For every affected file the tool computes a unified diff plus added/removed line
 counts and emits an `artifact.diff` event so the UI can render a Cursor / Claude
 Code style file-change card (clickable to open a before/after diff view).
 
-The patch is applied atomically: if any file operation fails to parse or apply,
-nothing is written to disk and no events are emitted.
+Nothing is written until every operation has been resolved: if any of them
+fails to parse or apply, the patch is rejected whole and no events are emitted.
+The writes themselves are performed by workspace-runtime, which owns the working
+copy — this service resolves the patch, computes the diffs, and reports.
 """
 
 import difflib
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from agents import RunContextWrapper, function_tool
 from src.context.event_bus import event_bus
 from src.context.session import session_manager
 from src.context.tool_context import ToolContext
 from src.protocol.messages import artifact_diff
+from src.tools import workspace_fs
 from src.tools._apply_diff import apply_diff
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
@@ -76,12 +78,17 @@ class _PatchOp:
 
 @dataclass
 class _FileChange:
-    """Resolved result of applying one operation (phase-1, in memory)."""
+    """Resolved result of applying one operation (phase-1, in memory).
+
+    Paths are workspace-RELATIVE: they are sent to the runtime, which resolves
+    them against the copy it holds. An absolute path from here would be a path
+    in a filesystem this process does not have.
+    """
 
     change_type: str  # "create" | "update" | "delete"
     display_path: str  # path shown in the UI (move target if renamed)
-    write_target: Path | None  # absolute path to write (None for delete)
-    delete_source: Path | None  # absolute path to remove (delete / rename source)
+    write_path: str | None  # relative path to write (None for delete)
+    delete_path: str | None  # relative path to remove (delete / rename source)
     old_content: str
     new_content: str
     diff: str
@@ -120,7 +127,7 @@ async def apply_patch(ctx: RunContextWrapper[ToolContext], patch: str) -> str:
         A concise English summary of the files changed and their +added/-removed
         line counts, or an error message if the patch could not be applied.
     """
-    workspace_root = Path(ctx.context.workspace_path).resolve()
+    workspace_path = ctx.context.workspace_path
 
     try:
         ops = _parse_patch_envelope(patch)
@@ -131,23 +138,40 @@ async def apply_patch(ctx: RunContextWrapper[ToolContext], patch: str) -> str:
     if not ops:
         return "Error: empty patch — no file operations found."
 
-    # Phase 1: resolve and apply every operation in memory (no disk writes yet),
-    # so the whole patch is atomic.
+    # Phase 1: resolve every operation in memory, so a patch that cannot be
+    # applied in full changes nothing at all.
     changes: list[_FileChange] = []
     for op in ops:
         try:
-            changes.append(_resolve_change(workspace_root, op))
-        except (ValueError, OSError) as exc:
+            changes.append(await _resolve_change(workspace_path, op))
+        except (ValueError, workspace_fs.WorkspaceFileError) as exc:
             logger.error("apply_patch_op_failed", path=op.path, op=op.op_type, error=str(exc))
             return f"Error: failed to apply {op.op_type} on {op.path}: {exc}"
 
-    # Phase 2: commit to disk.
+    # Phase 2: commit through the copy's owner. A failure here is reported with
+    # what already landed: the writes are separate calls, so claiming the whole
+    # patch failed would send the agent to re-apply changes that are in place.
+    applied: list[_FileChange] = []
     for change in changes:
-        if change.write_target is not None:
-            change.write_target.parent.mkdir(parents=True, exist_ok=True)
-            change.write_target.write_text(change.new_content, encoding="utf-8")
-        if change.delete_source is not None:
-            change.delete_source.unlink(missing_ok=True)
+        try:
+            if change.write_path is not None:
+                await workspace_fs.write_text(
+                    workspace_path, change.write_path, change.new_content
+                )
+            if change.delete_path is not None:
+                await workspace_fs.delete_path(workspace_path, change.delete_path)
+        except workspace_fs.WorkspaceFileError as exc:
+            logger.error(
+                "apply_patch_write_failed",
+                path=change.display_path,
+                applied=len(applied),
+                error=str(exc),
+            )
+            return (
+                f"Error: {change.display_path} could not be written: {exc}. "
+                f"{_format_summary(applied) if applied else 'No files were changed.'}"
+            )
+        applied.append(change)
 
     # Phase 3: emit one diff artifact per file for the UI timeline.
     session_id = ctx.context.session_id
@@ -223,17 +247,18 @@ def _parse_patch_envelope(patch: str) -> list[_PatchOp]:
     return ops
 
 
-def _resolve_change(workspace_root: Path, op: _PatchOp) -> _FileChange:
+async def _resolve_change(workspace_path: str, op: _PatchOp) -> _FileChange:
     """Apply a single operation in memory and compute its diff/stats."""
+    target = workspace_fs.normalize_relative_path(op.path)
+
     if op.op_type == "create":
-        target = _resolve_in_workspace(workspace_root, op.path)
         new_content = apply_diff("", "\n".join(op.body), mode="create")
         diff, added, removed = _compute_diff("", new_content)
         return _FileChange(
             change_type="create",
             display_path=op.path,
-            write_target=target,
-            delete_source=None,
+            write_path=target,
+            delete_path=None,
             old_content="",
             new_content=new_content,
             diff=diff,
@@ -241,17 +266,15 @@ def _resolve_change(workspace_root: Path, op: _PatchOp) -> _FileChange:
             lines_removed=removed,
         )
 
+    old_content = await _require_existing(workspace_path, target)
+
     if op.op_type == "delete":
-        source = _resolve_in_workspace(workspace_root, op.path)
-        if not source.is_file():
-            raise ValueError("file does not exist")
-        old_content = source.read_text(encoding="utf-8")
         diff, added, removed = _compute_diff(old_content, "")
         return _FileChange(
             change_type="delete",
             display_path=op.path,
-            write_target=None,
-            delete_source=source,
+            write_path=None,
+            delete_path=target,
             old_content=old_content,
             new_content="",
             diff=diff,
@@ -260,20 +283,16 @@ def _resolve_change(workspace_root: Path, op: _PatchOp) -> _FileChange:
         )
 
     # update (optionally a rename via move_to)
-    source = _resolve_in_workspace(workspace_root, op.path)
-    if not source.is_file():
-        raise ValueError("file does not exist")
-    old_content = source.read_text(encoding="utf-8")
     new_content = apply_diff(old_content, "\n".join(op.body), mode="default")
     diff, added, removed = _compute_diff(old_content, new_content)
 
     if op.move_to:
-        target = _resolve_in_workspace(workspace_root, op.move_to)
+        moved = workspace_fs.normalize_relative_path(op.move_to)
         return _FileChange(
             change_type="update",
             display_path=op.move_to,
-            write_target=target,
-            delete_source=source if target != source else None,
+            write_path=moved,
+            delete_path=target if moved != target else None,
             old_content=old_content,
             new_content=new_content,
             diff=diff,
@@ -284,8 +303,8 @@ def _resolve_change(workspace_root: Path, op: _PatchOp) -> _FileChange:
     return _FileChange(
         change_type="update",
         display_path=op.path,
-        write_target=source,
-        delete_source=None,
+        write_path=target,
+        delete_path=None,
         old_content=old_content,
         new_content=new_content,
         diff=diff,
@@ -294,16 +313,19 @@ def _resolve_change(workspace_root: Path, op: _PatchOp) -> _FileChange:
     )
 
 
-def _resolve_in_workspace(workspace_root: Path, relative: str) -> Path:
-    """Resolve a relative path inside the workspace, rejecting traversal."""
-    candidate = Path(relative)
-    target = candidate if candidate.is_absolute() else (workspace_root / candidate)
-    target = target.resolve()
-    try:
-        target.relative_to(workspace_root)
-    except ValueError:
-        raise ValueError(f"path is outside the workspace: {relative}") from None
-    return target
+async def _require_existing(workspace_path: str, relative: str) -> str:
+    """Read the current content of a file the patch claims to edit.
+
+    A missing or binary file is a patch error, not a transport one: the model
+    described an edit to something that cannot be edited that way, and the
+    message has to say which.
+    """
+    current = await workspace_fs.read_text(workspace_path, relative)
+    if current.missing:
+        raise ValueError("file does not exist")
+    if current.binary:
+        raise ValueError("file is binary and cannot be patched")
+    return current.content
 
 
 def _compute_diff(before: str, after: str) -> tuple[str, int, int]:

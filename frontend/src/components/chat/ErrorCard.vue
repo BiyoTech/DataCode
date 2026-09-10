@@ -20,18 +20,29 @@ const detail = computed(() => props.entry.payload.detail || '')
 const showDetail = ref(false)
 
 function toggleDetail() {
-  if (detail.value) {
-    showDetail.value = !showDetail.value
-  }
+  showDetail.value = !showDetail.value
 }
 </script>
 
 <template>
   <div class="error-card" :class="{ 'is-warning': !isError, 'is-error': isError }">
-    <div class="error-header" @click="toggleDetail">
+    <div class="error-header">
       <span class="error-icon">{{ icon }}</span>
+      <!-- The message is plain selectable text: an error is the thing users most
+           often need to copy (into a search, a bug report, or this very chat).
+           The disclosure affordance is therefore a button of its own rather than
+           a click handler on the whole row — a row-wide handler forces
+           user-select: none, and without it a drag to select text toggles the
+           detail panel instead. -->
       <span class="error-message">{{ message }}</span>
-      <span v-if="detail" class="error-toggle">{{ showDetail ? '▾' : '▸' }}</span>
+      <button
+        v-if="detail"
+        type="button"
+        class="error-toggle"
+        :aria-expanded="showDetail"
+        :title="t('common.detail')"
+        @click="toggleDetail"
+      >{{ showDetail ? '▾' : '▸' }}</button>
     </div>
     <div v-if="showDetail && detail" class="error-detail">
       <pre>{{ detail }}</pre>
@@ -66,25 +77,34 @@ function toggleDetail() {
   display: flex;
   align-items: center;
   gap: 8px;
-  cursor: pointer;
-  user-select: none;
 }
 
 .error-icon {
   font-size: 14px;
   font-weight: 700;
   flex-shrink: 0;
+  /* Excluded from selection so a copied error reads as the message alone,
+     without the decorative glyph in front of it. */
+  user-select: none;
 }
 
 .error-message {
   flex: 1;
   word-break: break-word;
+  user-select: text;
+  cursor: text;
 }
 
 .error-toggle {
-  font-size: 11px;
-  color: var(--text-muted);
   flex-shrink: 0;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
 }
 
 .error-detail {

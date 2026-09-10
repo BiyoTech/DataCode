@@ -62,7 +62,14 @@
 
 ## 2. Workspace `.agent` Directory
 
-When a user selects a workspace, the Agent Service automatically creates and manages a `.agent/` directory inside the workspace root. This directory is the agent's "home" — it contains all local configuration, rules, skills, tasks, and plans.
+When a user selects a workspace, the Agent Service reads a `.agent/` directory from the workspace root. This directory is the agent's "home" — it contains all local configuration, rules, skills, tasks, and plans.
+
+It is READ, never seeded: nothing is created just because a session opened. The
+defaults documented below live in code, so an absent `.agent/` behaves exactly
+like an empty one, and the platform never writes into a user's repository behind
+their back. Entries appear when the user or the agent actually puts something
+there — through workspace-runtime, which owns the working copy (agent-service
+has no filesystem access to it; see `agent-service/src/tools/workspace_fs.py`).
 
 ### 2.1 Directory Structure
 
@@ -1218,12 +1225,11 @@ The Agent Timeline is the primary UI for Plan Mode. It renders the event stream 
     |
     ▼
 [Agent Service: load workspace context]
-    ├── Read .agent/config.yaml
-    ├── Load rules from .agent/rules/
-    ├── Load skills from .agent/skills/ + src/skills/
-    ├── Read .agent/memory/index.md
-    ├── Scan workspace files → update .agent/context/
-    └── Build agent system prompts with rules + context
+    ├── Read .agent/config.yaml            (via workspace-runtime)
+    ├── Load rules from .agent/rules/*.md  (via workspace-runtime)
+    ├── Load recollection docs .agent/memory/*.md
+    ├── Load skills from src/skills/ (built-in manifests)
+    └── Build agent system prompts with rules + memory
     |
     ▼
 [WebSocket connect]

@@ -337,6 +337,7 @@ export default {
     default: 'default',
     noData: 'No data',
     error: 'Error',
+    detail: 'Details',
     success: 'Success',
     settings: 'Settings',
     userMenu: 'User menu',

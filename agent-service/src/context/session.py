@@ -21,6 +21,7 @@ from enum import Enum
 
 from src.config import settings
 from src.context.execution_style import ExecutionStyle
+from src.tools import workspace_fs
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1123,7 +1124,9 @@ class SessionManager:
                 last_message_at=row.updated_at,
             )
             if session.workspace_path:
-                session.workspace_context = self._init_workspace_context(session.workspace_path)
+                session.workspace_context = await self._init_workspace_context(
+                    session.workspace_path
+                )
             logger.info("session_loaded_from_db", session_id=session_id)
             return session
 
@@ -1135,10 +1138,18 @@ class SessionManager:
     # Workspace Context (private)
     # ================================================================
 
-    def _init_workspace_context(self, workspace_path: str) -> WorkspaceContext:
-        """Initialize workspace context — create .agent/ and load rules/memory.
+    async def _init_workspace_context(self, workspace_path: str) -> WorkspaceContext:
+        """Load ``.agent/`` — rules, recollection documents and configuration.
 
-        Results are cached per workspace_path to avoid repeated file I/O within the same session.
+        Async because the working copy lives in workspace-runtime: this service
+        has no volume for it, and reading it locally is what made a
+        containerized chat fail on a path it may not even create. The cache is
+        what keeps that off the per-message path.
+
+        Nothing is CREATED here any more. Seeding ``.agent/`` wrote into the
+        user's repository the first time they said hello, and the defaults it
+        seeded already exist in code — a file was never needed to have them.
+        The directories now appear when something is actually put in them.
         """
         cached = self._workspace_context_cache.get(workspace_path)
         if cached is not None:
@@ -1146,165 +1157,79 @@ class SessionManager:
             return cached
 
         ctx = WorkspaceContext(workspace_path=workspace_path)
-        self._ensure_agent_directory(ctx.agent_dir)
-        ctx.rules = self._load_rules(ctx.agent_dir)
-        ctx.memory_index = self._load_memory_index(ctx.agent_dir)
-        ctx.config = self._load_agent_config(ctx.agent_dir)
+        ctx.rules = await self._load_markdown_dir(workspace_path, "rules")
+        ctx.memory_index = "\n\n".join(
+            await self._load_markdown_dir(workspace_path, "memory")
+        )
+        ctx.config = await self._load_agent_config(workspace_path)
 
         self._cache_workspace_context(ctx)
-        logger.info("workspace_context_initialized", workspace_path=workspace_path)
+        logger.info(
+            "workspace_context_initialized",
+            workspace_path=workspace_path,
+            rules=len(ctx.rules),
+        )
         return ctx
 
-    def _ensure_agent_directory(self, agent_dir: str) -> None:
-        """Ensure .agent/ directory structure exists.
+    async def _load_markdown_dir(
+        self, workspace_path: str, subdir: str
+    ) -> t.List[str]:
+        """Read every ``.md`` file directly under ``.agent/<subdir>``, sorted.
 
-        Gracefully handles read-only or non-existent workspace paths
-        by catching OSError and logging a warning instead of crashing.
+        A workspace with no such directory is the normal case, not a failure:
+        rules and recollection documents are opt-in, so an empty list is the
+        answer. Only direct children are read — a rules directory is a flat set
+        of documents, and recursing would pull in whatever a user happened to
+        park below it.
         """
-        subdirs = [
-            "",
-            "rules",
-            "skills/installed",
-            "skills/custom",
-            "tasks",
-            "plans",
-            "memory",
-            "context",
-        ]
-
-        # Check if workspace root exists and is writable
-        workspace_root = os.path.dirname(agent_dir)
-        if not os.path.exists(workspace_root):
-            logger.warning(
-                "workspace_root_not_found, skipping .agent/ directory creation",
-                workspace_root=workspace_root,
-            )
-            return
-
+        prefix = f".agent/{subdir}"
         try:
-            for subdir in subdirs:
-                dir_path = os.path.join(agent_dir, subdir)
-                os.makedirs(dir_path, exist_ok=True)
-
-            config_path = os.path.join(agent_dir, "config.yaml")
-            if not os.path.exists(config_path):
-                self._create_default_agent_config(config_path)
-
-            # memory/ directory is created for user-defined recollection documents.
-            # index.md is no longer auto-generated — memory is now managed via DB.
-
-            logger.info("agent_directory_ensured", agent_dir=agent_dir)
-
-        except OSError as e:
-            # Read-only filesystem or permission denied — graceful degradation
-            logger.warning(
-                "agent_directory_creation_failed, workspace may be read-only",
-                agent_dir=agent_dir,
-                error=str(e),
+            entries = await workspace_fs.list_entries(
+                workspace_path, prefix, pattern="*.md", recursive=False
             )
-
-    def _create_default_agent_config(self, config_path: str) -> None:
-        """Create default .agent/config.yaml."""
-        default_config = """# Agent Configuration for this workspace
-# See: doc/design/data-agent-design.md
-
-agent:
-  name: "Data Agent"
-  default_mode: "ask"
-  default_execution_style: "agent"
-  auto_apply_rules: true
-  max_turns_per_message: 20
-
-  memory:
-    enabled: true
-    auto_summarize_after_turns: 10
-
-  skills:
-    auto_load_builtin: true
-
-  rules:
-    auto_load_from_dir: true
-    enforce_guardrails: true
-
-  tools:
-    default_level: 1
-    require_confirmation_above: 3
-"""
-        try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write(default_config)
-        except OSError as e:
-            logger.warning("failed_to_create_default_agent_config", path=config_path, error=str(e))
-
-    def _load_rules(self, agent_dir: str) -> t.List[str]:
-        """Load all rule files from .agent/rules/ (sorted by filename)."""
-        rules_dir = os.path.join(agent_dir, "rules")
-        if not os.path.exists(rules_dir):
+        except workspace_fs.WorkspaceFileError as exc:
+            logger.warning(
+                "agent_dir_unreadable", subdir=subdir, error=str(exc)
+            )
             return []
 
-        rules = []
-        rule_files = sorted(
-            [f for f in os.listdir(rules_dir) if f.endswith(".md")],
-        )
-        for filename in rule_files:
-            # Prevent path traversal — only read direct children of rules_dir
-            safe_name = os.path.basename(filename)
-            filepath = os.path.join(rules_dir, safe_name)
-            if not os.path.isfile(filepath):
+        documents: t.List[str] = []
+        for entry in sorted(entries, key=lambda item: item.path):
+            if entry.is_directory:
                 continue
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                rules.append(content)
-                logger.info("rule_loaded", filename=safe_name)
-            except Exception as e:
-                logger.warning("rule_load_failed", filename=safe_name, error=str(e))
-        return rules
-
-    def _load_memory_index(self, agent_dir: str) -> str:
-        """Load user-defined recollection documents from .agent/memory/ directory.
-
-        Scans all .md files (sorted by filename) and concatenates their content.
-        Returns empty string if the directory is empty or doesn't exist.
-        """
-        memory_dir = os.path.join(agent_dir, "memory")
-        if not os.path.isdir(memory_dir):
-            return ""
-
-        parts = []
-        memory_files = sorted(
-            [f for f in os.listdir(memory_dir) if f.endswith(".md")],
-        )
-        for filename in memory_files:
-            # Prevent path traversal — only read direct children of memory_dir
-            safe_name = os.path.basename(filename)
-            filepath = os.path.join(memory_dir, safe_name)
-            if not os.path.isfile(filepath):
+                document = await workspace_fs.read_text(workspace_path, entry.path)
+            except workspace_fs.WorkspaceFileError as exc:
+                logger.warning(
+                    "agent_doc_load_failed", path=entry.path, error=str(exc)
+                )
                 continue
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if content:
-                    parts.append(content)
-                logger.info("memory_doc_loaded", filename=safe_name)
-            except Exception as e:
-                logger.warning("memory_doc_load_failed", filename=safe_name, error=str(e))
+            if document.missing or document.binary:
+                continue
+            content = document.content.strip()
+            if content:
+                documents.append(content)
+        return documents
 
-        return "\n\n".join(parts)
-
-    def _load_agent_config(self, agent_dir: str) -> t.Dict[str, t.Any]:
-        """Load .agent/config.yaml configuration."""
+    async def _load_agent_config(self, workspace_path: str) -> t.Dict[str, t.Any]:
+        """Load ``.agent/config.yaml``; an absent or broken file means defaults."""
         import yaml
 
-        config_path = os.path.join(agent_dir, "config.yaml")
-        if not os.path.exists(config_path):
+        try:
+            document = await workspace_fs.read_text(
+                workspace_path, ".agent/config.yaml"
+            )
+        except workspace_fs.WorkspaceFileError as exc:
+            logger.warning("agent_config_unreadable", error=str(exc))
+            return {}
+        if document.missing or document.binary or not document.content.strip():
             return {}
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.warning("agent_config_load_failed", error=str(e))
+            parsed = yaml.safe_load(document.content)
+        except yaml.YAMLError as exc:
+            logger.warning("agent_config_load_failed", error=str(exc))
             return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     async def load_dynamic_l1_memory(self, workspace_path: str, limit: int = 20) -> str:
         """Query recent L1 memory events from DB for dynamic prompt injection.

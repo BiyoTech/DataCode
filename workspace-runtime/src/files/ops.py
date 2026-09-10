@@ -64,6 +64,50 @@ def read_file(workspace_path: str, relative_path: str) -> t.Optional[str]:
         return f.read()
 
 
+# How much of a file is sampled to decide whether it is text. Same heuristic
+# git uses, and the same one agent-service applied before its file tools moved
+# behind this API — the verdict must not depend on who is asking.
+_BINARY_SAMPLE_BYTES = 8192
+
+# Above this share of control characters the sample is not text.
+_BINARY_CONTROL_RATIO = 0.30
+
+
+def looks_binary(sample: bytes) -> bool:
+    """Whether *sample* looks like binary content rather than text."""
+    if b"\x00" in sample:
+        return True
+    try:
+        text = sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    if not text:
+        return False
+    allowed_control = {"\n", "\r", "\t"}
+    non_text = sum(1 for ch in text if ch < " " and ch not in allowed_control)
+    return non_text / len(text) > _BINARY_CONTROL_RATIO
+
+
+def read_bytes(
+    workspace_path: str, relative_path: str, *, max_bytes: int
+) -> t.Optional[t.Tuple[bytes, bool]]:
+    """Read a file as raw bytes, capped at *max_bytes*.
+
+    Returns ``(data, truncated)``, or ``None`` when the file does not exist.
+    Bytes rather than text because the callers that need this are the ones text
+    cannot serve: office documents are archives, and deciding "is this text at
+    all" requires the bytes themselves.
+    """
+    full_path = _safe_path(workspace_path, relative_path)
+    if not full_path or not os.path.isfile(full_path):
+        return None
+    with open(full_path, "rb") as handle:
+        data = handle.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        return data[:max_bytes], True
+    return data, False
+
+
 def write_file(workspace_path: str, relative_path: str, content: str) -> str:
     """Write content to a file (create or overwrite).
 
@@ -164,6 +208,7 @@ def list_files(
     directory: str = "",
     recursive: bool = False,
     pattern: str = "",
+    include_dirs: bool = False,
 ) -> t.List[FileInfo]:
     """List files in a workspace directory.
 
@@ -177,6 +222,10 @@ def list_files(
         directory: Subdirectory to list (relative), empty = root.
         recursive: Whether to recurse into subdirectories.
         pattern: Glob pattern filter (e.g. "*.sql").
+        include_dirs: Whether a RECURSIVE listing also yields directories.
+            Off by default because the flat index behind search and @-mentions
+            wants files only; the agent's browser wants the shape of the tree,
+            and inferring directories from file paths misses the empty ones.
 
     Returns:
         List of FileInfo objects.
@@ -199,6 +248,18 @@ def list_files(
                     os.path.relpath(os.path.join(root, d), workspace_path)
                 )
             ]
+            if include_dirs:
+                for name in dirs:
+                    full = os.path.join(root, name)
+                    stat = os.stat(full)
+                    files.append(FileInfo(
+                        path=os.path.relpath(full, workspace_path),
+                        is_directory=True,
+                        size_bytes=0,
+                        modified_at=datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    ))
             for name in filenames:
                 if pattern and not _matches_pattern(name, pattern):
                     continue

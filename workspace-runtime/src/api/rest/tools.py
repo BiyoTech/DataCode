@@ -16,12 +16,17 @@ returned in-process, so the LLM-facing tool schemas are unchanged.
 
 from __future__ import annotations
 
+import base64
+import re
+
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from src.api.deps import validate_workspace_path
 from src.config import settings
 from src.files import ops as file_ops
+from src.files import search as file_search
+from src.utils.errors import InvalidRequestError
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +48,15 @@ class FileReadRequest(BaseModel):
     max_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
 
 
+class FileReadBytesRequest(BaseModel):
+    workspace_path: str
+    file_path: str
+    # Lower ceiling than the text read: the payload is base64 (4/3 expansion)
+    # and the only caller parses office documents, which are small next to the
+    # data files a working copy may hold.
+    max_bytes: int = Field(default=20_000_000, ge=1, le=50_000_000)
+
+
 class FileWriteRequest(BaseModel):
     workspace_path: str
     file_path: str
@@ -59,13 +73,20 @@ class FileListRequest(BaseModel):
     path: str = ""
     pattern: str = "*"
     recursive: bool = False
+    include_dirs: bool = False
 
 
 class SearchRequest(BaseModel):
     workspace_path: str
     query: str
-    pattern: str = "*.py"
+    pattern: str = "*"
+    regex: bool = False
+    context_before: int = Field(default=0, ge=0, le=20)
+    context_after: int = Field(default=0, ge=0, le=20)
     max_results: int = Field(default=50, ge=1, le=500)
+    # The counting output modes need per-file totals only; collecting the lines
+    # for them would be work the caller throws away.
+    include_matches: bool = True
 
 
 class ShellRequest(BaseModel):
@@ -85,20 +106,53 @@ class ShellRequest(BaseModel):
 
 @router.post("/read")
 async def tool_read(req: FileReadRequest):
-    """Read one file inside the caller's working copy (L1).
+    """Read one file as TEXT inside the caller's working copy (L1).
 
-    A path that is not there is a TOOL RESULT, not a server error: slicing the
-    ``None`` returned for a missing file used to raise TypeError -> 500, so the
-    agent saw an infrastructure failure instead of "no such file".
+    Two answers that are results rather than failures:
+
+    * a path that is not there — slicing the ``None`` returned for a missing
+      file used to raise TypeError -> 500, so the agent saw an infrastructure
+      failure instead of "no such file";
+    * a file that is not text — decoding it would either raise or hand the
+      model a screenful of replacement characters. It is reported as
+      ``binary`` so the caller can say so, or fetch the bytes instead.
     """
     ws = validate_workspace_path(req.workspace_path)
-    content = file_ops.read_file(ws, req.file_path)
-    if content is None:
-        return {"content": "", "missing": True, "truncated": False}
+    raw = file_ops.read_bytes(ws, req.file_path, max_bytes=req.max_bytes)
+    if raw is None:
+        return {"content": "", "missing": True, "binary": False, "truncated": False}
+
+    data, truncated = raw
+    if file_ops.looks_binary(data[:8192]):
+        return {"content": "", "missing": False, "binary": True, "truncated": False}
     return {
-        "content": content[: req.max_bytes],
+        "content": data.decode("utf-8", errors="replace"),
         "missing": False,
-        "truncated": len(content) > req.max_bytes,
+        "binary": False,
+        "truncated": truncated,
+    }
+
+
+@router.post("/read-bytes")
+async def tool_read_bytes(req: FileReadBytesRequest):
+    """Read one file as base64 bytes (L1).
+
+    Exists for the formats text cannot carry: office documents are archives,
+    and the parsers that turn them into Markdown live in agent-service (they
+    are LLM-facing presentation, and their dependency footprint has no place
+    in the service that holds working copies). So the bytes travel and the
+    parsing stays where it belongs.
+    """
+    ws = validate_workspace_path(req.workspace_path)
+    raw = file_ops.read_bytes(ws, req.file_path, max_bytes=req.max_bytes)
+    if raw is None:
+        return {"content_base64": "", "missing": True, "truncated": False}
+
+    data, truncated = raw
+    return {
+        "content_base64": base64.b64encode(data).decode("ascii"),
+        "missing": False,
+        "truncated": truncated,
     }
 
 
@@ -129,37 +183,53 @@ async def tool_list(req: FileListRequest):
     # (workspace, directory, recursive, pattern), so passing them by position
     # swapped the two and made every listing recursive while ignoring the
     # pattern.
-    entries = file_ops.list_files(ws, req.path, recursive=req.recursive, pattern=req.pattern)
+    entries = file_ops.list_files(
+        ws,
+        req.path,
+        recursive=req.recursive,
+        pattern=req.pattern,
+        include_dirs=req.include_dirs,
+    )
     return {"entries": entries}
 
 
 @router.post("/search")
 async def tool_search(req: SearchRequest):
-    """Grep-like content search across the working copy (L1)."""
-    from pathlib import Path
+    """Grep-like content search across the working copy (L1).
 
+    The walk, the visibility policy and the binary skip live in
+    ``src.files.search``; what comes back is structured, and the caller renders
+    it. An invalid regular expression is the caller's usage error, so it is
+    answered as a 400 with the message the engine gave — not a 500.
+    """
     ws = validate_workspace_path(req.workspace_path)
-    root = Path(ws)
-    matches: list[dict] = []
-    for path in root.rglob(req.pattern or "*"):
-        if not path.is_file() or len(matches) >= req.max_results:
-            break
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            if req.query in line:
-                matches.append(
-                    {
-                        "path": str(path.relative_to(root)),
-                        "line": line_no,
-                        "text": line[:500],
-                    }
-                )
-                if len(matches) >= req.max_results:
-                    break
-    return {"matches": matches, "truncated": len(matches) >= req.max_results}
+    try:
+        outcome = file_search.search_workspace(
+            ws,
+            req.query,
+            file_pattern=req.pattern,
+            regex=req.regex,
+            context_before=req.context_before,
+            context_after=req.context_after,
+            max_results=req.max_results,
+            include_matches=req.include_matches,
+        )
+    except re.error as exc:
+        raise InvalidRequestError(f"invalid regular expression: {exc}") from exc
+
+    return {
+        "matches": [
+            {
+                "path": match.path,
+                "line": match.line,
+                "text": match.text,
+                "context": match.context,
+            }
+            for match in outcome.matches
+        ],
+        "files": outcome.files,
+        "truncated": outcome.truncated,
+    }
 
 
 # ── L3: gated execution ───────────────────────────────────────────────────

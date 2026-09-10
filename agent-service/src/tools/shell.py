@@ -69,7 +69,16 @@ class ShellRuntimeBootstrap:
         self._environment = environment
 
     def ensure_ready(self) -> None:
-        """Ensure the agent workspace and its Python 3.13 virtual environment are ready."""
+        """Prepare the DEV fallback's Python 3.13 virtual environment.
+
+        Only the in-process fallback needs this, and only it may call it: the
+        venv lives INSIDE the working copy, which in every real deployment
+        belongs to a workspace-runtime replica and is not mounted here. Calling
+        it while building the tool (as this used to) made every agent that
+        carries ``shell`` fail with ``Permission denied: '/data'`` before the
+        conversation started — on the path that never executes a command
+        locally in the first place.
+        """
         self.agent_path.mkdir(parents=True, exist_ok=True)
         if self._is_venv_ready():
             logger.info("Reusing shell venv: %s", self.venv_path)
@@ -189,7 +198,13 @@ class ShellRuntimeBootstrap:
 
         No isolation: same uid, same environment, same filesystem view as the
         agent. Only reachable when workspace-runtime is not configured.
+
+        The venv is prepared HERE, on first local use, because this is the only
+        path that has one — and the only path on which the working copy is
+        guaranteed to be a local directory this process may write.
         """
+        await asyncio.to_thread(self.ensure_ready)
+
         results: list[dict[str, Any]] = []
 
         for command in commands:
@@ -619,11 +634,12 @@ def create_native_shell_tool(
     if not agent_path:
         raise ValueError("agent_path is required for shell tool")
 
+    # No ensure_ready() here: building a tool must not write into a working
+    # copy this service does not own (see ShellRuntimeBootstrap.ensure_ready).
     bootstrap = ShellRuntimeBootstrap(
     agent_path, user_id=user_id,
     session_id=session_id, environment=environment,
 )
-    bootstrap.ensure_ready()
 
     import json
 

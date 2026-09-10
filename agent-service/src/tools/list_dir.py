@@ -3,14 +3,16 @@
 Lets agents browse the workspace structure without resorting to ``shell``
 commands.  Supports optional glob filtering and recursive listing, with a
 configurable entry cap to keep responses token-friendly.
+
+The walk happens in workspace-runtime (which holds the files and the one
+visibility policy every viewer shares); this tool caps and renders the result.
 """
 
 import fnmatch
-from pathlib import Path
 
 from agents import RunContextWrapper, function_tool
 from src.context.tool_context import ToolContext
-from src.tools._file_utils import iter_visible_entries, resolve_safe_path
+from src.tools import workspace_fs
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
 
@@ -52,52 +54,67 @@ async def list_dir(
         max_entries = DEFAULT_MAX_ENTRIES
 
     try:
-        target = resolve_safe_path(workspace_path, path)
+        entries = await workspace_fs.list_entries(
+            workspace_path,
+            path if path not in ("", ".") else "",
+            # The name filter is applied here, on the FULL listing, because the
+            # runtime matches a pattern against file names only: a directory
+            # must stay visible under ``*.sql`` (it may contain matches), and a
+            # recursive listing has to be filtered on the relative path.
+            pattern="*",
+            recursive=recursive,
+            include_dirs=True,
+        )
     except ValueError as exc:
         return f"Error: {exc}"
+    except workspace_fs.WorkspaceFileError as exc:
+        logger.warning("list_dir_failed", path=path, error=str(exc))
+        return f"Error: Failed to list {path}: {exc}"
 
-    if not target.exists():
-        return f"Error: Path not found: {path}"
-    if not target.is_dir():
-        return f"Error: Path is not a directory: {path}"
+    if not entries:
+        # An empty answer covers both "nothing here" and "no such directory";
+        # the runtime does not distinguish them, and neither changes what the
+        # agent should do next.
+        return _render(path, pattern, recursive, [], [], truncated=False)
 
-    root = Path(workspace_path).resolve()
-
-    # Collect entries.
     dirs: list[str] = []
     files: list[str] = []
-
     truncated = False
-    count = 0
-    # Machine-written trees (caches, virtual environments, the platform's own
-    # state) are pruned by the iterator, so they cost nothing to skip.
-    for entry in iter_visible_entries(root, target, recursive=recursive):
-        if not entry.exists():
-            continue
-
-        rel = entry.relative_to(root)
-        rel_str = str(rel)
-
-        # For recursive listings, apply the glob to the file name.
-        name = entry.name
-        if entry.is_dir():
-            # Always include directories when pattern is "*", even in recursive
-            # mode, so the agent can see the structure.
+    for entry in entries:
+        name = entry.path.rsplit("/", 1)[-1]
+        if entry.is_directory:
             if pattern == "*" or fnmatch.fnmatch(name, pattern):
-                dirs.append(rel_str + "/")
-        elif entry.is_file():
-            if pattern == "*" or fnmatch.fnmatch(name, pattern):
-                files.append(rel_str)
+                dirs.append(entry.path + "/")
+        elif pattern == "*" or fnmatch.fnmatch(name, pattern):
+            files.append(entry.path)
 
-        count += 1
-        if (len(dirs) + len(files)) >= max_entries:
+        if len(dirs) + len(files) >= max_entries:
             truncated = True
             break
 
     dirs.sort()
     files.sort()
 
-    # Build output.
+    logger.debug(
+        "list_dir_served",
+        path=path,
+        pattern=pattern,
+        recursive=recursive,
+        dirs=len(dirs),
+        files=len(files),
+    )
+    return _render(path, pattern, recursive, dirs, files, truncated=truncated)
+
+
+def _render(
+    path: str,
+    pattern: str,
+    recursive: bool,
+    dirs: list[str],
+    files: list[str],
+    *,
+    truncated: bool,
+) -> str:
     lines = [f"## Directory: {path}"]
     mode_label = "recursive" if recursive else "flat"
     lines.append(
@@ -111,27 +128,16 @@ async def list_dir(
 
     if dirs:
         lines.append("")
-        for d in dirs:
-            lines.append(f"  📁 {d}")
+        lines.extend(f"  📁 {entry}" for entry in dirs)
 
     if files:
         lines.append("")
-        for f in files:
-            lines.append(f"  📄 {f}")
+        lines.extend(f"  📄 {entry}" for entry in files)
 
     if truncated:
         lines.append(
-            f"\n... (results capped at {max_entries} entries. "
+            f"\n... (results capped at {len(dirs) + len(files)} entries. "
             f"Use a tighter pattern or non-recursive mode to narrow.)"
         )
-
-    logger.debug(
-        "list_dir_served",
-        path=path,
-        pattern=pattern,
-        recursive=recursive,
-        dirs=len(dirs),
-        files=len(files),
-    )
 
     return "\n".join(lines)

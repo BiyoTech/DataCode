@@ -322,6 +322,7 @@ export default {
     default: '默认',
     noData: '暂无数据',
     error: '错误',
+    detail: '详情',
     success: '成功',
     settings: '设置',
     userMenu: '用户菜单',

@@ -169,9 +169,31 @@ class RuntimeClient:
         )
 
     async def read(self, workspace_path: str, file_path: str) -> dict[str, Any]:
-        """Read a file from the working copy (L1: no code execution)."""
+        """Read a file from the working copy as text (L1: no code execution)."""
         return await self.post(
             "/rt/v1/tools/read",
+            workspace_path=workspace_path,
+            json={"workspace_path": workspace_path, "file_path": file_path},
+        )
+
+    async def read_binary(
+        self, workspace_path: str, file_path: str, *, max_bytes: int
+    ) -> dict[str, Any]:
+        """Read a file as base64 bytes (L1) — office documents and the like."""
+        return await self.post(
+            "/rt/v1/tools/read-bytes",
+            workspace_path=workspace_path,
+            json={
+                "workspace_path": workspace_path,
+                "file_path": file_path,
+                "max_bytes": max_bytes,
+            },
+        )
+
+    async def delete(self, workspace_path: str, file_path: str) -> dict[str, Any]:
+        """Delete a path inside the working copy (L1)."""
+        return await self.post(
+            "/rt/v1/tools/delete",
             workspace_path=workspace_path,
             json={"workspace_path": workspace_path, "file_path": file_path},
         )
@@ -196,6 +218,7 @@ class RuntimeClient:
         path: str = "",
         pattern: str = "*",
         recursive: bool = False,
+        include_dirs: bool = False,
     ) -> dict[str, Any]:
         """List the working copy's files (L1)."""
         return await self.post(
@@ -206,6 +229,7 @@ class RuntimeClient:
                 "path": path,
                 "pattern": pattern,
                 "recursive": recursive,
+                "include_dirs": include_dirs,
             },
         )
 
@@ -213,10 +237,19 @@ class RuntimeClient:
         self,
         workspace_path: str,
         query: str,
-        pattern: str = "*.py",
+        *,
+        pattern: str = "*",
+        regex: bool = False,
+        context_before: int = 0,
+        context_after: int = 0,
         max_results: int = 50,
+        include_matches: bool = True,
     ) -> dict[str, Any]:
-        """Search file contents inside the working copy (L1)."""
+        """Search file contents inside the working copy (L1).
+
+        The walk happens on the runtime side; what comes back is structured
+        (matches + per-file counts) and the caller renders it.
+        """
         return await self.post(
             "/rt/v1/tools/search",
             workspace_path=workspace_path,
@@ -224,8 +257,15 @@ class RuntimeClient:
                 "workspace_path": workspace_path,
                 "query": query,
                 "pattern": pattern,
+                "regex": regex,
+                "context_before": context_before,
+                "context_after": context_after,
                 "max_results": max_results,
+                "include_matches": include_matches,
             },
+            # A full-tree grep is not a metadata call: the default budget is
+            # sized for those, and a large repository legitimately exceeds it.
+            timeout=60.0,
         )
 
     # ── generic surface (engine + metadata routes) ────────────────────
