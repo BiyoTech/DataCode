@@ -65,3 +65,17 @@ class DeploymentRequest(BaseModel):
             "true only for the production deployment."
         ),
     )
+
+
+class ReloadRequest(DeploymentRequest):
+    """Start (or join) a reload job for one environment working copy.
+
+    ``source`` is attribution, not behaviour: an install triggered from the UI and
+    one triggered from the CLI do exactly the same thing, and the manifest records
+    which it was so a surprising dependency tree can be traced to its trigger.
+    """
+
+    source: str = Field(
+        default="ui",
+        description="Where the reload came from: ui | cli",
+    )

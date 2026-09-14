@@ -6,7 +6,7 @@ Handles file CRUD within workspaces:
 - File change events are published via SSE for real-time UI updates
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from src.api.deps import Caller, WorkspacePath
 from src.api.models.requests import (
@@ -72,12 +72,70 @@ def _try_format_sql(content: str, workspace_path: str) -> str:
         return content
 
 
+def _declaration_diagnostics(workspace_path: str, file_path: str) -> dict | None:
+    """Validate the dependency declaration right after it was saved.
+
+    Returns a diagnostic payload for ``asset-dag/pyproject.toml``, ``None`` for
+    every other file.
+
+    Why on save and not only on reload: the whole check is a TOML parse plus a
+    comparison against the in-process platform baseline — microseconds, no IO
+    beyond the file already being written. Deferring it to a reload means the
+    user learns that ``pyarrow<15`` cannot work after a multi-minute install
+    cycle, in a panel, instead of while their cursor is still on the line.
+
+    A save is NEVER blocked by what this finds. The file is the user's, an
+    intermediate edit is legitimately broken, and a write that refuses itself
+    would make the editor unusable. The verdict is advisory data attached to
+    the response; the reload path enforces.
+    """
+    from datacode_common.python_deps import DECLARATION_RELPATH
+
+    if file_path.strip("/") != DECLARATION_RELPATH:
+        return None
+
+    from datacode_common.python_deps import DepsDeclarationError, parse_declaration
+
+    from src.deps.baseline import conflicts_for
+
+    try:
+        declaration = parse_declaration(
+            _read_saved_declaration(workspace_path, file_path)
+        )
+    except DepsDeclarationError as exc:
+        return {"valid": False, "message": str(exc), "conflicts": []}
+
+    conflicts = conflicts_for(declaration)
+    return {
+        "valid": not conflicts,
+        "message": conflicts[0].message() if conflicts else "",
+        "conflicts": [item.to_dict() for item in conflicts],
+        "declared": len(declaration.requirements),
+    }
+
+
+def _read_saved_declaration(workspace_path: str, file_path: str) -> str:
+    """Read back what was just written, rather than trusting the request body.
+
+    The write path may transform content (SQL formatting today, anything
+    tomorrow), so validating the body would eventually describe a file that is
+    not on disk.
+    """
+    from src.files.ops import read_file as _read
+
+    return _read(workspace_path, file_path) or ""
+
+
 @router.post("/write")
 async def write_file(req: WriteFileRequest):
     """Write a file to a workspace.
 
     For .sql files, applies format_on_save if content is parseable.
     Marks context dirty for lazy refresh and publishes file change event.
+
+    Saving ``asset-dag/pyproject.toml`` additionally returns a ``deps``
+    diagnostic (see :func:`_declaration_diagnostics`). The save itself always
+    succeeds.
     """
     from src.files.ops import write_file as _write
 
@@ -103,7 +161,85 @@ async def write_file(req: WriteFileRequest):
         workspace_path=req.workspace_path,
     ))
 
-    return {"success": True, "path": full_path}
+    response: dict = {"success": True, "path": full_path}
+    diagnostics = _declaration_diagnostics(req.workspace_path, req.file_path)
+    if diagnostics is not None:
+        response["deps"] = diagnostics
+    return response
+
+
+# Uploads are read into memory before hitting the disk, so the cap is also the
+# memory bound of one request. Aligned with the knowledge upload limit: both are
+# user-driven single files, and anything larger belongs in Git or the warehouse,
+# not in a working copy pushed through an HTTP body.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _sanitize_upload_name(filename: str) -> str:
+    """Reduce a client-supplied filename to a bare name, or raise 400.
+
+    Browsers send only the base name, but the field is client-controlled text:
+    stripping both path separators is what keeps ``../../x`` or ``C:\\x`` from
+    ever reaching the path layer. What remains must still be a real name.
+    """
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not name or name in {".", ".."}:
+        raise HTTPException(status_code=400, detail=f"Invalid file name: {filename!r}")
+    return name
+
+
+@router.post("/upload")
+async def upload_file(
+    workspace_path: WorkspacePath,
+    file: UploadFile = File(...),
+    directory: str = Form(""),
+):
+    """Upload one file into a workspace directory.
+
+    Multipart rather than JSON because the explorer's upload accepts binary
+    files, and base64-in-JSON would tax every proxy hop for the common case.
+    An existing file at the target is overwritten — the same contract as
+    ``/write``, which the explorer's save already relies on.
+
+    ``workspace_path`` rides the QUERY string, not the form: the gateway reads
+    it to authorize against the right workspace and to route to the replica
+    holding this copy's lease, and it cannot inspect a multipart body for
+    either. What stays in the form is only what the platform need not see.
+    """
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    name = _sanitize_upload_name(file.filename)
+
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(content)} bytes). Maximum: {MAX_UPLOAD_BYTES} bytes",
+        )
+
+    from src.files.ops import write_bytes as _write_bytes
+
+    relative = f"{directory.rstrip('/')}/{name}" if directory else name
+    try:
+        _write_bytes(workspace_path, relative, content)
+    except ValueError as exc:
+        # The traversal guard rejected the target directory: a bad request,
+        # not a server failure.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Same post-write contract as /write: the warm Context and the metadata
+    # cache describe the pre-write tree, and the tree refreshes over SSE.
+    get_executor_manager().mark_context_dirty(workspace_path)
+    get_metadata_context().mark_dirty(workspace_path)
+    bus = get_event_bus()
+    await bus.publish(SSEEvent(
+        topic=EventTopic.FILE,
+        data={"change": "modified", "path": relative},
+        workspace_path=workspace_path,
+    ))
+
+    return {"success": True, "path": relative, "size": len(content)}
 
 
 @router.get("/read")

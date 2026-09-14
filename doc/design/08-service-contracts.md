@@ -62,8 +62,9 @@
 | POST | `/api/v1/workspaces/bind-git` `/sync` `/{id}/open` | Git 绑定与打开 |
 | GET | `/api/v1/workspaces/{id}/remote-branches` | 远端分支 |
 | GET/POST | `/api/v1/workspaces/{id}/environments` | 环境列表 / 创建 |
-| GET/DELETE | `/api/v1/environments/{envId}` | 环境详情 / 销毁 |
+| GET/DELETE | `/api/v1/environments/{envId}` | 环境详情 / 销毁（只回收平台自有状态，远端分支一律保留） |
 | POST | `/api/v1/environments/{envId}/open` | 打开环境（触发租约） |
+| GET | `/api/v1/environments/{envId}/pending-work` | 删除前预检查：未提交改动与未推送提交数（只读、无锁） |
 | GET | `/api/v1/environments/{envId}/events` | 环境事件流（审计） |
 | GET/POST/PUT/DELETE/PATCH | `/api/v1/git/credentials/*` | Git 凭证（加密存储） |
 | GET | `/api/v1/sqlmesh/apply/history` `/apply/history/{recordId}` | Plan/Apply 历史 |

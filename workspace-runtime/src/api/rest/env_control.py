@@ -151,6 +151,7 @@ async def ensure_worktree(
         "branch": materialization.branch,
         "commit": materialization.commit,
         "created": materialization.created,
+        "branch_source": materialization.branch_source,
     }
 
 
@@ -226,23 +227,30 @@ async def list_environment_worktrees(
     return {"worktrees": worktrees}
 
 
-@router.get("/git/uncommitted-count")
-async def uncommitted_change_count(
+@router.get("/git/pending-work")
+async def pending_work(
     tenant_id: str = Query(min_length=1, max_length=128),
     workspace_id: str = Query(min_length=1, max_length=255),
     user_id: str = Query(min_length=1, max_length=128),
     environment: str = Query(min_length=1, max_length=128),
+    branch: str = Query(min_length=1, max_length=255),
     _internal: InternalCaller = None,
 ) -> dict:
-    """Count uncommitted changes in one user's worktree of an environment."""
+    """Work one member's working copy would lose if it were released.
+
+    Both counts in one round trip: the caller asks per member, and splitting
+    them would double the number of calls for two answers derived from the
+    same working copy.
+    """
     _validate_ids(tenant_id, workspace_id, user_id)
-    count = await _git_binder().uncommitted_change_count(
+    work = await _git_binder().pending_work(
         tenant_id=tenant_id,
         workspace_id=workspace_id,
         user_id=user_id,
         environment=environment,
+        branch=branch,
     )
-    return {"count": count}
+    return {"uncommitted": work.uncommitted, "unpushed": work.unpushed}
 
 
 @router.get("/git/first-existing")
@@ -372,29 +380,9 @@ async def push_branch(req: PushBranchRequest, _internal: InternalCaller) -> dict
     return {"ok": result.ok, "reason": result.reason, "detail": result.detail}
 
 
-class DeleteRemoteBranchRequest(BaseModel):
-    tenant_id: str = Field(min_length=1, max_length=128)
-    workspace_id: str = Field(min_length=1, max_length=255)
-    user_id: str = Field(min_length=1, max_length=128)
-    branch: str = Field(min_length=1, max_length=255)
-    git_repo_url: str = Field(min_length=1, max_length=2048)
-
-
-@router.post("/git/delete-remote-branch")
-async def delete_remote_branch(
-    req: DeleteRemoteBranchRequest, _internal: InternalCaller
-) -> dict:
-    """Delete an environment branch on the remote."""
-    _validate_ids(req.tenant_id, req.workspace_id, req.user_id)
-    binder = _git_binder()
-    repo = binder.repo_path(req.tenant_id, req.workspace_id, req.user_id)
-    result = await binder.delete_remote_branch(
-        repo_path=repo,
-        branch=req.branch,
-        user_id=req.user_id,
-        git_repo_url=req.git_repo_url,
-    )
-    return {"ok": result.ok, "reason": result.reason, "detail": result.detail}
+# There is deliberately no "delete remote branch" endpoint. Environment
+# destruction releases local state only; the remote branch survives and is what
+# a same-named environment reuses later.
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,12 @@ LOGS_DIR = "logs"
 LOGS_SERVICE_DIR = "service"
 LOGS_RUNS_DIR = "runs"
 LOGS_ERRORS_DIR = "errors"
+# Raw stdout/stderr of the code location server. Plain text, not NDJSON: it is
+# whatever the user's own asset code printed, plus the traceback Dagster emits
+# when importing it fails. That traceback is the ONLY place the real cause of a
+# failed reload appears, so it has to land somewhere both the UI and the agent
+# can read without a log store.
+LOGS_CODELOC_DIR = "codeloc"
 
 # The error archive used to sit at the workspace root. Readers still check the
 # old location so workspaces created before the move keep their history.
@@ -176,6 +182,11 @@ def run_logs_dir(workspace_path: str) -> str:
 def errors_dir(workspace_path: str) -> str:
     """Return the error archive directory."""
     return str(Path(logs_root(workspace_path)) / LOGS_ERRORS_DIR)
+
+
+def codeloc_logs_dir(workspace_path: str) -> str:
+    """Return the directory holding code-location stdout/stderr transcripts."""
+    return str(Path(logs_root(workspace_path)) / LOGS_CODELOC_DIR)
 
 
 def legacy_errors_dir(workspace_path: str) -> str:

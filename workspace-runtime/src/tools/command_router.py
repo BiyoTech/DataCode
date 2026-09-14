@@ -314,14 +314,53 @@ class CommandRouter:
         *,
         workspace_path: str,
         environment: str,
+        user_id: str = "",
         **_context: str,
     ) -> dict[str, Any]:
-        """``dc deployment status|reload``."""
+        """``dc deployment status|reload|deps``."""
         from src.tools.dagster_commands import run_deployment_command
 
         return await run_deployment_command(
-            routed.argv[2:], workspace_path=workspace_path, environment=environment
+            routed.argv[2:],
+            workspace_path=workspace_path,
+            environment=environment,
+            user_id=user_id,
         )
+
+    # ── dc deps: the working copy's Python packages ────────────────────
+
+    async def _dc_deps(
+        self,
+        routed: RoutedCommand,
+        *,
+        workspace_path: str,
+        environment: str,
+        user_id: str = "",
+        **_context: str,
+    ) -> dict[str, Any]:
+        """``dc deps status|sync`` — read or install the declared packages."""
+        from src.tools.deps_commands import run_deps_command
+
+        return await run_deps_command(
+            routed.argv[2:],
+            workspace_path=workspace_path,
+            environment=environment,
+            user_id=user_id,
+        )
+
+    # ── pip install (refused) ──────────────────────────────────────────
+
+    async def _pip_install(
+        self, routed: RoutedCommand, **_context: str
+    ) -> dict[str, Any]:
+        """Refused, with the alternative spelled out.
+
+        A hand-installed package lives only inside the vehicle that ran the
+        command, so it disappears when that vehicle exits and nothing records why
+        it was ever there. Declaring it makes the install reproducible for the
+        whole working copy — which is what the user actually wanted.
+        """
+        return render.result(EXIT_USAGE, stderr=governance_hint(routed.verb))
 
     async def _dc_run(
         self,
@@ -347,7 +386,10 @@ _HANDLERS = {
     ("sqlmesh", "ontology"): CommandRouter._ontology,
     ("dc", "assets"): CommandRouter._dc_assets,
     ("dc", "deployment"): CommandRouter._dc_deployment,
+    ("dc", "deps"): CommandRouter._dc_deps,
     ("dc", "run"): CommandRouter._dc_run,
+    ("pip", "install"): CommandRouter._pip_install,
+    ("pip3", "install"): CommandRouter._pip_install,
 }
 
 _router: Optional[CommandRouter] = None

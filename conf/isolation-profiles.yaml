@@ -116,6 +116,13 @@ profiles:
       - sqlmesh.evaluate
       - sqlmesh.test
       - dagster.codelocation
+      # Installing the working copy's declared Python dependencies. Listed here
+      # so a single-node install has a vehicle for it at all: the container
+      # profile below is stronger and wins wherever it is available, and where
+      # it is not, this is the one that can run pip. The install runs as the
+      # unprivileged executor uid with a cleared environment, so a package's
+      # build hooks still cannot read platform secrets.
+      - deps.sync
     # Honest limits: same Pod, same netns, same filesystem view as the
     # runtime. Does NOT cover T1 (other leases' working copies are visible)
     # nor T3/T6/T7 (network). Single-tenant / trusted-tenant only.
@@ -236,6 +243,77 @@ profiles:
       - sqlmesh.render_project
     covers_threats: [T1, T2, T3, T5, T6, T7, T10]
     # T8 (container escape) is NOT covered: see L3_strong.
+
+  # ── L3-deps-install: package index only, zero credentials ─────────────
+  L3_deps_install:
+    enabled: true
+    # Installs the third-party Python packages a working copy declares in
+    # `asset-dag/pyproject.toml`. A profile of its own because the combination
+    # it needs exists in no other one:
+    #
+    #   * WRITABLE working copy   — the overlay tree is its output;
+    #   * network to the package INDEX and nothing else;
+    #   * ZERO credentials.
+    #
+    # L2_container holds the writable warehouse account, which Q5 forbids
+    # combining with anything that executes package code (a wheel's own
+    # metadata hooks are code). L3_base has the right credential grade but its
+    # allow-list contains warehouse and git, not an index — and widening
+    # L3_base would hand a package index to every task that runs user code.
+    isolation: container
+    runtime_class: runc
+    run_as_user: 65534
+    # NOT read-only: pip needs a writable overlay target and cache. Both live
+    # inside the one working copy this Pod mounts, so the write surface is the
+    # same one the task exists to modify.
+    read_only_root_fs: false
+    drop_capabilities: ["ALL"]
+    seccomp: RuntimeDefault
+    automount_service_account_token: false
+    enable_service_links: false
+    dns_policy: None
+    host_network: false
+    host_pid: false
+    host_ipc: false
+    resources:
+      cpu_limit: "2"
+      memory_limit: "4Gi"
+      pids_limit: 256
+      # Higher than the other profiles on purpose: a scientific stack unpacks
+      # to a few GiB, and hitting the limit mid-install leaves a half-written
+      # tree. The overlay's own size cap (`deps.max_bytes`) is what actually
+      # bounds the result; this only bounds the workspace it needs to get there.
+      ephemeral_storage_limit: "12Gi"
+    network:
+      default: deny
+      egress_via_proxy: true
+      # The index host comes from PLATFORM configuration, never from the
+      # working copy: a declaration file that could name its own index would
+      # be a way to widen the sandbox's egress from inside the repository.
+      allowed_destinations: [package_index]
+      denied_cidrs:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 127.0.0.0/8
+        - 9.0.0.0/8
+        - 11.0.0.0/8
+        - 21.0.0.0/8
+        - 30.0.0.0/8
+    credentials:
+      # Nothing. An install reaches a package index and writes a directory; it
+      # has no business holding a warehouse account of any grade.
+      warehouse: none
+      platform: none
+    node_pool: user-code
+    # Longer than the other profiles: a first install of a scientific stack is
+    # minutes of download. The reload job is asynchronous precisely so this
+    # number does not have to fit inside an HTTP request.
+    timeout_seconds: 900
+    allowed_task_kinds:
+      - deps.sync
+    covers_threats: [T1, T2, T3, T5, T6, T7, T10]
 
   # ── L3-strong: sandboxed kernel, DEFERRED (Q2) ────────────────────────
   L3_strong:

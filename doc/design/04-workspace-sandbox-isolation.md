@@ -594,6 +594,38 @@ profiles:
     covers_threats: ["T1", "T2", "T3", "T5", "T6", "T7", "T10"]
     # T8 (container escape) is NOT covered: see L3_strong.
 
+  L3_deps_install:
+    # 安装工作副本在 asset-dag/pyproject.toml 中声明的第三方 Python 包。
+    #
+    # 单独一档的理由：它需要的组合在其它档位都不存在 —— 可写工作副本 + 只通包索引
+    # + 零凭证。L2 持有可写数仓账号（Q5 禁止与任何执行包内代码的场景共存，wheel 的
+    # 元数据钩子就是代码）；L3_base 凭证等级正确但白名单是 warehouse/git，而放宽
+    # L3_base 等于把包索引发给所有跑用户代码的 task。
+    isolation: container
+    runtime_class: runc
+    run_as_user: 65534
+    read_only_root_fs: false           # pip 需要可写的 target 与 cache
+    drop_capabilities: ["ALL"]
+    seccomp: RuntimeDefault
+    resources:
+      ephemeral_storage_limit: "12Gi"  # 科学计算栈解包体积
+    network:
+      default: deny
+      egress_via_proxy: true
+      # index host 只来自平台配置（deps.index_url），绝不从工作副本推导：
+      # 能自选索引的声明文件等于从被评审的代码里放宽沙箱出网。
+      allowed_destinations: ["package_index"]
+      denied_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                     "169.254.0.0/16", "127.0.0.0/8",
+                     "9.0.0.0/8", "11.0.0.0/8", "21.0.0.0/8", "30.0.0.0/8"]
+    credentials:
+      warehouse: none                  # 安装只需要索引与一个目录
+      platform: none
+    node_pool: user-code
+    timeout_seconds: 900               # 首次安装是分钟级下载
+    allowed_task_kinds: ["deps.sync"]
+    covers_threats: ["T1", "T2", "T3", "T5", "T6", "T7", "T10"]
+
   L3_strong:
     # DISABLED (Q2). Identical to L3_base plus a sandboxed kernel. Kept here so
     # enabling it is a config change plus a capable node pool, not a redesign.
@@ -615,7 +647,14 @@ default_profile: strongest_enabled
 |------|--------------|--------------------------|
 | P3 后 | L1、**L3_proc** | `L3_proc` |
 | P6 后 | L1、L2、**L3_base**、L3_proc（保留给 dev/单机） | `L3_base` |
+| 依赖安装后 | 上述 + **L3_deps_install**（只声明 `deps.sync`，不参与 fail-safe 链） | 不变 |
 | 待增强 | 上述 + **L3_strong** | `L3_strong` |
+
+`deps.sync` 同时被 L3_proc 声明（dev/单机唯一能跑 pip 的载具），容器可用时
+「最强者胜」自动选中 `L3_deps_install`；产物是与路径无关的 `--target`
+site-packages 树（`.datacode/deps/site-packages`），因此同一份树在 runtime 的真实
+路径与容器的 `/workspace` 挂载点下都能被 `PYTHONPATH` 前置消费。venv 不可用：
+其 `pyvenv.cfg` 与 shebang 钉死绝对路径，跨挂载点即废。
 
 ---
 

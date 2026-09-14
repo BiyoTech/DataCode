@@ -49,11 +49,20 @@ class SqlMeshOpError(RuntimeError):
 
     Attributes:
         code: One of ``datacode_common.task_protocol``'s ``ERR_*`` values.
+        detail: Structured facts the caller could not derive from the message —
+            a dependency conflict's rewrite, for one. Travels in the failure's
+            ``result`` payload, so a UI can act on it instead of parsing prose.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.detail: dict[str, Any] = dict(detail or {})
 
 
 def _noop_progress(_stage: str, _percent: Optional[int], _detail: str) -> None:

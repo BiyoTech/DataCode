@@ -28,6 +28,8 @@ a skipped check is a hole in the record, never a pass.
 | `verify-sandbox-isolation.py` | P6 sandbox security (T1–T10) | `python3 scripts/verify/verify-sandbox-isolation.py [--k8s]` |
 | `verify-capacity-control.py` | P8 capacity orchestration against a real cluster (needs kind + Redis) | `python3 scripts/verify/verify-capacity-control.py` |
 | `verify-workspace-lifecycle.py` | Workspace create/delete contract over real git: error passthrough (missing remote → `repo_not_found` + remote wording), create-or-reuse (no template on existing/empty repos), hard purge (rows of the three owned tables, prefix-neighbour guard, remote untouched, idempotent) | `python3 scripts/verify/verify-workspace-lifecycle.py` |
+| `verify-workspace-deps.py` | The dependency plane end to end, offline (local `file://` index + one hand-built wheel + REAL pip in the real sandbox): `ensure` reports drift without installing, a reload installs and the tree imports through the injected overlay, an unchanged declaration is not reinstalled, an uninstallable one fails the reload with the manifest marked `failed` and the reason archived under `logs/errors/`, `pip install` refused | `python3 scripts/verify/verify-workspace-deps.py` |
+| `verify-environment-branch-reuse.py` | Environment destroy/recreate over real git: the remote branch and its commits survive a destroy, recreating the same name RESUMES that branch (user code, not the base), a stale local branch is fast-forwarded but one with unpushed commits is kept, `pending-work` counts unpushed commits without refusing the deletion, and no `push --delete` exists anywhere | `python3 scripts/verify/verify-environment-branch-reuse.py` |
 
 ## ops/ — operator tooling
 

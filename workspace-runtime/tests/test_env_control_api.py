@@ -238,7 +238,7 @@ def test_members_and_branches_reflect_disk(client, base_path):
     assert presence["remote"] is False
 
 
-def test_uncommitted_count_counts_worktree_changes(client, base_path):
+def test_pending_work_counts_worktree_changes(client, base_path):
     client.post(
         "/internal/env-control/git/ensure-repository",
         json={
@@ -264,17 +264,41 @@ def test_uncommitted_count_counts_worktree_changes(client, base_path):
     (Path(created["workspace_path"]) / "new_model.sql").write_text("SELECT 1")
 
     response = client.get(
-        "/internal/env-control/git/uncommitted-count",
+        "/internal/env-control/git/pending-work",
         params={
             "tenant_id": _TENANT,
             "workspace_id": _WORKSPACE,
             "user_id": _USER,
             "environment": _ENV,
+            "branch": "env/dev",
         },
         headers=_INTERNAL,
     )
     assert response.status_code == 200
-    assert response.json()["count"] == 1
+    body = response.json()
+    assert body["uncommitted"] == 1
+    # No remote at all here, so there is no tracking ref to compare against:
+    # reporting the whole local history as "about to be lost" would turn a
+    # never-pushed branch into a permanent alarm.
+    assert body["unpushed"] == 0
+
+
+def test_pending_work_is_zero_without_a_working_copy(client, base_path):
+    """Most members never materialize a given environment; that is not an
+    error, and they have nothing to lose."""
+    response = client.get(
+        "/internal/env-control/git/pending-work",
+        params={
+            "tenant_id": _TENANT,
+            "workspace_id": _WORKSPACE,
+            "user_id": "nobody",
+            "environment": _ENV,
+            "branch": "env/dev",
+        },
+        headers=_INTERNAL,
+    )
+    assert response.status_code == 200
+    assert response.json() == {"uncommitted": 0, "unpushed": 0}
 
 
 # ── SQLMesh: virtual environments ──────────────────────────────────────────

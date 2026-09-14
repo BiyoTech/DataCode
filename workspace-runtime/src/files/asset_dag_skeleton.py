@@ -21,8 +21,6 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_WORKSPACE_PLACEHOLDER = "{{ workspace_name }}"
-
 _DEFINITIONS_PY = '''"""Dagster Definitions entrypoint for workspace {{ workspace_name }}.
 
 Loaded by the runtime Code Location gRPC server. This is the single
@@ -61,15 +59,27 @@ defs = dg.load_defs(
 )
 '''
 
-_PYPROJECT_TOML = """[project]
+_PYPROJECT_TOML = """# THE INSTALL LIST for this working copy's third-party Python packages.
+#
+# Declare what your assets import under [project].dependencies, then press Reload
+# in the asset page (or run `dc deps sync`). The declaration is shared by everyone
+# working on this workspace and installed once for the whole working copy.
+#
+# `pip install` is refused on purpose: a package installed by hand disappears with
+# the sandbox that ran the command and nothing records why it was there.
+#
+# Platform packages cannot be overridden — asking for a version the platform does
+# not ship fails the sync instead of installing a copy that would shadow the
+# platform's. Run `dc deps baseline` to see what it provides, with the exact
+# string to declare for each.
+
+[project]
 name = "asset-dag"
 version = "0.1.0"
 description = "Data+AI pipeline (Dagster + Daft) for workspace {{ workspace_name }}"
-requires-python = ">=3.11"
+requires-python = ">={{ python_version }}"
 dependencies = [
-    "dagster>=1.8.0",
-    "getdaft>=0.3.0",
-    "httpx>=0.27.0",
+{{ platform_dependencies }}
 ]
 
 [tool.dagster]
@@ -121,6 +131,19 @@ asset-dag/
   `asset-dag` directory (its hyphenated name is not a valid Python package).
 - **Keep tests in `tests/`, not in `defs/`.** Modules under `defs/` are treated
   as definitions; test modules must stay out of the auto-discovery root.
+
+## Adding a third-party package
+
+Declare it in `pyproject.toml` under `[project].dependencies`, then press
+**Reload** in the asset page (or run `dc deps sync`). The platform installs it
+once for the whole working copy and shows the install as it happens; it never
+starts the code location with the packages missing, because your assets would
+then fail to import. `dc deps status` reports what is declared and installed.
+
+`pip install` is refused: a package installed by hand disappears with the sandbox
+that ran the command. Platform packages (`dagster`, `sqlmesh`, ...) cannot be
+overridden — the sync fails with the shipped version named instead of installing a
+copy that would shadow the platform's.
 
 ## Running
 
@@ -533,14 +556,21 @@ def scaffold_asset_dag(path: str, workspace_name: str) -> None:
     Fill-missing only: existing files are never overwritten, so user edits
     survive re-scaffolding. The runtime performs the same fill-missing
     render from its own templates when a code location is ensured.
+
+    Placeholder substitution is delegated to ``codeloc.scaffold`` so both paths
+    produce identical files — in particular the same platform-provided
+    dependency block, generated from the running image's baseline rather than
+    written by hand in two places.
     """
+    from src.codeloc.scaffold import render_placeholders
+
     os.makedirs(path, exist_ok=True)
     for rel_path, template in _SKELETON_FILES.items():
         file_path = os.path.join(path, rel_path)
         if os.path.exists(file_path):
             continue
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        content = template.replace(_WORKSPACE_PLACEHOLDER, workspace_name)
+        content = render_placeholders(template, workspace_name)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
     logger.info("asset_dag_scaffolded", path=path, workspace=workspace_name)

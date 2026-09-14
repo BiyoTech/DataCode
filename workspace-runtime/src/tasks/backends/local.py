@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from datacode_common.isolation import IsolationLevel, IsolationProfile
+from datacode_common.python_deps import TASK_KIND_DEPS_SYNC
 from datacode_common.task_protocol import (
     ERR_NO_RESULT,
     ERR_TIMEOUT,
@@ -39,6 +40,7 @@ from datacode_common.task_protocol import (
 )
 
 from src.config import settings
+from src.deps.manifest import overlay_for_injection
 from src.isolation.guards import default_guard_root, ensure_guard_dir
 from src.isolation.hardening import (
     ResourceLimits,
@@ -168,7 +170,7 @@ class LocalProcessBackend(TaskBackend):
         env = build_clean_env(
             workspace_path=spec.workspace_path,
             environment=spec.environment,
-            python_path=self._python_path,
+            python_path=self._python_path_for(spec),
             guard_dir=self._guard_dir,
             tool_dirs=self._tool_dirs,
             extra=extra,
@@ -275,6 +277,26 @@ class LocalProcessBackend(TaskBackend):
             f"result; stderr: {err_tail[-2048:] or '(empty)'}",
             exit_code=exit_code,
         )
+
+    def _python_path_for(self, spec: TaskSpec) -> tuple[str, ...]:
+        """Import roots for the child (injection point 2 of 3).
+
+        The runner's own package and the shared library are always there. The
+        working copy's installed third-party packages come FIRST when they exist,
+        because the user's asset code — which this vehicle may execute — has to
+        find them, and ``sys.path`` reaches PYTHONPATH entries in order.
+
+        An install task is the one exception: it is the process that BUILDS that
+        tree, and importing a half-written overlay into the installer would make
+        a failed install poison its own retry.
+        """
+        if spec.kind == TASK_KIND_DEPS_SYNC:
+            return self._python_path
+
+        overlay = overlay_for_injection(
+            spec.workspace_path, consumer="sandbox_local"
+        )
+        return (overlay, *self._python_path) if overlay else self._python_path
 
     @staticmethod
     def _target_uid(profile: IsolationProfile) -> Optional[int]:

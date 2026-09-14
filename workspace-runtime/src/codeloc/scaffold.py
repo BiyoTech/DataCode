@@ -52,6 +52,21 @@ ASSET_DAG_SUBDIR = "asset-dag"
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
 _WORKSPACE_PLACEHOLDER = "{{ workspace_name }}"
 
+# Placeholders substituted from the PLATFORM BASELINE rather than from a
+# hand-written list. The scaffolded declaration used to carry literal bounds
+# (`dagster>=1.8.0`), which drift the moment the image is upgraded: the file
+# then documents a version the platform no longer has, and a user copying that
+# style writes bounds that the sync refuses. Generating them means the scaffold
+# cannot describe a platform that does not exist.
+_PYTHON_VERSION_PLACEHOLDER = "{{ python_version }}"
+_PLATFORM_DEPENDENCIES_PLACEHOLDER = "{{ platform_dependencies }}"
+
+# What the scaffold names explicitly, in the order a reader wants them. The full
+# baseline is several hundred distributions; listing all of them in every
+# working copy's pyproject.toml would bury the user's own declarations. These
+# are the ones the generated assets actually import.
+_SCAFFOLD_BASELINE_NAMES = ("dagster", "getdaft", "httpx")
+
 # Template path (relative to _TEMPLATE_DIR) -> rendered path (relative to
 # asset-dag/). Every file, including each package ``__init__.py``, has a
 # template, so rendering is a single uniform pass.
@@ -92,8 +107,49 @@ _MANAGED_FILES = {
 }
 
 
+def _platform_dependency_lines() -> str:
+    """The platform-provided block of a scaffolded declaration.
+
+    Generated from the running image's baseline, so every bound names a version
+    that is genuinely installed. A name missing from the baseline is simply
+    omitted: a scaffold that declared a package the platform does not have would
+    produce a working copy whose first reload fails.
+    """
+    from src.deps.baseline import platform_baseline
+
+    baseline = platform_baseline()
+    lines = [
+        f'    "{name}>={baseline[name]}",'
+        for name in _SCAFFOLD_BASELINE_NAMES
+        if baseline.get(name)
+    ]
+    return "\n".join(lines)
+
+
+def render_placeholders(content: str, workspace_name: str) -> str:
+    """Substitute every scaffold placeholder in one template's text.
+
+    Public because the creation-time skeleton (``src/files/asset_dag_skeleton``)
+    writes the same files from inline constants and must substitute them
+    identically — two substitution rules would mean a workspace's declaration
+    differed depending on which path created it.
+    """
+    from datacode_common.python_deps import interpreter_python_version
+
+    content = content.replace(_WORKSPACE_PLACEHOLDER, workspace_name)
+    if _PLATFORM_DEPENDENCIES_PLACEHOLDER in content:
+        content = content.replace(
+            _PLATFORM_DEPENDENCIES_PLACEHOLDER, _platform_dependency_lines()
+        )
+    if _PYTHON_VERSION_PLACEHOLDER in content:
+        content = content.replace(
+            _PYTHON_VERSION_PLACEHOLDER, interpreter_python_version()
+        )
+    return content
+
+
 def _render_template(template_rel: str, asset_dag: Path, workspace_name: str) -> str:
-    """Read a template and substitute the workspace placeholder."""
+    """Read a template and substitute its placeholders."""
     template = _TEMPLATE_DIR / template_rel
     try:
         content = template.read_text(encoding="utf-8")
@@ -101,7 +157,7 @@ def _render_template(template_rel: str, asset_dag: Path, workspace_name: str) ->
         raise CodeLocationLoadError(
             str(asset_dag), detail=f"Scaffold template unreadable: {template} ({e})"
         ) from e
-    return content.replace(_WORKSPACE_PLACEHOLDER, workspace_name)
+    return render_placeholders(content, workspace_name)
 
 
 def ensure_asset_dag_scaffold(asset_dag: Path, workspace_name: str) -> None:

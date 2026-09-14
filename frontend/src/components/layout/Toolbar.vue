@@ -6,7 +6,7 @@ import { useEnvironmentStore, type EnvironmentInfo } from '@/stores/environment'
 import { useGatewayStore } from '@/stores/gateway'
 import { useModelsStore } from '@/stores/models'
 import api from '@/utils/api'
-import { MessagePlugin } from 'tdesign-vue-next'
+import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import { extractApiMessage, notifyError } from '@/utils/notifyError'
 import {
   extractMismatchPayload,
@@ -79,11 +79,32 @@ const sortedEnvironments = computed(() =>
 
 /**
  * Production is the workspace's own line of development and is reached through
- * promotion, never destroyed. An environment already being released cannot be
- * destroyed twice either.
+ * promotion, never destroyed.
+ *
+ * `archiving` is deliberately ALLOWED: re-issuing the delete is the ONLY way
+ * out of that status. It is written before the release starts and cleared when
+ * it ends, so a process that stops in between leaves the row stranded with
+ * nothing to advance it — the reconciler skips it (it is neither live nor
+ * archived) and the TTL reaper's query does not select it. The backend
+ * short-circuits only on `archived` and re-runs an idempotent release, so
+ * repeating it is safe; when a release genuinely is in flight, the environment
+ * lock answers 409 ENVIRONMENT_BUSY and the user is told, rather than a second
+ * release tearing down a running one.
  */
 function canDestroyEnvironment(env: EnvironmentInfo): boolean {
-  return !env.isProduction && env.status !== 'archiving'
+  return !env.isProduction
+}
+
+/** A row already being released is not being deleted — that release is finished. */
+function destroyActionLabel(env: EnvironmentInfo): string {
+  return env.status === 'archiving' ? t('environment.retryReclaim') : t('common.delete')
+}
+
+function destroyActionHint(env: EnvironmentInfo): string {
+  if (env.isProduction) return t('environment.productionProtected')
+  return env.status === 'archiving'
+    ? t('environment.retryReclaimHint')
+    : t('environment.destroy')
 }
 
 /** Short type label rendered next to the environment name. */
@@ -344,6 +365,11 @@ async function selectGateway(gatewayName: string): Promise<void> {
  * worktree and the SQLMesh virtual environment as one unit. The caller is then
  * switched to it, since creating a development line means intending to work in
  * it.
+ *
+ * When the remote branch of this name already exists, the environment RESUMES
+ * it rather than branching from the current one. That is announced explicitly:
+ * silently handing someone a working copy full of code they did not expect is
+ * the kind of surprise that gets discovered by reading files.
  */
 async function createEnvironment(): Promise<void> {
   const envName = newEnvironmentName.value.trim()
@@ -357,7 +383,15 @@ async function createEnvironment(): Promise<void> {
     })
     newEnvironmentName.value = ''
     showEnvDropdown.value = false
-    await environmentStore.switchEnvironment(created.environmentId)
+    if (created.branchSource === 'reused_remote') {
+      MessagePlugin.info(
+        t('environment.branchReused', {
+          name: envName,
+          branch: created.environment.branch,
+        })
+      )
+    }
+    await environmentStore.switchEnvironment(created.environment.environmentId)
   } catch (e) {
     notifyError(e, t('environment.createFailed'))
   } finally {
@@ -380,10 +414,18 @@ async function refreshChanges(): Promise<void> {
 }
 
 /**
- * Destroy an environment: releases its SQLMesh views, worktree and branch while
- * keeping the audit trail. Irreversible, so it is confirmed first; the active
- * environment must be left before it can be destroyed, because destroying the
- * directory the user is working in would strand the UI on a dead path.
+ * Destroy an environment: releases its SQLMesh views, working copies, local
+ * branch and deployment while keeping the audit trail. The REMOTE branch
+ * survives, so this is reversible in the sense that matters — recreating the
+ * same name resumes the same code.
+ *
+ * The active environment must be left first: destroying the directory the user
+ * is working in would strand the UI on a dead path.
+ *
+ * Unpushed commits are read BEFORE the dialog opens, not after a failed
+ * attempt: they are the only code this action can truly lose, and a warning
+ * that arrives once the working copy is gone is useless. It stays a warning —
+ * the user may well be deleting an experiment they never meant to keep.
  */
 async function destroyEnvironment(env: EnvironmentInfo): Promise<void> {
   if (!canDestroyEnvironment(env) || pendingEnvironmentId.value) return
@@ -391,16 +433,66 @@ async function destroyEnvironment(env: EnvironmentInfo): Promise<void> {
     notifyError(null, t('environment.cannotDestroyCurrent'))
     return
   }
-  if (!window.confirm(t('environment.confirmDestroy', { name: env.name }))) return
+
+  const pending = await environmentStore.fetchPendingWork(env.environmentId)
+  const warning =
+    pending && pending.unpushed > 0
+      ? t('environment.destroyUnpushedWarning', { count: pending.unpushed })
+      : ''
+
+  // "archiving" means a release was already under way and never finished, so
+  // the copy has to say so: asking the user to confirm deleting something the
+  // UI already renders as "being released" would be nonsense.
+  const isStuckReclaim = env.status === 'archiving'
+
+  const confirmed = await new Promise<boolean>((resolve) => {
+    const dialog = DialogPlugin.confirm({
+      header: isStuckReclaim
+        ? t('environment.confirmRetryReclaimTitle', { name: env.name })
+        : t('environment.confirmDestroyTitle', { name: env.name }),
+      body: [
+        isStuckReclaim
+          ? t('environment.retryReclaimBody')
+          : t('environment.confirmDestroy', { name: env.name }),
+        t('environment.destroyKeepsRemoteBranch', { branch: env.branch }),
+        warning,
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      theme: 'warning',
+      confirmBtn: {
+        content: isStuckReclaim ? t('environment.retryReclaim') : t('common.delete'),
+        theme: 'danger',
+      },
+      cancelBtn: t('common.cancel'),
+      onConfirm: () => {
+        dialog.hide()
+        resolve(true)
+      },
+      onClose: () => {
+        dialog.hide()
+        resolve(false)
+      },
+    })
+  })
+  if (!confirmed) return
 
   try {
     await environmentStore.destroyEnvironment(env.environmentId)
     return
   } catch (e: any) {
-    // The backend refuses (409) while the working copy holds uncommitted work,
+    // The backend refuses (409) while a working copy holds UNCOMMITTED work,
     // and reports how much would be lost. Discarding it must be an explicit
     // second decision, never an automatic retry.
     if (e?.response?.status !== 409) {
+      notifyError(e, t('environment.destroyFailed'))
+      return
+    }
+    // A 409 is not always "uncommitted work": a release genuinely in flight
+    // (another member, or the TTL reaper) holds the environment lock and
+    // answers ENVIRONMENT_BUSY. force does not bypass that lock, so offering to
+    // force is a promise the retry would only break.
+    if (e?.response?.data?.error_code === 'ENVIRONMENT_BUSY') {
       notifyError(e, t('environment.destroyFailed'))
       return
     }
@@ -588,10 +680,10 @@ watch(currentEnvironment, async () => {
             <button
               class="env-item-delete"
               :disabled="!canDestroyEnvironment(env) || pendingEnvironmentId === env.environmentId"
-              :title="env.isProduction ? t('environment.productionProtected') : t('environment.destroy')"
+              :title="destroyActionHint(env)"
               @click="destroyEnvironment(env)"
             >
-              {{ t('common.delete') }}
+              {{ destroyActionLabel(env) }}
             </button>
           </div>
 

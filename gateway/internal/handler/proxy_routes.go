@@ -177,6 +177,17 @@ var FilesValidatedRoutes = []ValidatedRoute{
 	{Method: "GET", Pattern: "/read", Required: []string{"workspace_path", "file_path"}},
 }
 
+// DepsValidatedRoutes defines the working-copy dependency reads under /deps.
+//
+// Only /status is here. /deps/baseline deliberately takes NO workspace_path:
+// the platform baseline is a property of the runtime image, identical for every
+// working copy, so requiring one would force a client to name a copy in order
+// to ask a question that has nothing to do with it — and would send the request
+// through lease routing for no reason.
+var DepsValidatedRoutes = []ValidatedRoute{
+	{Method: "GET", Pattern: "/status", Required: []string{"workspace_path"}},
+}
+
 // WipValidatedRoutes defines the WIP durability-contract reads (design 07 Q6).
 // Every endpoint addresses one working copy through workspace_path, so they are
 // lease-routed like the rest of the working-copy surface.
@@ -222,4 +233,10 @@ var OntologyValidatedRoutes = []ValidatedRoute{
 var DagsterValidatedRoutes = []ValidatedRoute{
 	{Method: "GET", Pattern: "/assets/graph", Required: []string{"workspace_path"}},
 	{Method: "GET", Pattern: "/schedules", Required: []string{"workspace_path"}},
+	// A reload is an asynchronous job whose record lives in the working copy, so
+	// only the replica holding that copy's lease can answer for it. Listed here
+	// rather than left to the catch-all so a missing workspace_path is a 400 with
+	// a reason, instead of a request routed to whichever replica DNS returned —
+	// which would answer "no such job" for a job that is running fine.
+	{Method: "GET", Pattern: "/deployments/reload/status", Required: []string{"workspace_path"}},
 }

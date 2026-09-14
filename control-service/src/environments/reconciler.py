@@ -21,7 +21,15 @@ Reported only (a human decides):
 * ``commit_drift`` needs an apply (the user chooses when to pay for a
   backfill);
 * ``orphan_branch`` may be someone's WIP — adopting it as an environment
-  creates schemas and a deployment nobody asked for (design §11.2).
+  creates schemas and a deployment nobody asked for (design §11.2);
+* ``preserved_remote_branch`` is not a disagreement: an archived environment
+  keeps its remote branch on purpose, and reporting it is what makes that
+  visible instead of leaving readers to infer it.
+
+Never touched: remote branches. No repair here deletes one, because no code
+path in the platform does (see ``registry.destroy``). An archived row whose
+branch still exists is therefore in its expected state, not an unfinished
+cleanup.
 
 P5: the four "parties" are reached through the HTTP binders — Git and the
 SQLMesh engine live inside workspace-runtime, deployments inside the runtime's
@@ -76,6 +84,10 @@ DRIFT_ORPHAN_SQLMESH_ENV = "orphan_sqlmesh_env"
 DRIFT_COMMIT_DRIFT = "commit_drift"
 DRIFT_APPLIED_DIRTY = "applied_dirty"
 DRIFT_STALE_RESOURCES = "stale_resources"
+# Not a disagreement at all: an archived environment's remote branch is kept on
+# purpose. Reported so the preservation is visible in the same place operators
+# read about everything else the environment still owns.
+DRIFT_PRESERVED_REMOTE_BRANCH = "preserved_remote_branch"
 DRIFT_MISSING_DEPLOYMENT = "missing_deployment"
 DRIFT_STALE_DEPLOYMENT = "stale_deployment"
 # Lease and sandbox parties (design 05 §5.1, landed in P8).
@@ -532,16 +544,35 @@ class EnvironmentReconciler:
             served is not None and _expected_deployment_name(model) in served
         )
 
+        # The remote branch is deliberately NOT part of this list. It is
+        # preserved by every destroy path, so an archived row whose branch
+        # still exists is in its EXPECTED state; listing it as "held" would
+        # make every sweep report a drift whose repair no longer exists.
         held = [
             name
             for name, alive in (
                 ("local_branch", local),
-                ("remote_branch", remote),
                 ("working_copy", bool(worktree)),
                 ("virtual_environment", virtual_env_alive),
             )
             if alive
         ]
+        if remote:
+            # Stated, not inferred: an operator reading the report must see
+            # that the branch survives on purpose and is what a same-named
+            # environment reuses.
+            report.drifts.append(
+                Drift(
+                    kind=DRIFT_PRESERVED_REMOTE_BRANCH,
+                    environment=model.name,
+                    detail=(
+                        f"remote branch {model.branch} is preserved for reuse by a "
+                        "future environment of the same name; the platform never "
+                        "deletes it"
+                    ),
+                    repairable=False,
+                )
+            )
         if not held and not deployment_alive:
             return
 
@@ -563,12 +594,10 @@ class EnvironmentReconciler:
             if released is not None:
                 repaired = (
                     released.worktrees_removed > 0
-                    or released.remote_branch_deleted
                     or released.virtual_environment_released
                 )
                 repair_detail = (
                     f"worktrees_removed={released.worktrees_removed}, "
-                    f"remote_branch_deleted={released.remote_branch_deleted}, "
                     f"virtual_environment_released="
                     f"{released.virtual_environment_released}"
                 )
@@ -618,8 +647,22 @@ class EnvironmentReconciler:
         report: ReconcileReport,
         actor_user_id: str,
     ) -> None:
-        """Find branches and virtual environments no registry row accounts for."""
-        registered = {model.name for model in models if model.status != naming.STATUS_ARCHIVED}
+        """Find branches and virtual environments no registry row accounts for.
+
+        The two resources need DIFFERENT notions of "claimed", and conflating
+        them is what used to make preserved branches look orphaned:
+
+        * a branch is claimed by any row, archived included — the branch
+          outlives the environment by design and a same-named create
+          reactivates that very row to reuse it;
+        * a virtual environment is claimed only by a LIVE row — an archived
+          environment's views are exactly what destroy releases, so an
+          archived row must not vouch for them.
+        """
+        branch_claimants = {model.name for model in models}
+        virtual_env_claimants = {
+            model.name for model in models if model.status != naming.STATUS_ARCHIVED
+        }
 
         repo = await self._git.first_existing_repo(
             tenant_id=workspace.tenant_id,
@@ -630,7 +673,7 @@ class EnvironmentReconciler:
             for environment in sorted(
                 await self._git.list_environment_branches(repo_path=repo)
             ):
-                if environment in registered:
+                if environment in branch_claimants:
                     continue
                 # Reported only: whether an unregistered branch should become an
                 # environment is a human decision (design §11.2), and adopting it
@@ -649,7 +692,7 @@ class EnvironmentReconciler:
 
         if state is None:
             return
-        for environment in sorted(state - registered):
+        for environment in sorted(state - virtual_env_claimants):
             if environment == naming.PRODUCTION_ENV:
                 # SQLMesh always owns a `prod` environment; the workspace may
                 # simply name its production environment differently.
@@ -1234,7 +1277,9 @@ class EnvironmentReconciler:
             return
 
         released = await self._sqlmesh.invalidate_virtual_environment(
-            workspace_path=worktree, environment=environment
+            tenant_id=workspace.tenant_id,
+            workspace_id=workspace.id,
+            environment=environment,
         )
         report.drifts.append(
             Drift(

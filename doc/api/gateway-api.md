@@ -43,6 +43,7 @@ that holds the workspace's lease — never load-balanced across replicas.
 - [Workspace Management](#workspace-management)
 - [Git Operations](#git-operations)
 - [File Operations](#file-operations)
+- [Asset Deployments and Reload](#asset-deployments-and-reload)
 - [Workspace Logs](#workspace-logs)
 - [Quotas](#quotas)
 - [Error Codes](#error-codes)
@@ -555,6 +556,18 @@ Requires `workspace:env:create`. Publishing the branch additionally needs
 `workspace:git:push`; when the push fails the environment stays usable locally
 and its `status` reports it.
 
+The response carries `branch_source`, which says where the code came from:
+
+| Value | Meaning |
+|-------|---------|
+| `created_from_base` | A new branch was cut from `base_env`. |
+| `reused_remote` | The remote already had `env/{name}` — usually because a previous environment of this name was destroyed (destroy preserves the branch) — so this environment RESUMES that line of development and the working copy holds its code, not the base's. |
+| `adopted_local` | A leftover local branch held commits that were never pushed, so it was kept as-is rather than realigned to the remote. |
+
+`branch_source` describes this creation only and is deliberately absent from the
+environment list: replaying it later would report a past decision as current
+state.
+
 ---
 
 ### Open Environment
@@ -583,16 +596,84 @@ Requires `workspace:read`. `environment_id` is `{workspace_id}:{environment}`.
 
 ---
 
-### Destroy Environment
+### Pending Work (pre-flight for deletion)
 
-Release the SQLMesh views, worktree and branch. The registry row and its events
-are kept for audit. Production is rejected.
+What destroying an environment would lose. Read-only, takes no environment
+lock, and has no side effects — call it BEFORE showing a delete confirmation,
+while the user can still push.
 
 ```
-DELETE /api/v1/environments/{environment_id}?delete_remote_branch=true
+GET /api/v1/environments/{environment_id}/pending-work
+```
+
+Requires `workspace:env:read`.
+
+**Response:**
+
+```json
+{
+  "environment_id": "ws-t1-sales:dev_alice",
+  "branch": "env/dev_alice",
+  "uncommitted": 0,
+  "unpushed": 3,
+  "members": [{ "user_id": "u1", "uncommitted": 0, "unpushed": 3 }]
+}
+```
+
+`unpushed` is the number that matters: the remote branch survives a destroy, so
+committed-but-unpushed commits are the only code that can still disappear. It
+is a warning, never a precondition — the deletion stays available either way.
+`uncommitted` is returned too because that is what the DELETE below refuses
+over, letting one dialog explain both outcomes.
+
+Members with nothing pending are omitted. A failure here must not block a
+deletion: it only enriches the confirmation.
+
+---
+
+### Destroy Environment
+
+Release the state the PLATFORM owns: SQLMesh views, every member's working
+copy, the local branch and the Dagster deployment. The registry row and its
+events are kept for audit. Production is rejected.
+
+```
+DELETE /api/v1/environments/{environment_id}?force=false
 ```
 
 Requires `workspace:env:delete`.
+
+**The remote branch is never deleted.** The remote repository belongs to the
+user — it may predate the workspace, be shared with tooling outside DataCode,
+and hold the only durable copy of the code. Preserving it is also what lets a
+same-named environment resume the same line of development later (see
+`branch_source` above). There is no parameter to opt out, and the platform
+contains no `git push --delete` at all.
+
+`force=true` discards **uncommitted** changes in the working copies; without it
+a dirty copy answers `409` and names how many changes would be lost. Unpushed
+commits never block the request — they are reported by `pending-work` before
+the user confirms, and recorded afterwards in the destroy event's
+`unpushed_commits_discarded`.
+
+**Response:**
+
+```json
+{
+  "success": true,
+  "environment_id": "ws-t1-sales:dev_alice",
+  "archived": true,
+  "branch": "env/dev_alice",
+  "remote_branch_preserved": true,
+  "virtual_environment_released": true,
+  "worktrees_removed": 2,
+  "unpushed_commits_discarded": 0
+}
+```
+
+A skipped release (no local copy anywhere, an unreachable runtime) is reported
+honestly as `false` / `0` rather than masquerading as a full cleanup; the
+reconciler finishes it later.
 
 ---
 
@@ -894,6 +975,170 @@ Response reports what was actually released:
 
 ---
 
+## Asset Deployments and Reload
+
+A **deployment** is one environment's Dagster code location. Bringing it up is
+`ensure`; making a code change live is `reload`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/dagster/deployments/ensure` | Idempotently start the code location; reports dependency state |
+| POST | `/api/v1/dagster/deployments/reload` | **202** — start (or join) a reload job |
+| GET | `/api/v1/dagster/deployments/reload/status?workspace_path=...&job_id=...` | Authoritative job state |
+| POST | `/api/v1/dagster/deployments/reload/cancel` | Withdraw the reload in flight |
+
+### Reload is a job, not a request
+
+A reload installs the working copy's declared Python packages
+(`asset-dag/pyproject.toml`, `[project].dependencies`) **before** starting the
+code location, so it can take minutes on a first install. `POST /reload`
+therefore answers **202** with a job envelope and the work continues in the
+background:
+
+```json
+{
+  "job_id": "9f2c1d0a4b3e5f67",
+  "workspace_path": "/data/workspaces/t1/ws-t1-shop/u1/envs/dev",
+  "deployment_name": "ws_t1_shop__dev",
+  "state": "running",
+  "stage": "installing_deps",
+  "stages": ["queued", "resolving_deps", "installing_deps",
+             "starting_code_location", "loading_definitions", "ready"],
+  "message": "installing 3 declared package(s)",
+  "attached": false,
+  "output_tail": "",
+  "failure_code": "",
+  "error_log_id": "",
+  "deps_state": "drifted",
+  "deployment": null
+}
+```
+
+Contract points:
+
+* **`workspace_path` is required on the status query.** The runtime is a headless
+  Service and a job record lives in the working copy, so only the replica holding
+  that copy's lease can answer. Without it the gateway answers **400** rather than
+  routing to an arbitrary replica that would report "no such job".
+* **A second trigger attaches.** Three buttons in the UI and the CLI express one
+  intent, so a request arriving while a reload runs returns the SAME `job_id` with
+  `attached: true`. A **409** `ENVIRONMENT_BUSY` is reserved for a real conflict —
+  another operation holding the environment lock.
+* **Progress is also published** on the SSE `deployment` topic of
+  `GET /api/v1/events` (same payload shape, plus `line` for one new installer
+  output line). The status endpoint remains the authoritative truth: a client may
+  poll it exclusively and lose nothing.
+* **A terminal state survives** a dropped connection, a page refresh and a runtime
+  restart — records are written to `{workspace}/.datacode/deploy/reload-jobs/`.
+* **A failed install fails the reload.** The code location is never started with
+  its declared packages missing, and there is no automatic retry: a reload is a
+  user action, and an unattended retry would hide the failure.
+
+Failure reasons (`failure_code`), each with its own next action:
+
+| Code | Meaning |
+|------|---------|
+| `deps_declaration_invalid` | `asset-dag/pyproject.toml` cannot be parsed — fix the syntax |
+| `deps_platform_conflict` | a declared package is pinned to a version the platform does not ship. The declaration is valid; it just cannot be installed, because a workspace overlay shadows the platform's copy instead of coexisting with it. The envelope's `conflicts[]` carries `{requirement, name, platform_version, suggested}` per offending line |
+| `deps_platform_transitive` | a declared package is compatible with the baseline but one of ITS dependencies is not (`feast` needs `tenacity<9`, the platform ships 9.1.4). No check of the declaration can see it, so it is only known after a resolve. Reported only for a pin the platform **cannot yield** — see *Yielding a platform pin* — so the envelope also names it. `transitive_conflicts[]` carries `{requirement, name, blockers[{name, required, platform_version, required_by}], suggested, resolved_version, protected[]}`; `required` is the version RANGE a dependency states and `required_by` the dependency stating it, neither of which appears in the user's file. `suggested` is empty when no release fits, and `protected[]` then names the pin only an operator can move |
+| `deps_install_failed` | pip could not install the declared packages; `output_tail` carries its output |
+| `deps_index_not_configured` | the deployment has no package index configured (`deps.index_url`) |
+| `deps_shadow_platform` | the installed tree contains a package the platform provides. No declaration can cause this — it means the runtime and task-runner images are out of step |
+| `deps_too_large` | the installed tree exceeds `deps.max_bytes` for one working copy |
+| `code_load_failed` | the location started but could not import the definitions; `output_tail` is the traceback |
+| `sandbox_unavailable` | no sandbox could be started; nothing was changed |
+| `internal_error` | unexpected failure |
+
+Every failure is also archived to `{workspace}/logs/errors/` and the envelope's
+`error_log_id` names that record, so an agent can diagnose it with ordinary file
+tools (see *Workspace Logs* below).
+
+### Dependencies
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/v1/deps/baseline` | What a code location can import with no overlay at all |
+| GET | `/api/v1/deps/status` | One working copy's dependency state, incl. platform conflicts |
+
+**`/deps/baseline` takes no `workspace_path`** — deliberately. The baseline is a
+property of the runtime image, identical for every working copy, so requiring
+one would make the answer look workspace-specific and would send the request
+through lease routing for nothing. Authenticated access is enough, matching
+`/sqlmesh/meta` and `/dagster/mode`.
+
+Each entry is `{name, version, suggested}`, where `suggested` is the requirement
+string that accepts the shipped version (a lower bound, never a pin — a pin
+would conflict again at the next image upgrade). `highlighted[]` is the subset
+user code commonly imports; the full list runs to several hundred distributions.
+
+Two properties worth stating, because both were defects before:
+
+* **The baseline is the interpreter code locations run on**, not the one that
+  performs the install. Those are different images in production and the same
+  process in development, so getting it wrong is invisible until deployment.
+* **A conflict is reported by the READ path**, so `/deps/status` and the
+  `ensure` payload both carry `conflicts[]`. A reload that cannot possibly
+  succeed is visible before the user spends minutes discovering it — and saving
+  `asset-dag/pyproject.toml` through `POST /files/write` returns the same verdict
+  as a `deps` field on the response, without ever refusing the save.
+
+The read path compares the declaration against the baseline, so it can only see
+conflicts the declaration names. **A declared package whose own dependencies
+clash with the baseline is not visible there** — `feast` is compatible with the
+platform, its dependency `tenacity<9` is not. That shape is diagnosed by the
+installer and reaches the client as `transitive_conflicts[]` on a failed reload
+envelope, never from `/deps/status`.
+
+### Yielding a platform pin
+
+Pinning all several hundred baseline distributions gives each of them a veto
+over every declaration, and the cost of being overridden is not the same for
+all of them:
+
+* a **compiled** distribution (`numpy`, `pyarrow`, `pydantic-core`, `grpcio`) or
+  one the platform's own machinery is built on (`dagster`, `sqlmesh`) breaks the
+  platform at ABI level, inside a code location, with the traceback pointing at
+  the user's asset;
+* a **pure-Python leaf** (`tenacity`, `tqdm`) carries API-drift risk only, and
+  only inside the one working copy that asked for it.
+
+So the runtime derives the yieldable subset — everything with no compiled
+extension, minus the platform's own runtime, adjusted by
+`deps.protected_packages` / `deps.relaxable_packages` — and the installer spends
+it as follows:
+
+1. install with the FULL baseline pinned. This is the normal outcome and leaves
+   the workspace identical to the platform;
+2. if pip refused to RESOLVE and every pin it named as a party to the conflict
+   is yieldable, release **those** pins and retry **once**;
+3. otherwise fail with `deps_platform_transitive`, naming the pin that cannot
+   move in `protected[]`.
+
+A successful install that yielded is not silent. `relaxed[]` —
+`{name, platform_version, overlay_version, required_by}` — appears on the reload
+envelope (published as soon as pip finishes) AND on `/deps/status` and the
+`ensure` payload, because the override outlives the install: from then on that
+copy's code location and sandboxes import a different version than the
+platform's own processes do.
+
+### `ensure` never installs
+
+`ensure` is on the asset page's load path, so it stays a read: it reports the
+dependency state and leaves the install to a reload the user triggers.
+
+```json
+{ "deps": { "state": "ready", "declared": 3, "installed": 41,
+            "message": "", "installed_at": "2026-09-11T09:12:00+00:00",
+            "size_bytes": 41234567,
+            "relaxed": [{ "name": "tenacity", "platform_version": "9.1.4",
+                          "overlay_version": "8.5.0", "required_by": "feast" }] } }
+```
+
+`state` is one of `ready`, `drifted`, `missing`, `incompatible`, `failed`,
+`empty`, `declaration_invalid`.
+
+---
+
 ## Workspace Logs
 
 Services mirror every workspace-attributable log line as NDJSON into
@@ -910,6 +1155,11 @@ because a log line may quote SQL, data values or tool output.
 | GET | `/api/v1/logs/stream?workspace_path=...&sources=...&levels=...&q=...` | SSE tail of lines appended after connecting |
 | GET | `/api/v1/logs/errors?workspace_path=...&limit=50` | Archived error summaries, newest first |
 | GET | `/api/v1/logs/errors/{error_id}?workspace_path=...` | One archived error with traceback and context |
+
+Besides `logs/service/` (the NDJSON timeline) and `logs/errors/` (the archive), a
+working copy also holds `logs/codeloc/server.log` — the raw stdout/stderr of its
+code-location process. That file is plain text on purpose: it is the user's own
+code talking, and its tail is the import traceback a failed reload reports.
 
 `sources` and `levels` are comma-separated. A source is a file origin such as
 `workspace-runtime`, `control-service` or `sqlmesh-cli` (SQLMesh's own text logs,

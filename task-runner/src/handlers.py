@@ -34,10 +34,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
+from datacode_common.python_deps import TASK_KIND_DEPS_SYNC
 from datacode_common.task_protocol import ERR_UNSUPPORTED_KIND
 
+from src import deps_ops, sqlmesh_ops
 from src import shell as shell_ops
-from src import sqlmesh_ops
 from src.sqlmesh_ops import ProgressFn, SqlMeshOpError
 
 # A handler receives (workspace_path, params) plus keyword context and returns
@@ -79,6 +80,11 @@ _REGISTRY: dict[str, Handler] = {
     # shape is the one the executor's shell op used to return (that op is gone;
     # shell is a task now), so the agent tool schema is unchanged.
     "agent.shell": Handler(shell_ops.op_shell, sql_only=False, writes=False),
+    # ── L3-deps-install: package index only, zero credentials ─────────
+    # Installs the working copy's declared third-party packages. `writes=False`
+    # is about the WAREHOUSE, which this kind never touches; its output is a
+    # directory inside the one working copy the vehicle mounts.
+    TASK_KIND_DEPS_SYNC: Handler(deps_ops.op_deps_sync, sql_only=False, writes=False),
 }
 
 # Parameter through which a caller selects an alternative project directory. Read

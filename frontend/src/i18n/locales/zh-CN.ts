@@ -635,6 +635,11 @@ export default {
     deleteDirTitle: '删除文件夹',
     deleteDirConfirm: '确定删除「{name}」及其中的所有内容？此操作无法撤销。',
     deleted: '已删除',
+    // 资源管理器右键菜单的上传入口：目标目录即菜单所在文件夹；同名文件会被
+    // 覆盖（与编辑器保存同一契约）。
+    uploadHere: '上传文件到此目录',
+    uploaded: '已上传 {count} 个文件到 {dir}',
+    uploadFailed: '上传失败',
   },
   workspaceInfo: {
     title: '工作区',
@@ -864,6 +869,105 @@ export default {
     reload: '仅重载',
     reloading: '处理中...',
     reloadSuccess: '代码位置已重载。',
+    reloadFailed: '重载未完成——原因见下方。',
+    reloadCancel: '取消',
+    reloadCancelFailed: '取消重载失败。',
+    reloadAttached: '已在进行中',
+    // 重载会先安装声明的 Python 依赖再启动代码位置，因此展示阶段而不是只转圈。
+    reloadStage: {
+      queued: '排队中',
+      resolving_deps: '读取依赖声明',
+      installing_deps: '安装依赖',
+      starting_code_location: '启动代码位置',
+      loading_definitions: '加载资产定义',
+      ready: '完成',
+      failed: '失败',
+    },
+    // 每个失败码一句话：用户的下一步动作各不相同。
+    reloadFailure: {
+      deps_declaration_invalid:
+        'asset-dag/pyproject.toml 无法解析，因此读不到任何依赖声明。请修正语法后重载。',
+      deps_platform_conflict:
+        '声明中有依赖被固定到平台未提供的版本。声明本身是合法的，只是无法安装——工作副本的依赖目录会覆盖平台自身的同名包。',
+      deps_platform_transitive:
+        '某个已声明的包需要平台已提供的包的另一个版本。你的声明里并没有写这个包——它是被间接依赖引入的。平台已经把可以安全让位的同类包全部让出并重试过；下面这个属于平台自身运行时，无法被覆盖。',
+      deps_install_failed: '声明的依赖安装失败。下方安装输出中包含具体包名与原因。',
+      deps_index_not_configured:
+        '当前部署未配置软件包索引，无法安装依赖，请联系管理员配置。',
+      deps_shadow_platform:
+        '安装结果中出现了平台自身提供的包。任何依赖声明都不会导致这种情况，请联系管理员排查。',
+      deps_too_large:
+        '安装后的依赖体积超过单个工作副本上限。请移除体积最大的包，或联系管理员上调上限。',
+      code_load_failed:
+        '代码位置已启动但无法加载资产定义。下方 traceback 来自你自己的代码。',
+      sandbox_unavailable: '平台无法启动安装依赖所需的沙箱。本次未做任何改动，通常重试即可。',
+      internal_error: '重载发生未预期的失败。',
+    },
+    reloadErrorLog: '完整详情已归档到 logs/errors/（error id {id}）',
+    showOutput: '查看输出',
+    hideOutput: '收起输出',
+    // 依赖漂移提示：ensure 只上报状态，绝不隐式安装。
+    depsHint: {
+      drifted: '依赖声明自上次安装后已变更，点击重载以安装这 {count} 个声明的依赖包。',
+      missing: '本工作副本尚未安装声明的 {count} 个 Python 依赖包，点击重载即可安装。',
+      incompatible: '已安装的依赖是为其它 Python 基线构建的，点击重载以重新构建。',
+      failed: '上次依赖安装失败，点击重载可重试。',
+      declaration_invalid: 'asset-dag/pyproject.toml 无法读取，因此无法安装任何依赖。',
+    },
+    // 与平台基线冲突的声明。在尝试重载之前就展示——重载无法解决它，只有修改声明可以。
+    depsConflict: {
+      title: '以下依赖无法安装',
+      explain:
+        '工作副本的依赖目录会先于平台自身的包被加载，因此只会覆盖而不会共存。请改为平台提供的版本，或直接删除该行——无论是否声明，这个包都能 import。',
+      column: '当前声明',
+      suggested: '建议改为',
+      platform: '平台版本',
+      fixOne: '应用',
+      fixAll: '全部应用',
+      fixed: 'asset-dag/pyproject.toml 已更新，点击重载以安装。',
+      fixFailed: '更新 asset-dag/pyproject.toml 失败。',
+      viewBaseline: '平台提供了哪些包？',
+      // 在编辑器中直接标注到声明该依赖的那一行。
+      marker:
+        '平台提供 {platform}，工作副本的依赖目录只会覆盖它而不会共存。请改为声明 {suggested}，或直接删除这一行——无论是否声明，这个包都能 import。',
+    },
+    // 声明本身与平台兼容，但它的依赖要求了一个平台无法让位的包。只有在平台已经
+    // 释放了所有可让位的钉版之后才会出现，因此每一行要么能改，要么只能找管理员。
+    depsTransitive: {
+      title: '以下依赖需要平台无法让位的包',
+      explain:
+        '下面每个包单独看都与平台兼容，问题出在它的某个依赖要求了另一个版本的平台包。能让位的平台包已经自动让位了，剩下这些属于平台自身运行时（含编译扩展的包，或平台本身依赖的组件），无法被工作副本覆盖，因此只能换一个你声明的包的发布版本。',
+      blocker: '需要 {name} {required}，但平台提供的是 {platform}',
+      blockerVia: '{via} 要求 {name} {required}，但平台提供的是 {platform}',
+      suggested: '建议改为',
+      resolvesTo: '（将安装 {version}）',
+      apply: '应用',
+      fixed: 'asset-dag/pyproject.toml 已更新，点击重载以安装。',
+      fixFailed: '更新 asset-dag/pyproject.toml 失败。',
+      noFix: '该包没有任何版本能适配当前平台基线，请联系管理员升级基线。',
+      noFixProtected:
+        '{packages} 属于平台自身运行时（含编译扩展，或平台本身依赖的组件），其版本无法被工作副本覆盖。请联系管理员升级平台基线，或将其加入允许覆盖的清单。',
+      viewBaseline: '平台提供了哪些包？',
+    },
+    // 安装成功，但过程中覆盖了平台包。这不是错误，而是「差异长期存在」的唯一可见处。
+    depsRelaxed: {
+      title: '本工作副本覆盖了部分平台包',
+      explain:
+        '你声明的依赖需要平台未提供的版本。这些包对单个工作副本来说可以安全覆盖，因此平台让位、安装得以成功。此后本副本的资产与终端将使用下列版本，而不是平台自带的版本。',
+      override: '平台 {platform} → {overlay}',
+      requiredBy: '（由 {via} 要求）',
+    },
+    depsBaseline: {
+      title: '平台提供的包',
+      subtitle:
+        '无需声明即可直接 import（Python {python}）。声明它们不会安装任何东西；把它们固定到其它版本会被拒绝。',
+      name: '包名',
+      version: '版本',
+      declare: '声明写法',
+      showAll: '显示全部 {count} 个',
+      showCommon: '仅显示用户代码常用的包',
+      empty: '无法读取平台基线。',
+    },
     pullReload: '拉取并重载',
     pullReloadSuccess: '已拉取最新代码并重载代码位置。',
     pullReloadFailed: '拉取最新代码失败。',
@@ -943,8 +1047,19 @@ export default {
     appliedDirtyHint:
       '当前数据由未提交的代码 apply 产生，没有任何 commit 能描述它。提交后重新 apply 即可让代码与数据一致。',
     cannotDestroyCurrent: '请先切换到其他环境，再销毁该环境。',
-    confirmDestroy: '确定销毁环境“{name}”？其分支、工作副本与数据视图都会被释放，且不可恢复。',
+    confirmDestroyTitle: '确定销毁环境“{name}”？',
+    confirmRetryReclaimTitle: '完成“{name}”的回收？',
+    retryReclaimBody:
+      '上一次回收没有完成（状态仍为“回收中”），通常是进程中途退出导致的。此操作会重新执行一次回收，已完成的部分会直接跳过。无论如何远端分支都会保留。',
+    retryReclaim: '完成回收',
+    retryReclaimHint: '继续完成一次未结束的回收',
+    confirmDestroy: '该环境的工作副本、本地分支、数据视图与部署都会被释放。',
+    destroyKeepsRemoteBranch:
+      '远端分支 {branch} 会保留。之后创建同名环境时会自动接管它，继续原有开发。',
+    destroyUnpushedWarning:
+      '注意：有 {count} 个提交尚未推送。它们是销毁后唯一无法找回的改动，如需保留请先推送。',
     confirmDestroyForce: '{reason}\n\n仍要丢弃这些改动并销毁该环境吗？',
+    branchReused: '环境“{name}”已复用远端已有分支 {branch}，其中已包含该分支的代码。',
   },
   git: {
     sourceControl: '源代码管理',

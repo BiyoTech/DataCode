@@ -209,10 +209,13 @@ def run_task(spec: TaskSpec) -> TaskResult:
         )
     except SqlMeshOpError as exc:
         # Expected failure shape: a stable code the submitter can branch on.
+        # ``detail`` rides along in the result payload so a failure can carry
+        # actionable structure (a rewrite to apply) and not only a sentence.
         return TaskResult.failure(
             spec.task_id,
             exc.code,
             str(exc),
+            result=exc.detail or None,
             duration_ms=_elapsed_ms(),
             exit_code=EXIT_TASK_FAILED,
         )

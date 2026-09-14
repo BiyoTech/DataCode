@@ -333,6 +333,22 @@ func Setup(
 		})
 
 		// -----------------------------------------------------------------
+		// Working-copy Python dependencies (identity path)
+		//
+		// Uses the same target as the rest of the working-copy surface:
+		// /status carries workspace_path and is lease-routed, while
+		// /baseline carries none and therefore falls through to plain load
+		// balancing — the baseline is a property of the runtime image, so
+		// any replica answers it identically.
+		// -----------------------------------------------------------------
+		r.Route("/deps", func(r chi.Router) {
+			handler.RegisterValidated(r, handler.DepsValidatedRoutes, runtimeIdentity, logger)
+
+			// GET /baseline — no required parameters.
+			r.Get("/baseline", handler.GenericProxy(runtimeIdentity, logger))
+		})
+
+		// -----------------------------------------------------------------
 		// WIP durability contract (design 07 Q6) — the user-facing surface
 		// of the lease subsystem's snapshot machinery.
 		// -----------------------------------------------------------------
@@ -393,8 +409,12 @@ func Setup(
 			//   GET    /health | /mode | /assets | /deployments | /deployments/diff
 			//   GET    /runs/{runID} | /runs/{runID}/logs
 			//   POST   /pipelines/run | /deployments/ensure | /deployments/reload
-			//   POST   /runs/{runID}/cancel
+			//   POST   /deployments/reload/cancel | /runs/{runID}/cancel
 			//   DELETE /deployments/{deployment}
+			//
+			// `GET /deployments/reload/status` is NOT here: it is registered above
+			// so its workspace_path is enforced, because a reload job exists only
+			// on the replica holding that working copy's lease.
 			r.HandleFunc("/*", handler.GenericProxy(runtimeIdentity, logger))
 		})
 	})

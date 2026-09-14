@@ -231,6 +231,143 @@ def deployment(payload: Mapping[str, Any], *, action: str, as_json: bool) -> str
     )
 
 
+def reload_job(payload: Mapping[str, Any], *, stages: Sequence[str]) -> str:
+    """Render a finished reload job as the transcript of its stages.
+
+    The CLI polls the job to a terminal state and prints the stages it passed
+    through, so an agent reading stdout gets a determinate answer instead of "a
+    job was accepted, good luck". The last block is the reason when it failed —
+    including the installer output, which is where pip's own explanation is.
+    """
+    lines = [f"Reload {payload.get('state', '?')}: {payload.get('deployment_name', '?')}"]
+    lines.extend(f"  - {stage}" for stage in stages)
+    if payload.get("message"):
+        lines.append(f"  {payload['message']}")
+
+    if payload.get("state") != "succeeded":
+        if payload.get("failure_code"):
+            lines.append(f"  Reason   : {payload['failure_code']}")
+        if payload.get("error_log_id"):
+            # Named so an agent can open the archived record directly instead of
+            # asking the API for it again.
+            lines.append(
+                f"  Details  : logs/errors/ (error_id {payload['error_log_id']})"
+            )
+        tail = str(payload.get("output_tail") or "").strip()
+        if tail:
+            lines.append("  Output   :")
+            lines.extend(f"    {line}" for line in tail.splitlines()[-40:])
+        return "\n".join(lines)
+
+    deployment_payload = payload.get("deployment")
+    if isinstance(deployment_payload, Mapping):
+        lines.append(deployment(deployment_payload, action="reload", as_json=False))
+    relaxed = payload.get("relaxed") or []
+    if relaxed:
+        # A successful reload that had to override platform packages. Stated
+        # here because stdout is all an agent sees, and "it worked" alone would
+        # hide the one thing that changed about this copy's runtime.
+        lines.append("  Platform packages overridden for this working copy:")
+        for item in relaxed:
+            if not isinstance(item, Mapping):
+                continue
+            lines.append(
+                f"    {item.get('name', '?')}: platform "
+                f"{item.get('platform_version', '?')} -> "
+                f"{item.get('overlay_version', '?')}"
+            )
+    return "\n".join(lines)
+
+
+def deps_status(payload: Mapping[str, Any], *, as_json: bool) -> str:
+    """Render the dependency state of a working copy."""
+    if as_json:
+        return json.dumps(payload, indent=2)
+
+    lines = [
+        f"Dependencies: {payload.get('state', '?')}",
+        f"  Declared  : {payload.get('declared', 0)}",
+        f"  Installed : {payload.get('installed', 0)}",
+    ]
+    if payload.get("installed_at"):
+        # UTC, as stored. A CLI has no user timezone to localise into.
+        lines.append(f"  Built at  : {payload['installed_at']} (UTC)")
+    if payload.get("size_bytes"):
+        lines.append(f"  Size      : {int(payload['size_bytes']) / 1e6:.1f} MB")
+    if payload.get("message"):
+        lines.append(f"  {payload['message']}")
+
+    conflicts = payload.get("conflicts") or []
+    if conflicts:
+        # The rewrite, per line, rather than only the prose message: the agent
+        # reads this output and applies edits from it, and "declare X instead of
+        # Y" is something it can act on without parsing a paragraph.
+        lines.append("  Platform conflicts (edit asset-dag/pyproject.toml):")
+        for item in conflicts:
+            if not isinstance(item, Mapping):
+                continue
+            lines.append(
+                f"    {item.get('requirement', '?')}  ->  "
+                f"{item.get('suggested', '?')}"
+                f"   (platform ships {item.get('name', '?')}"
+                f"=={item.get('platform_version', '?')})"
+            )
+
+    relaxed = payload.get("relaxed") or []
+    if relaxed:
+        # A standing difference, not an event: whoever reads the status later
+        # has to see that this copy does not run the platform's own version of
+        # these packages, even if they never saw the install that did it.
+        lines.append("  Platform packages overridden in this working copy:")
+        for item in relaxed:
+            if not isinstance(item, Mapping):
+                continue
+            asker = item.get("required_by") or ""
+            lines.append(
+                f"    {item.get('name', '?')}: platform "
+                f"{item.get('platform_version', '?')} -> "
+                f"{item.get('overlay_version', '?')}"
+                + (f" (required by {asker})" if asker else "")
+            )
+    return "\n".join(lines)
+
+
+def deps_baseline(payload: Mapping[str, Any], *, as_json: bool) -> str:
+    """Render what the platform provides, as a declaration reference.
+
+    The ``suggested`` column is the point: it is the exact string to paste into
+    ``[project].dependencies``, so neither a human nor the agent has to derive
+    a bound from a version number.
+    """
+    if as_json:
+        return json.dumps(payload, indent=2)
+
+    packages = payload.get("packages") or []
+    lines = [
+        f"Platform baseline (Python {payload.get('python_version', '?')}, "
+        f"{payload.get('platform_tag', '?')})",
+        "  These are importable WITHOUT declaring anything. Declaring one is",
+        "  allowed and installs nothing; declaring a version the platform does",
+        "  not ship is refused, because an overlay always shadows it.",
+        "",
+    ]
+    width = max((len(str(item.get("name", ""))) for item in packages), default=4)
+    for item in packages:
+        if not isinstance(item, Mapping):
+            continue
+        lines.append(
+            f"  {str(item.get('name', '?')).ljust(width)}  "
+            f"{item.get('version', '?')}"
+        )
+    if payload.get("truncated"):
+        lines.append("")
+        lines.append(
+            f"  Showing the packages user code commonly imports; "
+            f"{payload.get('total', 0)} in total. Use --all for every one."
+        )
+    return "\n".join(lines)
+
+
 def job_run(payload: Mapping[str, Any], *, job_name: str) -> str:
     """Render a launched Dagster run."""
     return "\n".join(
@@ -261,6 +398,8 @@ __all__ = [
     "MAX_OUTPUT_CHARS",
     "asset_graph",
     "deployment",
+    "deps_baseline",
+    "deps_status",
     "environment_notice",
     "error_text",
     "external_models",

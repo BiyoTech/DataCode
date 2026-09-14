@@ -199,21 +199,37 @@ class TestTheScaffoldTellsUsersTheTruth:
             f"importable on this interpreter"
         )
 
-    def test_the_scaffold_project_says_it_is_not_installed(self) -> None:
-        """The single most misleading file in the generated project."""
+    def test_the_scaffold_project_says_how_to_install(self) -> None:
+        """The generated ``pyproject.toml`` IS the install list now.
+
+        It used to be metadata only, and the file said so — which was the honest
+        thing to write while nothing installed it. Now that the platform does, the
+        file has to say the opposite, and say WHERE the install is triggered: a
+        user who adds a package and sees nothing happen has no way to guess that a
+        Reload is what applies it.
+        """
         template = (
             REPO_ROOT / "workspace-runtime" / "src" / "templates" / "pyproject.toml.tpl"
         ).read_text(encoding="utf-8")
-        assert "METADATA ONLY" in template and "nothing ever installs" in template, (
-            "the scaffolded pyproject.toml no longer warns that its "
-            "`dependencies` are documentation: users will add a package there "
-            "and reasonably expect it to be installed"
+
+        assert "METADATA ONLY" not in template, (
+            "the scaffolded pyproject.toml still claims nothing installs it, "
+            "which stopped being true when `deps.sync` landed"
         )
+        assert "INSTALL LIST" in template
+        # The two ways to apply it, named in the file itself.
+        assert "dc deps sync" in template
+        assert "Reload" in template
 
 
 class TestScaffoldAndUserCodeAgree:
-    """The scaffold's own metadata advertises what a generated project needs.
-    It is never installed, but what it lists must at least be kept."""
+    """What a generated project declares must be importable here.
+
+    The scaffolded declaration names platform-provided packages, and a code
+    location imports them on THIS interpreter. A name in that list that this
+    service cannot import would produce a working copy whose very first reload
+    fails on a line the user never wrote.
+    """
 
     def test_the_scaffold_project_dependencies_are_kept(self) -> None:
         if sys.version_info >= (3, 11):
@@ -221,16 +237,46 @@ class TestScaffoldAndUserCodeAgree:
         else:  # pragma: no cover - the project requires >= 3.11
             raise AssertionError("tomllib needs Python 3.11+")
 
+        # Rendered through the real substitution rather than by replacing one
+        # placeholder here: the dependency block and the Python floor are now
+        # GENERATED from the platform baseline, so a hand-rolled replacement
+        # would parse a template that no working copy ever receives.
+        from src.codeloc.scaffold import render_placeholders
+
         template = (
             REPO_ROOT / "workspace-runtime" / "src" / "templates" / "pyproject.toml.tpl"
         )
         data = tomllib.loads(
-            template.read_text(encoding="utf-8").replace("{{ workspace_name }}", "ws")
+            render_placeholders(template.read_text(encoding="utf-8"), "ws")
         )
-        for requirement in data["project"]["dependencies"]:
+        requirements = data["project"]["dependencies"]
+        assert requirements, "the scaffold must document what it was written against"
+        for requirement in requirements:
             name = requirement.split(">=")[0].split("==")[0].strip()
             assert importlib.util.find_spec(_module_of(name)) is not None, (
                 f"the scaffolded asset-dag declares `{name}`, which is not "
-                f"importable here. Nothing installs that file, so the dependency "
-                f"has to be satisfied by this service's own environment."
+                f"importable here. The declaration is generated from this "
+                f"service's own baseline, so a miss means the generator and the "
+                f"environment disagree."
             )
+
+    def test_the_scaffold_declares_the_running_python_floor(self) -> None:
+        """A hardcoded floor drifts from the image it is supposed to describe."""
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:  # pragma: no cover - the project requires >= 3.11
+            raise AssertionError("tomllib needs Python 3.11+")
+
+        from datacode_common.python_deps import interpreter_python_version
+
+        from src.codeloc.scaffold import render_placeholders
+
+        template = (
+            REPO_ROOT / "workspace-runtime" / "src" / "templates" / "pyproject.toml.tpl"
+        )
+        data = tomllib.loads(
+            render_placeholders(template.read_text(encoding="utf-8"), "ws")
+        )
+        assert data["project"]["requires-python"] == (
+            f">={interpreter_python_version()}"
+        )

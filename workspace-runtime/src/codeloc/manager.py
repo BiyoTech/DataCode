@@ -43,11 +43,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+from datacode_common.python_deps import site_packages_path
 
 from src.codeloc.errors import CodeLocationLoadError, WorkspacePathInvalidError
+from src.codeloc.pod import WORKSPACE_MOUNT_PATH as POD_WORKSPACE_MOUNT_PATH
 from src.codeloc.ports import PortSegmentAllocator
 from src.codeloc.scaffold import ASSET_DAG_SUBDIR, ensure_asset_dag_scaffold
 from src.config import Settings, settings
+from src.deps.manifest import overlay_for_injection
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -477,6 +480,59 @@ class CodeLocationManager:
             name = f"signal {number}"
         return {"exit_code": status, "terminated_by": name}
 
+    @staticmethod
+    def _location_log_path(entry: _LocationEntry) -> str:
+        """Where this location's stdout/stderr is written.
+
+        Inside the working copy it serves, under the platform's ``logs/`` root:
+        the transcript belongs to that copy (it is the user's own code talking),
+        travels with it when the lease moves, and is readable by the agent with
+        the file tools it already has.
+        """
+        from src.files.layout import codeloc_logs_dir
+
+        return str(Path(codeloc_logs_dir(entry.spec.workspace_path)) / "server.log")
+
+    def load_failure(self, location_name: str) -> dict:
+        """Why a location is not serving, as structured facts. Empty when it is.
+
+        Used by the reload job to explain a failure instead of reporting
+        ``alive=false`` with no reason — which is what this endpoint did before,
+        leaving the UI with nothing to show.
+
+        Returns:
+            ``{}`` while the location serves, otherwise ``exit_code`` /
+            ``terminated_by`` when the process died, plus ``output_tail`` with the
+            end of its transcript (the import traceback, when there is one).
+        """
+        entry = self._locations.get(location_name)
+        if entry is None or self._is_serving(entry):
+            return {}
+
+        detail: dict = dict(self._exit_detail(entry))
+        proc = self._process_of(entry)
+        tail = proc.output_tail() if proc is not None else ""
+        if not tail:
+            # Pod mode, or a process object we no longer hold: read the file
+            # directly, since the transcript outlives whatever wrote it.
+            tail = self._read_log_tail(entry)
+        if tail:
+            detail["output_tail"] = tail
+        return detail
+
+    @staticmethod
+    def _read_log_tail(entry: _LocationEntry, max_bytes: int = 8192) -> str:
+        """Tail of a location's transcript file, independent of its process."""
+        path = Path(CodeLocationManager._location_log_path(entry))
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - max_bytes))
+                return handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def port_of(self, location_name: str) -> Optional[int]:
         """Port assigned to a location, whether or not it is running."""
         return self._ports.get(location_name)
@@ -664,6 +720,10 @@ class CodeLocationManager:
             location=entry.location_name,
             port=entry.port,
             timeout=self._settings.process_start_timeout,
+            # The process is still alive but never bound its port — almost always
+            # user code that hangs at import. Its own output is the only clue, so
+            # it goes in the log line rather than only in the file.
+            output_tail=self._read_log_tail(entry, max_bytes=2048),
         )
         return False
 
@@ -698,6 +758,10 @@ class CodeLocationManager:
             cwd=str(definitions.parent),
             env=self._code_location_env(entry),
             on_restart=lambda: self._after_restart(entry),
+            # The transcript of the USER's code. Its last lines are the import
+            # traceback when definitions fail to load, which is the only
+            # actionable content a failed reload has.
+            log_path=self._location_log_path(entry),
         )
         # A new process means the control plane's acknowledgement (which refers to
         # the previous one) no longer describes what is running here.
@@ -842,14 +906,53 @@ class CodeLocationManager:
         :class:`CodeLocationSpec`); only the service-wide bridge settings are
         added here. ``DAGSTER_WORKSPACE_PATH`` identifies both the workspace and
         the environment, since a working copy is per-environment.
+
+        ``PYTHONPATH`` carries the working copy's installed third-party packages
+        (injection point 1 of 3). PREPENDED, which is the only position that
+        works: ``sys.path`` is ordered ``'' -> PYTHONPATH -> stdlib ->
+        site-packages``, so anything appended after the image's own
+        site-packages would never be reached for a name the image also has. That
+        same ordering is why the platform's own packages are protected at INSTALL
+        time (see :mod:`datacode_common.python_deps`) rather than here.
         """
-        return {
+        env = {
             "WORKSPACE_RUNTIME_URL": self._settings.sqlmesh_service_url,
             "DAGSTER_WORKSPACE_PATH": entry.workspace_path,
             # Empty -> the runtime uses its default gateway.
             "SQLMESH_GATEWAY": "",
-            **entry.spec.env,
         }
+
+        overlay = self._overlay_python_path(entry)
+        if overlay:
+            env["PYTHONPATH"] = overlay
+
+        env.update(entry.spec.env)
+        return env
+
+    def _overlay_python_path(self, entry: _LocationEntry) -> str:
+        """``PYTHONPATH`` value for this location's vehicle, or ``""``.
+
+        The DECISION is always made against the runtime's own view of the copy —
+        that is where the manifest is readable. The VALUE depends on the vehicle:
+
+        * ``process`` — a child of this service, same filesystem view, so the
+          real path. The runtime's own ``PYTHONPATH`` is appended because the
+          child is started from this environment and still needs whatever the
+          deployment put there;
+        * ``pod`` — the copy is mounted at ``/workspace`` inside the container, so
+          the real path would name a directory that does not exist there. The
+          runtime's own ``PYTHONPATH`` must NOT be carried over for the same
+          reason: those directories belong to this image, not that one.
+        """
+        if not overlay_for_injection(entry.workspace_path, consumer="code_location"):
+            return ""
+
+        if self.vehicle == "pod":
+            return site_packages_path(POD_WORKSPACE_MOUNT_PATH)
+
+        overlay = site_packages_path(entry.workspace_path)
+        inherited = os.environ.get("PYTHONPATH", "")
+        return f"{overlay}{os.pathsep}{inherited}" if inherited else overlay
 
     def _asset_dag_path(self, workspace_path: str) -> Path:
         base = Path(self._settings.workspace_base_path).expanduser().resolve()

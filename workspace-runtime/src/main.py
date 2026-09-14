@@ -272,6 +272,7 @@ app.add_middleware(LogContextMiddleware)
 # SQLMesh engine surface (formerly sqlmesh-service).
 from src.api.rest import (  # noqa: E402
     cell_migration,
+    deps,
     env_control,
     events,
     files,
@@ -297,6 +298,10 @@ app.include_router(meta.router)
 app.include_router(ontology.router)
 app.include_router(tools.router)
 app.include_router(metrics.router)
+# Working-copy Python dependencies: the platform baseline and one copy's state.
+# Read-only — installing is a minutes-long operation and stays behind the
+# explicit reload, never behind a GET.
+app.include_router(deps.router)
 # WIP durability contract (design 07 Q6): the user-facing status/recover/
 # discard surface of the lease subsystem's snapshot machinery.
 app.include_router(wip.router)

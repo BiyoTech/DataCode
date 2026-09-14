@@ -182,9 +182,53 @@ function closeContextMenu() {
 
 function handleMentionInChat() {
   const node = contextMenu.value.node
-  if (!node || node.isDirectory) return
+  if (!node) return
+  // Files and directories alike: the mention is a path token, and the agent
+  // resolves a directory with its list tools rather than reading it.
   requestMention(node.path)
   closeContextMenu()
+}
+
+// Upload target: the directory the context menu was opened on. Remembered at
+// click time because the picker fires its change event asynchronously.
+const uploadInput = ref<HTMLInputElement | null>(null)
+const uploadTargetDir = ref('')
+
+function handleUploadClick() {
+  const node = contextMenu.value.node
+  if (!node || !node.isDirectory) return
+  uploadTargetDir.value = node.path
+  closeContextMenu()
+  uploadInput.value?.click()
+}
+
+async function handleUploadPicked(event: Event) {
+  const input = event.target as HTMLInputElement
+  const ws = workspaceStore.currentWorkspace
+  const picked = Array.from(input.files || [])
+  // Reset immediately so picking the same file twice still fires `change`.
+  input.value = ''
+  if (!ws || picked.length === 0) return
+
+  const dir = uploadTargetDir.value
+  const failures: string[] = []
+  for (const file of picked) {
+    try {
+      await fileStore.uploadFile(ws.path, dir, file)
+    } catch (e: any) {
+      failures.push(`${file.name}: ${extractApiMessage(e, t('files.uploadFailed'))}`)
+    }
+  }
+
+  await fileStore.loadFileTree(ws.path)
+  const succeeded = picked.length - failures.length
+  if (succeeded > 0) {
+    MessagePlugin.success(t('files.uploaded', { count: succeeded, dir: dir || '/' }))
+  }
+  // One message per failure: the reason (oversize, invalid name) is per file.
+  for (const failure of failures) {
+    MessagePlugin.error(failure)
+  }
 }
 
 function openNewDialog(type: 'file' | 'directory') {
@@ -470,17 +514,34 @@ async function handleImportSuccess() {
       <div class="ctx-item" @click="openNewDialog('file')">New File</div>
       <div class="ctx-item" @click="openNewDialog('directory')">New Folder</div>
       <div class="ctx-divider" />
+      <!-- Directory-only: the target of an upload is the folder the menu was
+           opened on. -->
       <div
-        v-if="contextMenu.node && !contextMenu.node.isDirectory"
+        v-if="contextMenu.node && contextMenu.node.isDirectory"
         class="ctx-item"
-        @click="handleMentionInChat"
+        @click="handleUploadClick"
       >
+        {{ t('files.uploadHere') }}
+      </div>
+      <!-- Files and directories alike: a mentioned folder is something the
+           agent can list with its file tools, not just read. -->
+      <div class="ctx-item" @click="handleMentionInChat">
         {{ t('chat.mention.reference') }}
       </div>
       <div class="ctx-divider" />
       <div class="ctx-item" @click="openRenameDialog">Rename</div>
       <div class="ctx-item ctx-danger" @click="handleDelete">Delete</div>
     </div>
+
+    <!-- Hidden picker behind "Upload files here"; the target directory is
+         remembered when the menu item is clicked. -->
+    <input
+      ref="uploadInput"
+      type="file"
+      multiple
+      class="hidden-file-input"
+      @change="handleUploadPicked"
+    />
 
     <!-- New file/directory dialog -->
     <div v-if="showNewDialog" class="dialog-overlay" @click.self="showNewDialog = false">
@@ -665,6 +726,15 @@ async function handleImportSuccess() {
   height: 1px;
   background: var(--border);
   margin: 4px 0;
+}
+
+/* Visually hidden but still focusable/clickable programmatically. */
+.hidden-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* Dialog */

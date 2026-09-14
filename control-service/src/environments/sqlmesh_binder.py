@@ -125,24 +125,30 @@ class SqlMeshBinder:
     async def invalidate_virtual_environment(
         self,
         *,
-        workspace_path: str,
+        tenant_id: str,
+        workspace_id: str,
         environment: str,
         gateway: t.Optional[str] = None,
     ) -> bool:
         """Invalidate an environment and drop its expired views.
 
-        The runtime derives a usable working copy itself (any member's copy
-        reaches the same workspace-level state); when none is materialized it
-        answers 404, which maps to ``False`` — the release is left to the
-        reconciler rather than silently reported as done.
+        Addressed by tenant and workspace rather than by a working-copy path:
+        the runtime resolves a usable copy itself, so the path was only ever a
+        carrier for these two ids. Synthesizing one (with a placeholder user
+        segment) used to be how this was called — and it raised on the layout
+        validator, which meant a destroy blew up right after writing
+        ``archiving`` and left the environment stuck in it.
+
+        When no copy is materialized anywhere the runtime answers 404, which
+        maps to ``False`` — the release is left to the reconciler rather than
+        silently reported as done.
         """
-        tenant, workspace, _, _ = _ids_from_path(workspace_path)
         try:
             body = await self._client.post(
                 "/internal/env-control/sqlmesh/invalidate-virtual-environment",
                 {
-                    "tenant_id": tenant,
-                    "workspace_id": workspace,
+                    "tenant_id": tenant_id,
+                    "workspace_id": workspace_id,
                     "environment": environment,
                     "gateway": gateway or "",
                 },
@@ -150,7 +156,7 @@ class SqlMeshBinder:
         except RuntimeUnavailableError as exc:
             logger.warning(
                 "virtual_environment_invalidate_failed",
-                workspace_path=workspace_path,
+                workspace_id=workspace_id,
                 environment=environment,
                 error=str(exc),
             )
@@ -162,7 +168,7 @@ class SqlMeshBinder:
         if ok:
             logger.info(
                 "virtual_environment_invalidated",
-                workspace_path=workspace_path,
+                workspace_id=workspace_id,
                 environment=environment,
             )
         return ok

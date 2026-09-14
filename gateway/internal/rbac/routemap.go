@@ -236,6 +236,21 @@ var rules = []Rule{
 	{Pattern: "/api/v1/files/*",
 		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 
+	// ------------------------------------------------------------------ deps
+	// Working-copy Python dependencies. Reads only — installing happens
+	// through the reload route, which is already gated as a code write.
+	//
+	// /baseline describes the runtime IMAGE, not any workspace, so it resolves
+	// no scope and carries no permission (ScopeSourceNone ignores one): it is
+	// the list a user needs in order to write a declaration that can install at
+	// all, every working copy's scaffolded pyproject.toml already quotes part
+	// of it, and requiring a workspace to read it would make the answer look
+	// workspace-specific when it is identical everywhere. Authenticated is
+	// enough, matching /sqlmesh/meta and /dagster/mode.
+	{Method: http.MethodGet, Pattern: "/api/v1/deps/baseline", Source: ScopeSourceNone},
+	{Method: http.MethodGet, Pattern: "/api/v1/deps/status",
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+
 	// ------------------------------------------------------------------- wip
 	// The durability-contract surface (design 07 Q6): reading one working
 	// copy's protection state is a code read; recovering or discarding a
@@ -279,6 +294,18 @@ var rules = []Rule{
 	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/ensure",
 		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/reload",
+		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+	// A reload is asynchronous: reading its progress is a READ on the same
+	// working copy, so it takes pipeline:read rather than pipeline:run — a user
+	// who may look at a pipeline may watch a reload someone else triggered.
+	//
+	// The scope is NOT optional, unlike the catch-all GET rule below. The runtime
+	// is a headless Service and this request must reach the replica holding the
+	// copy's lease; a query with no workspace_path would be answered by whichever
+	// replica the DNS round-robin picked, which knows nothing about the job.
+	{Method: http.MethodGet, Pattern: "/api/v1/dagster/deployments/reload/status",
+		Permission: catalog.PermWorkspacePipelineRead, Source: ScopeSourceWorkspacePath},
+	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/reload/cancel",
 		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
 	// Tearing a deployment down is part of destroying an environment, and the
 	// request carries only the deployment name — hence env:delete in some

@@ -20,6 +20,8 @@ import { useDagsterStore } from '@/stores/dagster'
 import { useThemeStore } from '@/stores/theme'
 import { registerAssetDagNode } from './assetDagNodeRegister'
 import { useAssetDagLayout } from '@/composables/useAssetDagLayout'
+import { notifyError } from '@/utils/notifyError'
+import DeploymentReloadProgress from './DeploymentReloadProgress.vue'
 
 const props = defineProps<{ workspacePath: string }>()
 
@@ -174,12 +176,33 @@ function toggleLock() {
   }
 }
 
-/** Reload this environment's deployment (picks up user edits under asset-dag/). */
+/**
+ * Reload this environment's deployment (picks up user edits under asset-dag/).
+ *
+ * The failure is REPORTED, not swallowed. It used to be discarded, which meant a
+ * dependency that could not be installed or code that could not be imported
+ * looked exactly like a graph that simply had not changed.
+ */
 async function reload() {
   if (!props.workspacePath || reloading.value) return
   reloading.value = true
-  await dagster.reloadDeployment(props.workspacePath).catch(() => {})
-  reloading.value = false
+  try {
+    await dagster.reloadDeployment(props.workspacePath)
+  } catch (e) {
+    notifyError(e, t('deploy.reloadFailed'))
+  } finally {
+    reloading.value = false
+  }
+}
+
+/**
+ * The declaration was rewritten from the failure panel, so the reload that
+ * failed on it can now be retried. Retried rather than only refreshed: the user
+ * asked for a reload, the platform told them exactly what stood in the way, and
+ * they resolved it — making them press the button a second time adds nothing.
+ */
+async function retryAfterDepsFix() {
+  await reload()
 }
 
 /**
@@ -351,6 +374,18 @@ onBeforeUnmount(() => {
           <t-icon name="refresh" size="16px" :class="{ spinning: reloading }" />
         </button>
       </div>
+
+      <!-- Reload progress, floating over the canvas: an install can run for
+           minutes, and the user has to see WHICH stage it is in and why it
+           stopped without leaving the graph. -->
+      <div v-if="dagster.reloadJob" class="dag-reload-progress">
+        <DeploymentReloadProgress
+          :job="dagster.reloadJob"
+          :output="dagster.reloadOutput"
+          :workspace-path="props.workspacePath"
+          @deps-fixed="retryAfterDepsFix"
+        />
+      </div>
     </div>
   </div>
 </template>
@@ -362,6 +397,17 @@ onBeforeUnmount(() => {
   min-height: 400px;
   /* Canvas backdrop follows the app theme so it blends with the main shell. */
   background: var(--bg-primary);
+}
+
+/* Top-right, wide enough for the stage ladder and the output panel, and above
+   the canvas so a running install is visible without scrolling. */
+.dag-reload-progress {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  width: 460px;
+  max-width: calc(100% - 24px);
 }
 
 .dag-state {

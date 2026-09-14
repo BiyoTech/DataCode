@@ -219,12 +219,15 @@ class EnvironmentReaper:
         nobody will come to resolve its uncommitted changes, and the warning
         event recorded at expiry is the notice that made this fair. What is
         released is reported in the audit trail by ``destroy`` itself.
+
+        The remote branch survives here exactly as it does for a user-initiated
+        destroy: an expiry is a capacity decision about platform state, never a
+        licence to delete the team's code.
         """
         result = await self._registry_factory().destroy(
             environment_id=model.id,
             tenant_id=model.tenant_id,
             actor_user_id=SYSTEM_ACTOR,
-            delete_remote_branch=True,
             force=True,
             trigger_type=TRIGGER_SCHEDULE,
         )
@@ -239,7 +242,6 @@ class EnvironmentReaper:
                 "expires_at": expires_at.isoformat(),
                 "ttl_hours": model.ttl_hours,
                 "worktrees_removed": result.worktrees_removed,
-                "remote_branch_deleted": result.remote_branch_deleted,
             },
         )
         logger.info(

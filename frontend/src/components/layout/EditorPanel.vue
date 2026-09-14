@@ -34,6 +34,10 @@ let isDiffEditor = false
 const monacoLoaded = ref(false)
 const fallbackMode = ref(false)
 
+// Owner of the dependency markers. Scoped so setting them never clears Monaco's
+// own syntax diagnostics, and clearing ours never leaves someone else's behind.
+const DEPS_MARKER_OWNER = 'datacode-deps'
+
 // ────── Markdown preview mode support ──────
 type MdViewMode = 'code' | 'split' | 'preview'
 const mdViewMode = ref<MdViewMode>('code')
@@ -204,6 +208,9 @@ watch(
       // First mount, or the editor type changed (plain <-> diff): recreate it.
       nextTick(() => initEditor())
     }
+    // Re-applied per tab: markers live on the model, so without this the
+    // previous file's conflicts would stay drawn over the new file's lines.
+    nextTick(() => applyDepsMarkers())
   }
 )
 
@@ -219,6 +226,69 @@ async function handleSave() {
   const ws = workspaceStore.currentWorkspace
   if (!ws || !fileStore.activeFilePath || fileStore.activeFile?.readOnly) return
   await fileStore.saveFile(ws.path, fileStore.activeFilePath)
+  applyDepsMarkers()
+}
+
+/**
+ * Mark dependency conflicts on the lines that declare them.
+ *
+ * A Monaco marker rather than a banner: the platform's verdict is about ONE
+ * line, and a message at the top of the screen makes the reader find that line
+ * themselves. The squiggle carries the rewrite in its hover, so the fix is
+ * readable without leaving the file.
+ *
+ * Markers are owned by the `datacode-deps` source, so setting them replaces the
+ * previous verdict wholesale — a fixed line cannot keep a stale squiggle.
+ */
+function applyDepsMarkers() {
+  if (!monaco || !monacoEditor || isDiffEditor) return
+  const model = monacoEditor.getModel()
+  if (!model) return
+
+  const diagnostics = fileStore.activeDepsDiagnostics
+  if (!diagnostics) {
+    monaco.editor.setModelMarkers(model, DEPS_MARKER_OWNER, [])
+    return
+  }
+
+  const lines: string[] = model.getValue().split('\n')
+  const markers = diagnostics.conflicts.map((conflict) => {
+    // Located by NAME: the backend normalises a requirement before reporting it
+    // (specifiers get sorted), so searching for the reported string would miss
+    // exactly the multi-bound requirements that conflict most often.
+    const index = lines.findIndex((line) =>
+      new RegExp(`["']${conflict.name.replace(/[-_.]/g, '[-_.]')}\\s*[<>=!~\\[]`, 'i').test(line),
+    )
+    const lineNumber = index === -1 ? 1 : index + 1
+    return {
+      severity: monaco.MarkerSeverity.Error,
+      message: t('deploy.depsConflict.marker', {
+        platform: `${conflict.name}==${conflict.platform_version}`,
+        suggested: conflict.suggested,
+      }),
+      startLineNumber: lineNumber,
+      endLineNumber: lineNumber,
+      startColumn: 1,
+      endColumn: (lines[lineNumber - 1]?.length || 1) + 1,
+      source: DEPS_MARKER_OWNER,
+    }
+  })
+
+  // A declaration that does not parse has no line to point at; reported at the
+  // top of the file rather than guessed at.
+  if (!diagnostics.valid && !diagnostics.conflicts.length && diagnostics.message) {
+    markers.push({
+      severity: monaco.MarkerSeverity.Error,
+      message: diagnostics.message,
+      startLineNumber: 1,
+      endLineNumber: 1,
+      startColumn: 1,
+      endColumn: (lines[0]?.length || 1) + 1,
+      source: DEPS_MARKER_OWNER,
+    })
+  }
+
+  monaco.editor.setModelMarkers(model, DEPS_MARKER_OWNER, markers)
 }
 
 // Handle fallback textarea changes

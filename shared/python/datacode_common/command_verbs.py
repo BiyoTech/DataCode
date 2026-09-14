@@ -86,6 +86,30 @@ GOVERNED_VERBS: dict[tuple[str, ...], str] = {
         "stamped with the deployment's tags). Run it as a single command "
         "without shell operators."
     ),
+    ("dc", "deps"): (
+        "'dc deps' is served by the platform: the install runs in a sandbox that "
+        "may reach the package index and nothing else, and its result is recorded "
+        "so the working copy's dependency tree stays explainable. Run it as a "
+        "single command without shell operators."
+    ),
+    # Listed even though the platform REFUSES it, for the same reason as
+    # `sqlmesh run`: without an entry here the native binary would install into
+    # whichever interpreter happens to be on PATH. In a sandbox that is a tree
+    # thrown away when the vehicle exits (so the packages vanish and the failure
+    # is "it worked once"), and in the code location's own interpreter it would
+    # be a shared mutation no declaration records.
+    ("pip", "install"): (
+        "'pip install' is disabled on this platform: a package installed by hand "
+        "is gone with the sandbox that ran it, and nothing records why it was "
+        "there. Declare the dependency in asset-dag/pyproject.toml under "
+        "[project].dependencies, then run 'dc deps sync' (or press Reload in the "
+        "UI) to install it for the whole working copy."
+    ),
+    ("pip3", "install"): (
+        "'pip3 install' is disabled on this platform: declare the dependency in "
+        "asset-dag/pyproject.toml under [project].dependencies and run "
+        "'dc deps sync' (or press Reload in the UI) instead."
+    ),
 }
 
 # Programs that carry governed verbs at all. Used by the guards to decide

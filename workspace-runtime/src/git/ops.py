@@ -1274,6 +1274,56 @@ class GitWorktreeOperations:
         return GitWorktreeOperations.ref_exists(repo_path, f"refs/heads/{branch}")
 
     @staticmethod
+    def fast_forward_branch(repo_path: str, branch: str, target_ref: str) -> bool:
+        """Move a local branch ref forward to ``target_ref``.
+
+        Only ever a fast-forward: the caller must have established that the
+        branch tip is an ancestor of the target, so no commit becomes
+        unreachable. Refuses a branch that is checked out in a worktree,
+        because moving the ref under a live checkout would leave that worktree
+        describing a state its files do not have.
+        """
+        if GitWorktreeOperations.branch_is_checked_out(repo_path, branch):
+            logger.warning(
+                "git_branch_fast_forward_skipped",
+                repo=repo_path,
+                branch=branch,
+                reason="checked_out",
+            )
+            return False
+
+        target = GitWorktreeOperations.head_commit_of(repo_path, target_ref)
+        if not target:
+            return False
+        result = _run_git(
+            repo_path, ["update-ref", f"refs/heads/{branch}", target]
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "git_branch_fast_forward_failed",
+                repo=repo_path,
+                branch=branch,
+                stderr=result.stderr,
+            )
+            return False
+
+        logger.info(
+            "git_branch_fast_forwarded",
+            repo=repo_path,
+            branch=branch,
+            target=target[:8],
+        )
+        return True
+
+    @staticmethod
+    def branch_is_checked_out(repo_path: str, branch: str) -> bool:
+        """Whether any worktree of ``repo_path`` currently has ``branch`` out."""
+        return any(
+            entry.branch == branch
+            for entry in GitWorktreeOperations.worktree_list(repo_path)
+        )
+
+    @staticmethod
     def remote_branch_exists(
         repo_path: str, branch: str, remote: str = "origin"
     ) -> bool:

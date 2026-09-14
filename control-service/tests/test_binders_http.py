@@ -62,6 +62,7 @@ async def test_ensure_worktree_returns_runtime_materialization(fake):
         "branch": "env/dev",
         "commit": "abc1234",
         "created": True,
+        "branch_source": "reused_remote",
     }
     binder = GitBinder(client=fake)
 
@@ -77,10 +78,53 @@ async def test_ensure_worktree_returns_runtime_materialization(fake):
     assert result.created is True
     assert result.commit == "abc1234"
     assert result.workspace_path == "/base/t1/ws/u1/envs/dev"
+    # The runtime alone decides where the branch came from; the binder carries
+    # the verdict rather than re-deriving it.
+    assert result.branch_source == "reused_remote"
     method, path, payload = fake.calls[-1]
     assert (method, path) == ("POST", "/internal/env-control/git/ensure-worktree")
     assert payload["tenant_id"] == "t1"
     assert payload["environment"] == "dev"
+
+
+async def test_pending_work_returns_both_counts(fake):
+    """Both halves of "what would this release lose" in one round trip."""
+    fake.responses["GET /internal/env-control/git/pending-work"] = {
+        "uncommitted": 2,
+        "unpushed": 3,
+    }
+    binder = GitBinder(client=fake)
+
+    work = await binder.pending_work(
+        tenant_id="t1",
+        workspace_id="ws",
+        user_id="u1",
+        environment="dev",
+        branch="env/dev",
+    )
+
+    assert (work.uncommitted, work.unpushed) == (2, 3)
+    method, path, params = fake.calls[-1]
+    assert (method, path) == ("GET", "/internal/env-control/git/pending-work")
+    # The branch must travel: without it the runtime cannot resolve the
+    # tracking ref the unpushed count is measured against.
+    assert params["branch"] == "env/dev"
+
+
+async def test_git_binder_exposes_no_remote_branch_deletion(fake):
+    """Structural guard for the whole point of this contract.
+
+    The platform never deletes a remote branch, and the verifiable form of
+    that promise is that no binder method can even ask for it. A future
+    "cleanup" helper re-introducing the capability fails here.
+    """
+    binder = GitBinder(client=fake)
+
+    assert not [
+        name
+        for name in dir(binder)
+        if "delete" in name and "remote" in name
+    ]
 
 
 async def test_members_round_trip(fake):
@@ -197,34 +241,39 @@ async def test_state_environments_none_is_not_empty(fake):
 
 
 async def test_invalidate_maps_missing_worktree_to_false(fake):
-    import os
-
-    from src.config import settings
-
-    base = os.path.expanduser(settings.workspace_base_path)
-    worktree = f"{base}/t1/ws-t1-shop/u1/envs/dev"
     fake.responses["POST /internal/env-control/sqlmesh/invalidate-virtual-environment"] = (
         WorkspaceNotFoundError("no copy materialized")
     )
     binder = SqlMeshBinder(client=fake)
 
     assert await binder.invalidate_virtual_environment(
-        workspace_path=worktree, environment="dev"
+        tenant_id="t1", workspace_id="ws-t1-shop", environment="dev"
     ) is False
 
 
 async def test_invalidate_maps_unreachable_runtime_to_false(fake):
-    import os
-
-    from src.config import settings
-
-    base = os.path.expanduser(settings.workspace_base_path)
-    worktree = f"{base}/t1/ws-t1-shop/u1/envs/dev"
     fake.responses["POST /internal/env-control/sqlmesh/invalidate-virtual-environment"] = (
         RuntimeUnavailableError("invalidate", "down")
     )
     binder = SqlMeshBinder(client=fake)
 
     assert await binder.invalidate_virtual_environment(
-        workspace_path=worktree, environment="dev"
+        tenant_id="t1", workspace_id="ws-t1-shop", environment="dev"
     ) is False
+
+
+async def test_invalidate_is_addressed_by_ids_not_by_a_path(fake):
+    """Regression: this used to take a working-copy path, and its only caller
+    synthesized one with a ``_`` user segment — which the layout validator
+    rejects. A destroy therefore raised immediately after writing
+    ``archiving``, stranding the environment in that status forever.
+
+    Taking the ids directly removes the ability to express that mistake.
+    """
+    import inspect
+
+    params = inspect.signature(
+        SqlMeshBinder(client=fake).invalidate_virtual_environment
+    ).parameters
+    assert "workspace_path" not in params
+    assert {"tenant_id", "workspace_id"} <= set(params)

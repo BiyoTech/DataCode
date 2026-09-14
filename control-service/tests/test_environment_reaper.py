@@ -74,7 +74,6 @@ class _FakeRepo:
 @dataclass
 class _DestroyResult:
     archived: bool = True
-    remote_branch_deleted: bool = True
     virtual_environment_released: bool = True
     worktrees_removed: int = 2
 

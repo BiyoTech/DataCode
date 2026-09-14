@@ -52,6 +52,11 @@ class EventTopic(str, enum.Enum):
     # surfaces as "your working copy is moving" instead of as the next
     # request's failure.
     WORKSPACE = "workspace"
+    # Code-location reload progress: stage transitions plus the installer's
+    # output, line by line. A reload can take minutes (a first dependency
+    # install), so it is an asynchronous job whose progress arrives here while
+    # the authoritative state stays readable from its status endpoint.
+    DEPLOYMENT = "deployment"
 
 
 class SSEEvent:

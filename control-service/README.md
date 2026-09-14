@@ -44,6 +44,34 @@ Every deployment's migrate step runs the same entry point: dev's
 `run_db_migrations`, the compose one-shot `migrate` service, the Kubernetes
 `control-migrate` Job. Replicas run with `AUTO_MIGRATE=0`.
 
+## What a destroy may take (and what it may not)
+
+Destroying an environment releases only state the PLATFORM created: the SQLMesh
+virtual environment, every member's working copy, the local branch, the Dagster
+deployment, and the registry status. **The remote branch is never touched.** It
+lives in the user's repository — which may predate the workspace, be shared with
+tooling outside DataCode, and hold the only durable copy of that work — so
+deleting it as a side effect of releasing derived state is not the platform's
+call. The same reasoning already governed workspace deletion; environments now
+follow it.
+
+The verifiable form of that promise: this repository contains no
+`git push --delete`, and no endpoint or binder method through which one could be
+requested (`tests/test_binders_http.py`, `scripts/verify/verify-environment-branch-reuse.py`).
+
+Two consequences worth knowing:
+
+* **A preserved branch is an asset, not a leftover.** Creating an environment
+  whose remote branch still exists RESUMES it (reported as
+  `branch_source=reused_remote`) instead of re-cutting one from the base, and
+  the reconciler must not report it as `stale_resources` or `orphan_branch` —
+  an archived row still claims its own branch.
+* **Unpushed commits are the only code a destroy can lose**, because the local
+  branch deletion is forced. They are reported by
+  `GET /environments/{id}/pending-work` before the user confirms and recorded
+  afterwards in the destroy event; they never refuse the request. Uncommitted
+  changes still do, unless `force=true` (which the TTL reaper depends on).
+
 ## Run
 
 ```

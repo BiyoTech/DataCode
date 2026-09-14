@@ -13,6 +13,7 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import api from '@/utils/api'
 import { i18n } from '@/i18n'
 import { useWorkspaceStore } from '@/stores/workspace'
+import type { DepsDeclarationDiagnostics } from '@/types/dagster'
 
 export interface FileNode {
   path: string          // Relative to workspace root
@@ -54,6 +55,21 @@ export const useFileStore = defineStore('files', () => {
 
   const activeFile = computed(() =>
     openFiles.value.find((f) => f.path === activeFilePath.value) || null
+  )
+
+  /**
+   * Platform verdict on a saved dependency declaration, keyed by file path.
+   *
+   * Only `asset-dag/pyproject.toml` ever gets an entry. It exists so a version
+   * bound the platform cannot satisfy is visible the moment it is saved — the
+   * check is a parse plus a comparison, while discovering the same thing through
+   * a reload costs a full install cycle.
+   */
+  const depsDiagnostics = ref<Record<string, DepsDeclarationDiagnostics>>({})
+
+  /** Verdict for the file currently in the editor, if it has one. */
+  const activeDepsDiagnostics = computed(() =>
+    activeFilePath.value ? depsDiagnostics.value[activeFilePath.value] || null : null
   )
 
   /**
@@ -201,12 +217,20 @@ export const useFileStore = defineStore('files', () => {
 
   /**
    * Save the active file to backend.
+   *
+   * Saving `asset-dag/pyproject.toml` additionally surfaces the platform's
+   * verdict on the declaration (see `depsDiagnostics`). The save itself is never
+   * blocked by it: the file is the user's, an intermediate edit is legitimately
+   * broken, and a write that refused itself would make the editor unusable.
    */
   async function saveFile(workspacePath: string, filePath: string): Promise<void> {
     const file = openFiles.value.find((f) => f.path === filePath)
     if (!file || file.readOnly) return
 
-    await api.post('/files/write', {
+    const { data } = await api.post<{
+      success: boolean
+      deps?: DepsDeclarationDiagnostics
+    }>('/files/write', {
       workspace_path: workspacePath,
       file_path: filePath,
       content: file.content,
@@ -214,6 +238,16 @@ export const useFileStore = defineStore('files', () => {
 
     file.isDirty = false
     file.originalContent = file.content
+
+    // Kept per path rather than as a single value: several files can be open,
+    // and a stale verdict attached to the wrong tab is worse than none.
+    if (data.deps) {
+      depsDiagnostics.value = { ...depsDiagnostics.value, [filePath]: data.deps }
+    } else if (depsDiagnostics.value[filePath]) {
+      const next = { ...depsDiagnostics.value }
+      delete next[filePath]
+      depsDiagnostics.value = next
+    }
 
     // The draft has served its purpose; keeping it would make the next open
     // offer keystrokes that were already saved.
@@ -337,6 +371,33 @@ export const useFileStore = defineStore('files', () => {
       file_path: filePath,
       content,
     })
+  }
+
+  /**
+   * Upload one file into a directory of the working copy.
+   *
+   * Multipart rather than the JSON `/write` because uploads can be binary
+   * (images, archives, spreadsheets). Overwrites an existing file of the same
+   * name — the same contract as saving in the editor.
+   *
+   * `workspace_path` rides the query string, not the form: the gateway reads it
+   * to authorize against the right workspace and to route to the replica holding
+   * this copy's lease, and it cannot inspect a multipart body for either.
+   */
+  async function uploadFile(
+    workspacePath: string,
+    directory: string,
+    file: File,
+  ): Promise<{ path: string; size: number }> {
+    const form = new FormData()
+    form.append('directory', directory)
+    form.append('file', file)
+
+    const { data } = await api.post('/files/upload', form, {
+      params: { workspace_path: workspacePath },
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    return data
   }
 
   /**
@@ -487,6 +548,10 @@ export const useFileStore = defineStore('files', () => {
     flatFilesWorkspacePath = ''
     openFiles.value = []
     activeFilePath.value = null
+    // Verdicts describe ONE working copy's declaration against the platform.
+    // Carrying them across a switch would label the new copy's file with the
+    // previous copy's conflicts.
+    depsDiagnostics.value = {}
   }
 
   return {
@@ -497,6 +562,8 @@ export const useFileStore = defineStore('files', () => {
     openFiles,
     activeFilePath,
     activeFile,
+    depsDiagnostics,
+    activeDepsDiagnostics,
     loadFileTree,
     refreshFileTree,
     fetchFlatFiles,
@@ -510,6 +577,7 @@ export const useFileStore = defineStore('files', () => {
     updateFileContent,
     closeFile,
     createFile,
+    uploadFile,
     createDirectory,
     deleteFile,
     renameFile,

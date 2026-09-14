@@ -327,11 +327,19 @@ class TaskResult:
         status: TaskStatus = TaskStatus.FAILED,
         duration_ms: int = 0,
         exit_code: Optional[int] = None,
+        result: Optional[Mapping[str, Any]] = None,
     ) -> "TaskResult":
-        """Build a failure result. Used by both sides, hence the helper."""
+        """Build a failure result. Used by both sides, hence the helper.
+
+        ``result`` is not a contradiction: ``error_code`` says WHICH failure
+        this is, while ``result`` carries what the caller needs to act on it —
+        a dependency conflict's rewrite, say — which does not fit in a sentence
+        and must not be recovered by parsing one.
+        """
         return cls(
             task_id=task_id,
             status=status,
+            result=dict(result) if result else {},
             error_code=code,
             error_message=message,
             duration_ms=duration_ms,

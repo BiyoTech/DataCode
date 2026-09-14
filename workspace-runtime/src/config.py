@@ -187,6 +187,43 @@ class Settings(BaseSettings):
     # engine chatter that is kept with a failure.
     task_log_tail_bytes: int = 65536
 
+    # ── Working-copy Python dependencies ──────────────────────────────
+    # The package index a `deps.sync` task may reach. PLATFORM configuration on
+    # purpose: the sandbox's egress allow-list is otherwise derived from the
+    # working copy, and an index named by a file in the repository would be a
+    # way to widen that allow-list from inside the code under review.
+    #
+    # Empty means dependency installation is NOT AVAILABLE. Refusing is the only
+    # honest default: falling back to the public index would mean a deployment
+    # that never configured an index still reaches out to the internet from a
+    # profile whose whole purpose is a narrow allow-list.
+    deps_index_url: str = ""
+    # Additional indexes, comma-separated. Same provenance rule.
+    deps_extra_index_urls: str = ""
+    # Hosts pip may use over plain HTTP (`--trusted-host`), comma-separated. For
+    # an internal mirror without a public certificate.
+    deps_trusted_hosts: str = ""
+    # Size ceiling for one working copy's overlay tree. The target is the user's
+    # own volume, and a transitive CUDA build is tens of gigabytes: without a cap
+    # a single declaration can fill the copy and take the lease down with it.
+    deps_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # Budget for one install. Below the profile's own timeout so the runner
+    # reports a classified failure instead of being killed by the vehicle.
+    deps_install_timeout_seconds: int = 840
+    # Baseline pins that may NEVER be yielded to a working copy, beyond the ones
+    # the platform derives itself (its own runtime, and everything shipping a
+    # compiled extension). Comma-separated canonical names. For a deployment
+    # whose assets depend on a specific pure-Python version the platform also
+    # uses — an authentication client, a tracing SDK — where an override would
+    # be silent and confusing rather than local.
+    deps_protected_packages: str = ""
+    # The opposite, and applied LAST so it wins: pins this deployment allows a
+    # working copy to override even though the rules above withhold them.
+    # Comma-separated canonical names. The escape hatch a failed install names
+    # in its message, so an operator who has decided a specific package is safe
+    # to override does not need a platform release to say so.
+    deps_relaxable_packages: str = ""
+
     # ── Kubernetes task backend ────────────────────────────────────────
     # Namespace the Jobs are created in. Must be the namespace whose
     # NetworkPolicy denies egress by default (P6b).
@@ -479,6 +516,13 @@ def _flatten_yaml(data: dict) -> dict:
         "task.workcopy_pvc": "task_workcopy_pvc",
         "task.job_ttl_seconds": "task_job_ttl_seconds",
         "task.dns_server": "task_dns_server",
+        "deps.index_url": "deps_index_url",
+        "deps.extra_index_urls": "deps_extra_index_urls",
+        "deps.trusted_hosts": "deps_trusted_hosts",
+        "deps.max_bytes": "deps_max_bytes",
+        "deps.install_timeout_seconds": "deps_install_timeout_seconds",
+        "deps.protected_packages": "deps_protected_packages",
+        "deps.relaxable_packages": "deps_relaxable_packages",
         "error_archive.enabled": "error_archive_enabled",
         "error_archive.retention": "error_archive_retention",
         "error_archive.max_sql_len": "error_archive_max_sql_len",

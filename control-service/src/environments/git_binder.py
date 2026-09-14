@@ -39,6 +39,26 @@ class GitCommandResult:
     detail: str = ""
 
 
+# Mirrors the runtime's branch-source vocabulary; the runtime decides, this
+# side only carries the verdict to the registry and the audit trail.
+BRANCH_SOURCE_REUSED_REMOTE = "reused_remote"
+BRANCH_SOURCE_ADOPTED_LOCAL = "adopted_local"
+BRANCH_SOURCE_CREATED_FROM_BASE = "created_from_base"
+
+
+@dataclass(frozen=True)
+class PendingWork:
+    """Work a member's working copy would lose on release (runtime's shape).
+
+    ``unpushed`` is reported, never enforced: the remote branch is always
+    preserved, so committed-but-unpushed commits are the only code a destroy
+    can still lose — worth telling the user about, not worth refusing over.
+    """
+
+    uncommitted: int
+    unpushed: int
+
+
 @dataclass(frozen=True)
 class WorktreeMaterialization:
     """Outcome of materializing one environment worktree for one user."""
@@ -47,6 +67,8 @@ class WorktreeMaterialization:
     branch: str
     commit: str
     created: bool
+    # One of the BRANCH_SOURCE_* constants (see the runtime binder).
+    branch_source: str
 
 
 def _ids_from_path(path: str) -> tuple[str, str, str, str]:
@@ -261,27 +283,35 @@ class GitBinder:
             branch=str(body.get("branch", branch)),
             commit=str(body.get("commit", "")),
             created=bool(body.get("created", False)),
+            branch_source=str(
+                body.get("branch_source", BRANCH_SOURCE_CREATED_FROM_BASE)
+            ),
         )
 
-    async def uncommitted_change_count(
+    async def pending_work(
         self,
         *,
         tenant_id: str,
         workspace_id: str,
         user_id: str,
         environment: str,
-    ) -> int:
-        """Count uncommitted changes in one user's worktree of an environment."""
+        branch: str,
+    ) -> PendingWork:
+        """Work one member's copy of an environment would lose on release."""
         body = await self._client.get(
-            "/internal/env-control/git/uncommitted-count",
+            "/internal/env-control/git/pending-work",
             params={
                 "tenant_id": tenant_id,
                 "workspace_id": workspace_id,
                 "user_id": user_id,
                 "environment": environment,
+                "branch": branch,
             },
         )
-        return int(body.get("count", 0))
+        return PendingWork(
+            uncommitted=int(body.get("uncommitted", 0)),
+            unpushed=int(body.get("unpushed", 0)),
+        )
 
     async def remove_worktree(
         self,
@@ -358,31 +388,9 @@ class GitBinder:
             detail=str(body.get("detail", "")),
         )
 
-    async def delete_remote_branch(
-        self, *, repo_path: str, branch: str, user_id: str, git_repo_url: str
-    ) -> GitCommandResult:
-        """Delete an environment branch on the remote.
-
-        ``repo_path`` is parsed for tenancy; the runtime re-derives the actual
-        repository, so a stale or absent clone simply fails this member's
-        attempt (the registry tries the next member).
-        """
-        tenant, workspace = _repo_ids(repo_path)
-        body = await self._client.post(
-            "/internal/env-control/git/delete-remote-branch",
-            {
-                "tenant_id": tenant,
-                "workspace_id": workspace,
-                "user_id": user_id,
-                "branch": branch,
-                "git_repo_url": git_repo_url,
-            },
-        )
-        return GitCommandResult(
-            ok=bool(body.get("ok", False)),
-            reason=str(body.get("reason", "")),
-            detail=str(body.get("detail", "")),
-        )
+    # Remote branches are never deleted: the runtime exposes no endpoint for it
+    # and destruction releases local state only. See the runtime binder for the
+    # full argument.
 
     # ---- Convenience for reconciler commit-drift detection ----
 

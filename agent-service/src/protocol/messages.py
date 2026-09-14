@@ -207,7 +207,17 @@ def agent_finish(
     outcome: str = "success",
     summary: str = "",
 ) -> ACPEvent:
-    """Agent 执行完成。"""
+    """Agent 执行完成。
+
+    TERMINAL invariant: this event must only be emitted where no further work
+    follows on the current turn (goal-loop finalizer, cancel, max-turns/budget
+    pause after the auto-resume budget is exhausted, resume failure). The
+    frontend treats it as the one event that releases the composer's busy
+    state — message.complete is NOT usable for that because it is emitted
+    mid-run to seal a streamed text segment. Emitting agent_finish mid-run
+    (e.g. between handoffs) would return the send button to idle while the
+    task is still running.
+    """
     return create_event(EventType.AGENT_FINISH, session_id, {
         "agent_name": agent_name,
         "outcome": outcome,

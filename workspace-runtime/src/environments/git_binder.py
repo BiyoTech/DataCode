@@ -31,6 +31,7 @@ from datacode_common.naming import ENVS_DIR, env_of
 
 from src.git.ops import (
     GitCommandResult,
+    GitMergeOperations,
     GitOperations,
     GitRemoteReason,
     GitWorktreeOperations,
@@ -62,6 +63,29 @@ _TERMINAL_FETCH_REASONS: frozenset[str] = frozenset(
 )
 
 
+# Where a worktree's branch came from. Decided in ``_add_worktree`` — the one
+# place that knows which start point git actually used — and carried to the
+# caller so nobody has to re-derive it from branch presence after the fact.
+BRANCH_SOURCE_REUSED_REMOTE = "reused_remote"
+BRANCH_SOURCE_ADOPTED_LOCAL = "adopted_local"
+BRANCH_SOURCE_CREATED_FROM_BASE = "created_from_base"
+
+
+@dataclass(frozen=True)
+class PendingWork:
+    """Work that would be lost if this working copy were released.
+
+    ``unpushed`` exists because destroying an environment force-deletes the
+    local branch while the remote branch is always preserved: a
+    committed-but-unpushed commit is the only code a destroy can still make
+    disappear. It is REPORTED, never enforced — only ``uncommitted`` gates a
+    destroy, exactly as before.
+    """
+
+    uncommitted: int
+    unpushed: int
+
+
 @dataclass(frozen=True)
 class WorktreeMaterialization:
     """Outcome of materializing one environment worktree for one user."""
@@ -70,6 +94,10 @@ class WorktreeMaterialization:
     branch: str
     commit: str
     created: bool
+    # One of the BRANCH_SOURCE_* constants: which start point backed this
+    # branch. Lets the caller tell the user whether their code came from an
+    # existing line of development or from a freshly branched base.
+    branch_source: str
 
 
 class GitBinder:
@@ -417,7 +445,16 @@ class GitBinder:
         registered = await self._registered_worktree_paths(repo)
         if os.path.realpath(target) in registered and os.path.isdir(target):
             commit = await asyncio.to_thread(GitWorktreeOperations.head_commit, target)
-            return WorktreeMaterialization(target, branch, commit, created=False)
+            # Nothing was materialized, so no start point was chosen. The copy
+            # is simply the one already on disk — reported as adopted-local
+            # rather than inventing a provenance this call never decided.
+            return WorktreeMaterialization(
+                target,
+                branch,
+                commit,
+                created=False,
+                branch_source=BRANCH_SOURCE_ADOPTED_LOCAL,
+            )
 
         # A leftover directory that Git does not know about is disposable
         # residue (interrupted creation, manual copy): clear it so `worktree
@@ -432,7 +469,9 @@ class GitBinder:
             await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
         await asyncio.to_thread(GitWorktreeOperations.worktree_prune, repo)
 
-        result = await self._add_worktree(repo, target, branch, start_branch)
+        result, branch_source = await self._add_worktree(
+            repo, target, branch, start_branch
+        )
         if not result.ok:
             # The reason travels with the error: an "add worktree" failure whose
             # only content is the operation name is the report users could do
@@ -453,21 +492,49 @@ class GitBinder:
             environment=environment,
             branch=branch,
             commit=commit[:8],
+            branch_source=branch_source,
         )
-        return WorktreeMaterialization(target, branch, commit, created=True)
+        return WorktreeMaterialization(
+            target, branch, commit, created=True, branch_source=branch_source
+        )
 
     async def _add_worktree(
         self, repo: str, target: str, branch: str, start_branch: str
-    ) -> GitCommandResult:
-        """Pick the right start point and add the worktree."""
+    ) -> t.Tuple[GitCommandResult, str]:
+        """Pick the right start point, add the worktree, and say which it used.
+
+        The source is decided HERE because this is the only place that knows
+        which of the three start points git actually took; letting callers
+        re-derive it from branch presence afterwards would give a different
+        answer every time the repository changed underneath them.
+        """
         remote_branch = f"{REMOTE_NAME}/{branch}"
-        if GitWorktreeOperations.local_branch_exists(repo, branch):
-            return await asyncio.to_thread(
+        local_exists = GitWorktreeOperations.local_branch_exists(repo, branch)
+        remote_exists = GitWorktreeOperations.remote_branch_exists(
+            repo, branch, REMOTE_NAME
+        )
+
+        if local_exists:
+            # A local branch always wins the checkout (git attaches the
+            # worktree to it), so when a remote branch exists too the two must
+            # be reconciled BEFORE the checkout — otherwise a stale local head
+            # left behind by a previous life of this environment silently
+            # serves old code while the team's work sits on the remote.
+            source = BRANCH_SOURCE_ADOPTED_LOCAL
+            if remote_exists:
+                source = await self._align_local_with_remote(
+                    repo, branch, remote_branch
+                )
+            result = await asyncio.to_thread(
                 GitWorktreeOperations.worktree_add, repo, target, branch
             )
-        if GitWorktreeOperations.remote_branch_exists(repo, branch, REMOTE_NAME):
-            # The environment already exists for the team: track its remote.
-            return await asyncio.to_thread(
+            return result, source
+
+        if remote_exists:
+            # The branch outlived its environment (destroy preserves it) or
+            # belongs to a teammate: either way, track it and continue that
+            # line of development instead of starting a new one.
+            result = await asyncio.to_thread(
                 GitWorktreeOperations.worktree_add,
                 repo,
                 target,
@@ -475,11 +542,19 @@ class GitBinder:
                 remote_branch,
                 True,
             )
+            return result, BRANCH_SOURCE_REUSED_REMOTE
+
         if not start_branch:
-            return GitCommandResult(
-                ok=False,
-                reason=GitRemoteReason.BRANCH_NOT_FOUND,
-                detail=f"branch {branch!r} exists neither locally nor on {REMOTE_NAME}",
+            return (
+                GitCommandResult(
+                    ok=False,
+                    reason=GitRemoteReason.BRANCH_NOT_FOUND,
+                    detail=(
+                        f"branch {branch!r} exists neither locally nor on "
+                        f"{REMOTE_NAME}"
+                    ),
+                ),
+                BRANCH_SOURCE_CREATED_FROM_BASE,
             )
 
         start_point = (
@@ -489,28 +564,97 @@ class GitBinder:
             )
             else start_branch
         )
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             GitWorktreeOperations.worktree_add, repo, target, branch, start_point
         )
+        return result, BRANCH_SOURCE_CREATED_FROM_BASE
 
-    async def uncommitted_change_count(
+    async def _align_local_with_remote(
+        self, repo: str, branch: str, remote_branch: str
+    ) -> str:
+        """Fast-forward a leftover local branch onto the remote, if that is safe.
+
+        Safe means the local tip is an ancestor of the remote tip: every local
+        commit is already published, so moving the ref loses nothing. When the
+        local branch holds commits the remote does not, it is KEPT as-is —
+        those commits exist nowhere else, and overwriting them to look tidy
+        would destroy the very code this whole change set set out to protect.
+        The divergence is reported through the source instead.
+        """
+        local_tip = await asyncio.to_thread(
+            GitWorktreeOperations.head_commit_of, repo, f"refs/heads/{branch}"
+        )
+        remote_tip = await asyncio.to_thread(
+            GitWorktreeOperations.head_commit_of, repo, remote_branch
+        )
+        if local_tip and local_tip == remote_tip:
+            return BRANCH_SOURCE_REUSED_REMOTE
+
+        already_published = await asyncio.to_thread(
+            GitWorktreeOperations.is_ancestor, repo, local_tip, remote_tip
+        )
+        if not already_published:
+            logger.warning(
+                "environment_local_branch_diverged_from_remote",
+                repo=repo,
+                branch=branch,
+                local=local_tip[:8],
+                remote=remote_tip[:8],
+            )
+            return BRANCH_SOURCE_ADOPTED_LOCAL
+
+        moved = await asyncio.to_thread(
+            GitWorktreeOperations.fast_forward_branch, repo, branch, remote_branch
+        )
+        return (
+            BRANCH_SOURCE_REUSED_REMOTE if moved else BRANCH_SOURCE_ADOPTED_LOCAL
+        )
+
+    async def pending_work(
         self,
         *,
         tenant_id: str,
         workspace_id: str,
         user_id: str,
         environment: str,
-    ) -> int:
-        """Count uncommitted changes in one user's worktree of an environment.
+        branch: str,
+    ) -> PendingWork:
+        """Everything one member's working copy would lose on release.
 
-        Worktree removal discards them, so destruction probes this first to
-        give the user a chance to keep their work (design §13).
+        Both halves of the same question ("what disappears if this copy goes
+        away"), so they are answered in ONE probe: destroy needs the first to
+        decide, and the delete dialog needs both to warn.
+
+        A copy that is not materialized here has nothing to lose, hence zeros
+        rather than an error — the caller scans every member and most of them
+        never opened this environment.
         """
         target = self.worktree_path(tenant_id, workspace_id, user_id, environment)
         if not os.path.isdir(target):
-            return 0
+            return PendingWork(uncommitted=0, unpushed=0)
+
         changes = await asyncio.to_thread(GitOperations.list_changes, target)
-        return len(changes)
+        unpushed = await asyncio.to_thread(
+            self._count_unpushed_commits, target, branch
+        )
+        return PendingWork(uncommitted=len(changes), unpushed=unpushed)
+
+    @staticmethod
+    def _count_unpushed_commits(worktree_path: str, branch: str) -> int:
+        """Commits the local branch holds that its tracking ref does not.
+
+        Zero when either ref is missing: a branch never pushed has no tracking
+        ref to compare against, and reporting its whole history as "about to be
+        lost" would turn a routine first-push case into an alarm. Same
+        judgement as the merge preview's un-pushed count.
+        """
+        local = f"refs/heads/{branch}"
+        tracking = f"refs/remotes/{REMOTE_NAME}/{branch}"
+        if not GitWorktreeOperations.ref_exists(worktree_path, local):
+            return 0
+        if not GitWorktreeOperations.ref_exists(worktree_path, tracking):
+            return 0
+        return GitMergeOperations.count_commits(worktree_path, tracking, local)
 
     async def remove_worktree(
         self,
@@ -603,29 +747,14 @@ class GitBinder:
 
         return await push_async(worktree_path, branch, REMOTE_NAME, auth)
 
-    async def delete_remote_branch(
-        self, *, repo_path: str, branch: str, user_id: str, git_repo_url: str
-    ) -> GitCommandResult:
-        """Delete an environment branch on the remote."""
-        self._assert_branch(branch)
-        auth = await self._auth_for(user_id, git_repo_url)
-
-        from src.git.ops import run_git_async
-
-        result = await run_git_async(
-            repo_path, ["push", REMOTE_NAME, "--delete", branch], auth
-        )
-        if result.returncode == 0:
-            logger.info("environment_remote_branch_deleted", branch=branch)
-            return GitCommandResult(ok=True)
-        logger.warning(
-            "environment_remote_branch_delete_failed",
-            branch=branch,
-            stderr=result.stderr,
-        )
-        return GitCommandResult(
-            ok=False, reason=GitRemoteReason.UNKNOWN, detail=result.stderr
-        )
+    # A remote branch is NEVER deleted by the platform. The remote repository
+    # belongs to the user: it may predate the environment, be shared with
+    # tooling outside DataCode, and its branches are the only durable copy of
+    # the code. Destroying an environment therefore releases local state only,
+    # and the surviving `env/*` branch is what lets a same-named environment
+    # pick the line of development back up (see `_add_worktree`). The absence
+    # of any `push --delete` in this repository is the verifiable form of that
+    # promise — do not reintroduce one.
 
     # ---- Internals ----
 

@@ -36,6 +36,20 @@ class ErrorCode(str, Enum):
     DEPLOYMENT_NOT_FOUND = "DEPLOYMENT_NOT_FOUND"
     DEPLOYMENT_INVALID = "DEPLOYMENT_INVALID"
 
+    # Third-party Python dependencies of a working copy. Four codes rather than
+    # one because the user's next action differs for each: fix the declaration's
+    # syntax, accept the platform's version of a package, read pip's output, or
+    # ask an operator for an index.
+    #
+    # DEPS_PLATFORM_CONFLICT is emphatically NOT part of DECLARATION_INVALID: a
+    # declaration pinned away from the platform baseline is perfectly valid TOML,
+    # and reporting it as unreadable sent users hunting for a syntax error that
+    # was never there.
+    DEPS_DECLARATION_INVALID = "DEPS_DECLARATION_INVALID"
+    DEPS_PLATFORM_CONFLICT = "DEPS_PLATFORM_CONFLICT"
+    DEPS_INSTALL_FAILED = "DEPS_INSTALL_FAILED"
+    DEPS_INDEX_NOT_CONFIGURED = "DEPS_INDEX_NOT_CONFIGURED"
+
     # Dagster domain objects.
     GRAPHQL_ERROR = "GRAPHQL_ERROR"
     RUN_NOT_FOUND = "RUN_NOT_FOUND"
@@ -101,6 +115,23 @@ class CodeLocationLoadError(ServiceError):
             message=f"Failed to load code location for workspace: {workspace_path}",
             detail=detail,
             status_code=500,
+        )
+
+
+class ReloadJobNotFoundError(ServiceError):
+    """Raised when a reload job cannot be found for a working copy.
+
+    404 rather than an empty envelope: "this copy has never been reloaded" and
+    "the reload you asked about finished like this" are different answers, and a
+    synthetic "unknown" job would let a client render a progress bar for a job
+    that does not exist.
+    """
+
+    def __init__(self, job_id: str):
+        super().__init__(
+            code=ErrorCode.DEPLOYMENT_NOT_FOUND,
+            message=f"No reload job found: {job_id}",
+            status_code=404,
         )
 
 

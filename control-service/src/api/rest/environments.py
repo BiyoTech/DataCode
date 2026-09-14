@@ -100,8 +100,14 @@ async def create_environment(
     Publishing the branch to the remote requires ``workspace:git:push``; when
     the push fails the environment stays usable for its creator and the response
     reports it through ``status``.
+
+    ``branch_source`` tells the caller where the code came from: an environment
+    recreated under a name whose remote branch still exists RESUMES it
+    (``reused_remote``) instead of branching from the base
+    (``created_from_base``), which is a difference the user must see rather
+    than discover in their files.
     """
-    env = await get_environment_registry().create(
+    created = await get_environment_registry().create(
         workspace_id=workspace_id,
         tenant_id=caller.tenant_id,
         actor_user_id=caller.user_id,
@@ -111,7 +117,10 @@ async def create_environment(
         ttl_hours=req.ttl_hours,
         trigger_type=req.trigger_type,
     )
-    return _serialize(env)
+    return {
+        **_serialize(created.environment),
+        "branch_source": created.branch_source,
+    }
 
 
 @router.get("/environments/{environment_id}")
@@ -167,6 +176,46 @@ async def list_environment_events(
     }
 
 
+@router.get("/environments/{environment_id}/pending-work")
+async def environment_pending_work(
+    environment_id: str,
+    caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_ENV_READ)),
+):
+    """Work that destroying this environment would lose. Read-only pre-flight.
+
+    Called BEFORE the delete confirmation so the user learns about unpushed
+    commits while they can still push them. Deliberately not folded into the
+    DELETE response: a warning that only arrives once the request has been
+    refused is a block, not a hint.
+
+    ``unpushed`` is the count that matters here — the remote branch survives a
+    destroy, so committed-but-unpushed commits are the only code that can
+    still disappear. ``uncommitted`` is returned too because it is what the
+    DELETE will refuse over, letting the dialog explain both outcomes at once.
+    """
+    report = await get_environment_registry().pending_work(
+        environment_id=environment_id,
+        tenant_id=caller.tenant_id,
+        actor_user_id=caller.user_id,
+    )
+    return {
+        "environment_id": report.environment_id,
+        "branch": report.branch,
+        "uncommitted": report.uncommitted,
+        "unpushed": report.unpushed,
+        # Per-member breakdown: the summary drives the dialog, this names who
+        # would lose what when someone has to chase it down.
+        "members": [
+            {
+                "user_id": member.user_id,
+                "uncommitted": member.uncommitted,
+                "unpushed": member.unpushed,
+            }
+            for member in report.members
+        ],
+    }
+
+
 @router.post("/environments/{environment_id}/reconcile")
 async def reconcile_environment(
     environment_id: str,
@@ -200,35 +249,42 @@ async def reconcile_environment(
 @router.delete("/environments/{environment_id}")
 async def destroy_environment(
     environment_id: str,
-    delete_remote_branch: bool = Query(
-        default=True, description="Also delete the environment branch on the remote."
-    ),
     force: bool = Query(
         default=False,
         description="Discard uncommitted changes in the caller's working copy.",
     ),
     caller: CallerContext = Depends(require_permission(PERM_WORKSPACE_ENV_DELETE)),
 ):
-    """Destroy an environment: release Git resources, keep the audit trail.
+    """Destroy an environment: release platform state, keep the audit trail.
 
     Production is rejected: it is the workspace's own line of development.
     Uncommitted changes in the caller's working copy require ``force``.
+
+    The remote Git branch is always preserved — there is no parameter to
+    delete it. It belongs to the user's repository, and keeping it is what
+    lets a later environment of the same name resume this line of work.
     """
     result = await get_environment_registry().destroy(
         environment_id=environment_id,
         tenant_id=caller.tenant_id,
         actor_user_id=caller.user_id,
-        delete_remote_branch=delete_remote_branch,
         force=force,
     )
-    # Honest reporting: a skipped release (no local copy anywhere, a missing
-    # credential) must not masquerade as a full cleanup. ``worktrees_removed``
-    # counts member copies, since an environment is materialized once per member.
+    # Honest reporting: a skipped release (no local copy anywhere, an
+    # unreachable runtime) must not masquerade as a full cleanup.
+    # ``worktrees_removed`` counts member copies, since an environment is
+    # materialized once per member. ``remote_branch_preserved`` is stated
+    # rather than implied: clients must be able to tell the user what survived
+    # without knowing the platform's internal policy.
     return {
         "success": True,
         "environment_id": environment_id,
         "archived": result.archived,
-        "remote_branch_deleted": result.remote_branch_deleted,
+        "branch": result.preserved_branch,
+        "remote_branch_preserved": True,
         "virtual_environment_released": result.virtual_environment_released,
         "worktrees_removed": result.worktrees_removed,
+        # What the destroy really did lose, so the outcome can be reconciled
+        # with the warning the user saw before confirming.
+        "unpushed_commits_discarded": result.unpushed_commits_discarded,
     }

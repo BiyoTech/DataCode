@@ -104,16 +104,24 @@ class FakeProcess:
     difference between "import failed" and "the kernel killed it".
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, log_path: Optional[str] = None) -> None:
         self.name = name
         self.alive = True
         self.exit_status: Optional[int] = None
+        # Where the real process would write the user's own output. Part of the
+        # surface because a failed reload's only actionable content is the tail
+        # of that file.
+        self.log_path = log_path
+        self.output = ""
 
     def is_alive(self) -> bool:
         return self.alive
 
     def exit_code(self) -> Optional[int]:
         return None if self.alive else self.exit_status
+
+    def output_tail(self, max_bytes: int = 8192) -> str:
+        return self.output[-max_bytes:]
 
 
 class FakeProcessManager:
@@ -123,12 +131,16 @@ class FakeProcessManager:
         self.spawned: dict[str, FakeProcess] = {}
         self.commands: dict[str, list[str]] = {}
         self.envs: dict[str, dict] = {}
+        self.log_paths: dict[str, Optional[str]] = {}
         self.stopped: list[str] = []
 
-    def spawn(self, name, command, *, cwd=None, env=None, on_restart=None):
-        self.spawned[name] = FakeProcess(name)
+    def spawn(
+        self, name, command, *, cwd=None, env=None, on_restart=None, log_path=None
+    ):
+        self.spawned[name] = FakeProcess(name, log_path=log_path)
         self.commands[name] = list(command)
         self.envs[name] = dict(env or {})
+        self.log_paths[name] = log_path
         return self.spawned[name]
 
     def stop(self, name: str) -> None:

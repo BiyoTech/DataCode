@@ -44,12 +44,37 @@ asset-dag/
 - **Keep tests in `tests/`, not in `defs/`.** Modules under `defs/` are treated
   as definitions; test modules must stay out of the auto-discovery root.
 
+## Adding a third-party package
+
+Declare it in `pyproject.toml` under `[project].dependencies`, then press
+**Reload** in the asset page (or run `dc deps sync`):
+
+```toml
+[project]
+dependencies = [
+    "polars>=1.0,<2",
+]
+```
+
+The declaration is shared: it travels with this repository and this branch, and
+the platform installs it once for the whole working copy — there is no per-user
+environment. Reload shows the install as it happens and stops with the reason if
+a package cannot be installed; it never starts the code location with the
+packages missing, because your assets would then fail to import.
+
+Two rules worth knowing:
+
+- **`pip install` is refused.** A package installed by hand disappears with the
+  sandbox that ran the command and nothing records why it was there.
+- **Platform packages cannot be overridden.** Asking for a version of `dagster`,
+  `sqlmesh` (or their own dependencies) that the platform does not ship fails the
+  sync with the shipped version named, rather than installing a copy that would
+  shadow the platform's and break the code location.
+
 ## Available packages
 
-This project's `pyproject.toml` is metadata — nothing installs it, and there is
-no per-workspace environment to install into. Your code runs on the
-**dagster-service's** interpreter, shared by every code location on a replica,
-so what you can import is decided by that image:
+These come from the platform image, so they are importable with nothing declared
+(declaring them anyway is fine — the sync recognises them and installs nothing):
 
 | Module you import | Use |
 | --- | --- |
@@ -62,6 +87,9 @@ so what you can import is decided by that image:
 
 The table lists import names: `sklearn` is how you import the `scikit-learn`
 distribution, and `daft` how you import `getdaft`.
+
+`dc deps status` reports what is declared, what is installed and when — the same
+answer the asset page shows next to the Reload button.
 
 Adding a package means adding it to the runtime image, not to this project: it
 belongs in the `[usercode]` extra of `workspace-runtime/pyproject.toml`, which

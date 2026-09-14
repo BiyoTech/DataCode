@@ -17,9 +17,17 @@ promote, or a user-triggered refresh), never because a file was saved.
 
 from fastapi import APIRouter, Query
 
-from src.api.dagster.requests import DeploymentRequest
-from src.api.dagster.responses import DeploymentDiff, DeploymentInfo, OperationResult
+from src.api.dagster.requests import DeploymentRequest, ReloadRequest
+from src.api.dagster.responses import (
+    DeploymentDiff,
+    DeploymentInfo,
+    OperationResult,
+    ReloadJobInfo,
+)
+from src.api.deps import Caller
 from src.codeloc.deployments import DeploymentSpec, get_deployment_manager
+from src.codeloc.errors import ReloadJobNotFoundError
+from src.codeloc.reload_jobs import get_reload_job_store
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,11 +59,76 @@ async def ensure_deployment(req: DeploymentRequest) -> DeploymentInfo:
     return DeploymentInfo(**info.as_dict())
 
 
-@router.post("/reload", response_model=DeploymentInfo)
-async def reload_deployment(req: DeploymentRequest) -> DeploymentInfo:
-    """Re-import a deployment's code after its working copy changed."""
-    info = await get_deployment_manager().reload(_spec(req))
-    return DeploymentInfo(**info.as_dict())
+@router.post("/reload", response_model=ReloadJobInfo, status_code=202)
+async def reload_deployment(req: ReloadRequest, caller: Caller) -> ReloadJobInfo:
+    """Start a reload and return its job envelope immediately.
+
+    A reload installs the working copy's declared Python packages before it starts
+    the code location, so it can take minutes on a first install. Making it a job
+    is what keeps that off the request path: progress arrives on the SSE
+    ``deployment`` topic and the authoritative state is readable from
+    ``/reload/status`` at any time — including after a dropped connection, a page
+    refresh or a runtime restart.
+
+    202, not 200: the work is accepted, not finished. A second request for the
+    same working copy joins the running job (``attached=true``) instead of
+    starting a competing one.
+    """
+    spec = _spec(req)
+    job = await get_deployment_manager().start_reload_job(
+        spec, source=req.source, actor_user_id=caller.user_id
+    )
+    return ReloadJobInfo(**job.to_dict())
+
+
+@router.get("/reload/status", response_model=ReloadJobInfo)
+async def reload_status(
+    workspace_path: str = Query(
+        ...,
+        description=(
+            "Environment working-copy path. REQUIRED: the runtime is a headless "
+            "Service and only the replica holding this copy's lease knows its "
+            "jobs, so the gateway routes on this value."
+        ),
+    ),
+    job_id: str = Query(
+        default="",
+        description="Specific job. Omitted returns the copy's latest reload.",
+    ),
+) -> ReloadJobInfo:
+    """The authoritative state of a reload.
+
+    What a reconnecting tab, a refreshed page or a polling CLI reads. Answers from
+    the working copy's own job records, so a terminal state survives the runtime
+    that produced it.
+    """
+    from src.api.deps import validate_workspace_path
+
+    resolved = validate_workspace_path(workspace_path)
+    job = get_reload_job_store().find(resolved, job_id)
+    if job is None:
+        raise ReloadJobNotFoundError(job_id or "latest")
+    return ReloadJobInfo(**job.to_dict())
+
+
+@router.post("/reload/cancel", response_model=ReloadJobInfo)
+async def cancel_reload(req: DeploymentRequest) -> ReloadJobInfo:
+    """Cancel the reload running for a working copy.
+
+    Marks the job cancelled and stops watching it. The install already in flight
+    is left to finish or fail on its own: killing a pip mid-unpack is how a copy
+    ends up with a tree that matches no fingerprint, and the next reload rebuilds
+    it from scratch anyway.
+    """
+    from src.api.deps import validate_workspace_path
+
+    resolved = validate_workspace_path(req.workspace_path)
+    store = get_reload_job_store()
+    job = store.latest(resolved)
+    if job is None:
+        raise ReloadJobNotFoundError("latest")
+    cancelled = await store.cancel(job.job_id)
+    return ReloadJobInfo(**(cancelled or job).to_dict())
 
 
 @router.get("", response_model=list[DeploymentInfo])

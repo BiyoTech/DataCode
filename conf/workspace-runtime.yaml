@@ -61,6 +61,53 @@ task:
   # Empty resolves to ~/.datacode/sandbox.
   sandbox_tool_root: ""
 
+# Third-party Python packages a working copy declares in
+# `asset-dag/pyproject.toml`. Installed into `.datacode/deps/site-packages` by a
+# `deps.sync` task and prepended to PYTHONPATH by the code location and by every
+# sandbox that runs the user's code.
+deps:
+  # The index installs may reach. PLATFORM configuration on purpose: the rest of
+  # a sandbox's egress allow-list is DERIVED from the working copy, and an index
+  # named by a file in the repository would be a way to widen that allow-list
+  # from inside the code under review.
+  #
+  # Empty means dependency installation is unavailable and says so when asked,
+  # rather than quietly reaching for the public index. The value shipped here is
+  # a deliberate PLATFORM choice, reviewable in this file; an air-gapped
+  # deployment replaces it with its mirror in its own profile. A URL carrying
+  # credentials is refused: the task spec is written to audit records and, on
+  # Kubernetes, to a ConfigMap.
+  index_url: "https://pypi.org/simple"
+  extra_index_urls: ""
+  # Hosts pip may use over plain HTTP, for an internal mirror without a
+  # publicly-trusted certificate. Comma-separated.
+  trusted_hosts: ""
+  # Ceiling for one copy's overlay tree. The target is the user's own volume and
+  # a transitive GPU stack is tens of gigabytes, so without a cap one
+  # declaration can fill the copy and take its lease down with it.
+  max_bytes: 2147483648            # 2 GiB
+  # Budget for one install, below the profile's own timeout so the runner
+  # reports a classified failure instead of being killed by the vehicle.
+  install_timeout_seconds: 840
+  # Pinning the whole baseline would give each of its several hundred packages a
+  # veto over every declaration, and the cost of being overridden is not the
+  # same for all of them: replacing the platform's `numpy` breaks the platform
+  # at ABI level, replacing its `tenacity` changes behaviour only inside the one
+  # working copy that asked for it. So a failed resolution releases the pins pip
+  # itself implicated, IF all of them are yieldable, and retries once. What
+  # yielded is recorded in the copy's manifest and shown in the UI.
+  #
+  # The yieldable set is derived, not listed: everything in the baseline that
+  # ships no compiled extension, minus the platform's own runtime (dagster,
+  # sqlmesh, pydantic, grpcio, ...). These two keys adjust that derivation.
+  #
+  # Never yieldable, on top of the derived rules. Comma-separated.
+  protected_packages: ""
+  # Yieldable even though the rules above withhold it — applied last, so it
+  # wins. Comma-separated. This is the key a failed install names when the pin
+  # in the way is one only an operator can release.
+  relaxable_packages: ""
+
 error_archive:
   enabled: true
   retention: 100

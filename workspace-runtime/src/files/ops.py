@@ -133,6 +133,37 @@ def write_file(workspace_path: str, relative_path: str, content: str) -> str:
     return full_path
 
 
+def write_bytes(workspace_path: str, relative_path: str, data: bytes) -> str:
+    """Write raw bytes to a file (create or overwrite).
+
+    The upload counterpart of :func:`write_file`. Bytes rather than text because
+    the explorer's upload accepts anything (images, archives, spreadsheets), and
+    a text-mode write would either crash on the decode or silently corrupt the
+    content through a lossy round-trip.
+
+    Auto-creates parent directories, under the same traversal guard as
+    :func:`write_file`.
+
+    Returns:
+        Absolute path of the written file.
+    """
+    full_path = _safe_path(workspace_path, relative_path)
+    if not full_path:
+        raise ValueError(f"Invalid path: {relative_path}")
+
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    with open(full_path, "wb") as f:
+        f.write(data)
+
+    logger.info(
+        "file_written",
+        workspace=workspace_path,
+        path=relative_path,
+        size=len(data),
+    )
+    return full_path
+
+
 def delete_path(workspace_path: str, relative_path: str) -> bool:
     """Delete a file, symlink or directory from the workspace.
 

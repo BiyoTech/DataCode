@@ -12,6 +12,7 @@ from src.api.schemas import (
 )
 from src.config import settings
 from src.context.session import session_manager
+from src.runtime.active_runs import active_chat_runs, is_chat_running_remotely
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -96,7 +97,27 @@ async def get_session(session_id: str):
         "last_message_at": session.last_message_at.isoformat() if session.last_message_at else None,
         "messages": messages,
         "timeline_events": timeline_events,
+        # Whether a chat run is in flight ANYWHERE (this replica's task dict ∪
+        # the cross-replica registry). The frontend needs this to restore its
+        # busy state on load/reconnect: the event stream alone cannot answer
+        # "did I miss the agent.start?", because message.complete is emitted
+        # mid-run (it seals one text segment, it does not end the run).
+        "is_running": await _is_run_in_flight(session.session_id),
     }
+
+
+async def _is_run_in_flight(session_id: str) -> bool:
+    """Whether a chat run for this session exists on any replica.
+
+    The local dict answers ownership (only a live task counts — a stale entry
+    whose task finished is not a run); the registry answers existence across
+    replicas, including this replica's own registration while the task lives.
+    """
+    run_info = active_chat_runs.get(session_id)
+    task = run_info.get("task") if run_info else None
+    if task is not None and not task.done():
+        return True
+    return await is_chat_running_remotely(session_id)
 
 
 @router.patch("/sessions/{session_id}")

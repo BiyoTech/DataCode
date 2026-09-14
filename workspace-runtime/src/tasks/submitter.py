@@ -32,6 +32,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+from datacode_common.egress import EgressDestination
 from datacode_common.egress_grant import (
     EgressGrant,
     EgressGrantStore,
@@ -42,6 +43,7 @@ from datacode_common.isolation import (
     IsolationProfile,
     NoIsolationAvailable,
 )
+from datacode_common.python_deps import TASK_KIND_DEPS_SYNC
 from datacode_common.task_protocol import (
     ERR_SUBMIT_FAILED,
     TaskProtocolError,
@@ -59,7 +61,11 @@ from src.tasks.credentials import (
     SandboxCredentials,
     build_sandbox_credentials,
 )
-from src.tasks.egress import resolve_working_copy_egress
+from src.tasks.egress import (
+    PackageIndexNotConfigured,
+    package_index_destinations,
+    resolve_working_copy_egress,
+)
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -347,15 +353,13 @@ class TaskSubmitter:
             )
             return None
 
-        discovered = await resolve_working_copy_egress(
-            spec.workspace_path, gateway=spec.gateway
-        )
+        destinations = await self._destinations_for(spec)
         grant = EgressGrant(
             task_id=spec.task_id,
             tenant_id=spec.tenant_id,
             workspace_id=spec.workspace_id,
             isolation_profile=profile.name,
-            destinations=discovered.destinations,
+            destinations=destinations,
             # The profile's ranges travel with the grant: the proxy has no way to
             # know which profile applied, so without this they would be declared
             # and never enforced.
@@ -386,6 +390,36 @@ class TaskSubmitter:
         except CredentialPolicyError as exc:
             await self._grants.revoke(spec.task_id)
             raise TaskSubmissionError(str(exc)) from exc
+
+    @staticmethod
+    async def _destinations_for(spec: TaskSpec) -> tuple[EgressDestination, ...]:
+        """Resolve the allow-list for one task, by provenance of its kind.
+
+        Two provenances, and they must not be mixed:
+
+        * derived from the WORKING COPY (warehouse gateways, Git remote) for
+          everything the user's project declares. Deriving keeps the list
+          exactly as wide as the project needs;
+        * taken from PLATFORM configuration for the package index, because a
+          file inside the repository must not be able to choose where the
+          sandbox connects.
+
+        Raises:
+            TaskSubmissionError: An install was requested on a deployment with
+                no configured index. Refused here rather than launched, so the
+                user sees "no index is configured" instead of a download that
+                is denied by the proxy for reasons they cannot see.
+        """
+        if spec.kind == TASK_KIND_DEPS_SYNC:
+            try:
+                return package_index_destinations()
+            except PackageIndexNotConfigured as exc:
+                raise TaskSubmissionError(str(exc)) from exc
+
+        discovered = await resolve_working_copy_egress(
+            spec.workspace_path, gateway=spec.gateway
+        )
+        return discovered.destinations
 
     # ── internals ──────────────────────────────────────────────────────
 

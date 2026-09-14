@@ -123,6 +123,14 @@ class ManagedProcess:
     # Whether the supervisor may respawn this process when it dies.
     autorestart: bool = True
     on_restart: Optional[RestartHook] = None
+    # Where stdout and stderr go. Unset means "inherit this service's", which is
+    # right for the Dagster daemon and webserver (their output belongs in the
+    # platform's own log stream). A code location is different: what it prints is
+    # the USER's code, and the traceback of a failed import is the only
+    # explanation a failed reload has. Redirecting it to a file inside the
+    # working copy puts that explanation where both the UI and the agent can read
+    # it, instead of interleaved into the service's stdout.
+    log_path: Optional[str] = None
     _process: Optional[subprocess.Popen] = None
     _started_at: Optional[float] = None
     # Timestamps of supervisor-driven restarts, trimmed to the current window.
@@ -135,6 +143,7 @@ class ManagedProcess:
         """Spawn the subprocess. Inherits the parent env plus ``self.env``."""
         merged_env = {**os.environ, **self.env}
         logger.info("dagster_process_starting", name=self.name, command=" ".join(self.command))
+        sink = self._open_log_sink()
         try:
             # start_new_session=True puts the child in its own process group so
             # we can signal the whole group and avoid orphaned grandchildren.
@@ -143,6 +152,8 @@ class ManagedProcess:
                 env=merged_env,
                 cwd=self.cwd,
                 start_new_session=True,
+                stdout=sink,
+                stderr=subprocess.STDOUT if sink is not None else None,
             )
         except FileNotFoundError as e:
             # The executable itself is missing. Named separately from other
@@ -159,7 +170,55 @@ class ManagedProcess:
             ) from e
         except (OSError, ValueError) as e:
             raise ProcessStartError(self.name, detail=str(e)) from e
+        finally:
+            if sink is not None:
+                # The child holds its own duplicate of the descriptor; keeping
+                # this one open would leak one per restart.
+                sink.close()
         self._started_at = time.time()
+
+    def _open_log_sink(self):
+        """Open :attr:`log_path` for the child, or return ``None``.
+
+        Truncated per start: this file is the transcript of THE CURRENT process,
+        which is what makes "the reload failed, here is why" unambiguous. History
+        would mean parsing out where the last attempt began.
+
+        A path that cannot be opened degrades to inherited output rather than
+        failing the start — losing the transcript costs diagnostics, while
+        refusing to start costs the user their code location.
+        """
+        if not self.log_path:
+            return None
+        try:
+            Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+            return open(self.log_path, "wb")  # noqa: SIM115 — handed to Popen
+        except OSError as exc:
+            logger.warning(
+                "dagster_process_log_unavailable",
+                name=self.name,
+                path=self.log_path,
+                error=str(exc),
+            )
+            return None
+
+    def output_tail(self, max_bytes: int = 8192) -> str:
+        """End of this process's transcript, or ``""`` when there is none.
+
+        The tail rather than the head: a Python traceback ends with the line that
+        actually failed, and an import error in a user's asset is the last thing
+        the process writes before exiting.
+        """
+        if not self.log_path:
+            return ""
+        try:
+            with open(self.log_path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - max_bytes))
+                return handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
 
     def is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
@@ -253,12 +312,17 @@ class DagsterProcessManager:
         env: Optional[dict[str, str]] = None,
         autorestart: bool = True,
         on_restart: Optional[RestartHook] = None,
+        log_path: Optional[str] = None,
     ) -> ManagedProcess:
         """Spawn (or replace) a named process and track it in the registry.
 
         An explicit spawn also clears the restart budget: the caller is acting on
         new information (fresh code, a fixed config), so the previous crash loop
         must not keep the process abandoned.
+
+        Args:
+            log_path: Redirect stdout/stderr to this file. See
+                :attr:`ManagedProcess.log_path`.
         """
         if name in self._processes and self._processes[name].is_alive():
             self.stop(name)
@@ -269,6 +333,7 @@ class DagsterProcessManager:
             cwd=cwd,
             autorestart=autorestart,
             on_restart=on_restart,
+            log_path=log_path,
         )
         proc.start()
         self._processes[name] = proc

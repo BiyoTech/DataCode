@@ -18,19 +18,22 @@ not depend on roles.
 
 from __future__ import annotations
 
-import os
 import time
 import typing as t
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from datacode_common import naming
-from datacode_common import workspace_paths as ws_paths
 
 from src.config import settings
 from src.core.env_locks import environment_lock_by_key
 from src.environments.deployment_binder import get_deployment_binder
-from src.environments.git_binder import GitBinder
+from src.environments.git_binder import (
+    BRANCH_SOURCE_ADOPTED_LOCAL,
+    BRANCH_SOURCE_REUSED_REMOTE,
+    GitBinder,
+    PendingWork,
+)
 from src.environments.models import EnvironmentModel
 from src.environments.repository import EnvironmentRepository
 from src.environments.sqlmesh_binder import get_sqlmesh_binder
@@ -104,6 +107,19 @@ class EnvironmentView:
 
 
 @dataclass(frozen=True)
+class CreatedEnvironment:
+    """An environment plus the one fact that is true only of its creation.
+
+    ``branch_source`` describes what THIS call did, not what the row is, so it
+    is deliberately kept out of ``EnvironmentView``: a list endpoint replaying
+    it later would be reporting a stale decision as current state.
+    """
+
+    environment: EnvironmentView
+    branch_source: str
+
+
+@dataclass(frozen=True)
 class OpenedEnvironment:
     """Result of materializing one environment working copy for one user."""
 
@@ -116,15 +132,44 @@ class OpenedEnvironment:
 
 
 @dataclass(frozen=True)
+class MemberPendingWork:
+    """One member's share of the work a destroy would lose."""
+
+    user_id: str
+    uncommitted: int
+    unpushed: int
+
+
+@dataclass(frozen=True)
+class PendingWorkReport:
+    """Pre-flight answer for the delete dialog.
+
+    Read-only and lock-free by design: it is consulted BEFORE the user
+    confirms, so it must never queue behind an apply, and it is never a
+    precondition of ``destroy`` — a failed probe degrades the dialog's warning,
+    it does not block the deletion.
+    """
+
+    environment_id: str
+    branch: str
+    uncommitted: int
+    unpushed: int
+    members: t.Tuple[MemberPendingWork, ...]
+
+
+@dataclass(frozen=True)
 class ReleasedResources:
     """What a release actually managed to free.
 
     A skipped release (no local copy anywhere, a missing credential) must not
     masquerade as a full cleanup, so every resource reports its own outcome and
     the caller learns exactly what the reconciler still has to finish.
+
+    The remote branch is deliberately absent: the platform never deletes it, so
+    reporting an outcome for it would describe an operation that no longer
+    exists.
     """
 
-    remote_branch_deleted: bool
     virtual_environment_released: bool
     # Number of member working copies released. An environment is held by one
     # worktree PER MEMBER, so this is the honest measure of the local cleanup.
@@ -139,6 +184,12 @@ class DestroyResult(ReleasedResources):
     """Outcome of a destroy: the resources freed plus the lifecycle transition."""
 
     archived: bool = False
+    # The branch that was KEPT. Named so a client can tell the user what
+    # survived (and what to reuse) without having to know the platform policy.
+    preserved_branch: str = ""
+    # Commits that existed only in a working copy and are now gone. Reported,
+    # never a reason to refuse — the user was warned before confirming.
+    unpushed_commits_discarded: int = 0
 
 
 class EnvironmentRegistry:
@@ -272,12 +323,18 @@ class EnvironmentRegistry:
         base_env: str = "",
         ttl_hours: int = 0,
         trigger_type: str = "human",
-    ) -> EnvironmentView:
+    ) -> CreatedEnvironment:
         """Create an environment: registry row, Git branch and worktree.
 
         Order matters: the row is inserted as ``creating`` before any Git write,
         so a crash in the middle is visible and retryable instead of leaving an
         orphan branch nobody accounts for.
+
+        An environment whose branch still exists on the remote — because a
+        previous environment of this name was destroyed, or a teammate pushed
+        it — RESUMES that branch instead of re-cutting one from the base. The
+        outcome is reported through ``branch_source`` so the caller can tell
+        the user which of the two happened.
 
         Serialized by the environment lock, like apply and promote (design
         §6.3): without it a concurrent ``destroy`` could release the branch and
@@ -328,7 +385,7 @@ class EnvironmentRegistry:
         production_name: str,
         ttl_hours: int,
         trigger_type: str,
-    ) -> EnvironmentView:
+    ) -> CreatedEnvironment:
         """Run the creation orchestration; the caller holds the environment lock."""
         started = time.monotonic()
         workspace_id = workspace.id
@@ -405,12 +462,18 @@ class EnvironmentRegistry:
                 branch=model.branch,
                 start_branch=base.branch,
             )
-            published = await self._publish_branch(
-                workspace=workspace,
-                worktree_path=materialization.workspace_path,
-                branch=model.branch,
-                user_id=actor_user_id,
-            )
+            if materialization.branch_source == BRANCH_SOURCE_REUSED_REMOTE:
+                # Already on the remote — that is where this worktree came
+                # from. Pushing would be a round trip to tell the remote what
+                # it just told us.
+                published = True
+            else:
+                published = await self._publish_branch(
+                    workspace=workspace,
+                    worktree_path=materialization.workspace_path,
+                    branch=model.branch,
+                    user_id=actor_user_id,
+                )
         except Exception as exc:
             await self._repo.update_status(
                 environment_id,
@@ -487,6 +550,7 @@ class EnvironmentRegistry:
                 "base_env": base.name,
                 "branch": model.branch,
                 "branch_published": published,
+                "branch_source": materialization.branch_source,
                 "initial_status": status,
             },
             duration_ms=_elapsed_ms(started),
@@ -499,8 +563,28 @@ class EnvironmentRegistry:
             base_env=base.name,
             branch=model.branch,
             branch_published=published,
+            branch_source=materialization.branch_source,
             initial_status=status,
         )
+        if materialization.branch_source == BRANCH_SOURCE_REUSED_REMOTE:
+            # The user gets their previous code back rather than a fresh copy
+            # of the base. Worth its own line: "created" alone would hide the
+            # single most surprising thing about this environment.
+            logger.info(
+                "environment_branch_reused",
+                workspace_id=workspace_id,
+                environment=name,
+                branch=model.branch,
+                commit=materialization.commit[:8],
+            )
+        elif materialization.branch_source == BRANCH_SOURCE_ADOPTED_LOCAL:
+            logger.warning(
+                "environment_branch_adopted_local",
+                workspace_id=workspace_id,
+                environment=name,
+                branch=model.branch,
+                commit=materialization.commit[:8],
+            )
 
         # The virtual environment is a zero-cost pointer switch, but it needs the
         # warehouse to be reachable. A failure here is drift, not a lost
@@ -569,7 +653,10 @@ class EnvironmentRegistry:
         # recycled-row path the model was never inserted, so its server-side
         # defaults (created_at / updated_at) would still be unset.
         persisted = await self._repo.get(environment_id, tenant_id)
-        return _to_view(persisted) if persisted is not None else _to_view(model)
+        return CreatedEnvironment(
+            environment=_to_view(persisted if persisted is not None else model),
+            branch_source=materialization.branch_source,
+        )
 
     # ---- Working copies ----
 
@@ -711,17 +798,63 @@ class EnvironmentRegistry:
 
     # ---- Destruction ----
 
+    async def pending_work(
+        self,
+        *,
+        environment_id: str,
+        tenant_id: str,
+        actor_user_id: str,
+    ) -> PendingWorkReport:
+        """What destroying this environment would lose, without destroying it.
+
+        Exists so the warning reaches the user while they can still act on it:
+        answering "you have N unpushed commits" inside a destroy's error
+        response would mean the request had already been refused, which is the
+        shape of a block, not of a hint.
+
+        Takes NO environment lock. It reads working copies that a concurrent
+        apply may be writing, so its counts are a snapshot, not a guarantee —
+        and that is the right trade: a dialog must never wait behind a
+        backfill, and ``destroy`` re-probes under the lock anyway.
+        """
+        model = await self._require_environment(environment_id, tenant_id)
+        members = await self._members_for_release(
+            tenant_id=tenant_id,
+            workspace_id=model.workspace_id,
+            actor_user_id=actor_user_id,
+        )
+        pending = await self._collect_pending_work(
+            tenant_id=tenant_id,
+            workspace_id=model.workspace_id,
+            environment=model.name,
+            branch=model.branch,
+            members=members,
+        )
+        return PendingWorkReport(
+            environment_id=environment_id,
+            branch=model.branch,
+            uncommitted=sum(work.uncommitted for work in pending.values()),
+            unpushed=sum(work.unpushed for work in pending.values()),
+            members=tuple(
+                MemberPendingWork(
+                    user_id=member,
+                    uncommitted=work.uncommitted,
+                    unpushed=work.unpushed,
+                )
+                for member, work in sorted(pending.items())
+            ),
+        )
+
     async def destroy(
         self,
         *,
         environment_id: str,
         tenant_id: str,
         actor_user_id: str,
-        delete_remote_branch: bool = True,
         force: bool = False,
         trigger_type: str = "human",
     ) -> DestroyResult:
-        """Archive an environment and release its resources.
+        """Archive an environment and release the state the PLATFORM owns.
 
         Serialized by the environment lock exactly like apply and promote
         (design §6.3): destroying mid-apply would rip the worktree out from
@@ -730,9 +863,13 @@ class EnvironmentRegistry:
 
         Releases EVERY member's copy, not just the caller's: an environment is
         materialized once per member, so a partial cleanup would leave others
-        holding a worktree and a local branch of an environment that no longer
-        exists — and one ``git push`` from any of them would recreate the remote
-        branch the registry has just retired.
+        holding a worktree of an environment that no longer exists.
+
+        What is NOT released: the remote branch. The remote repository belongs
+        to the user — it may predate the workspace, be shared with tooling
+        outside DataCode, and hold the only durable copy of the code. It is
+        also what lets a same-named environment resume this line of
+        development later (``_add_worktree`` tracks it).
 
         Uncommitted changes in ANY member's copy are preserved by an explicit
         confirmation unless ``force`` is set, because worktree removal discards
@@ -754,14 +891,15 @@ class EnvironmentRegistry:
         if model.status == naming.STATUS_ARCHIVED:
             return DestroyResult(
                 archived=False,
-                remote_branch_deleted=False,
                 virtual_environment_released=False,
                 worktrees_removed=0,
                 deployment_destroyed=False,
+                preserved_branch=model.branch,
             )
 
-        workspace = await self._require_workspace(model.workspace_id, tenant_id)
-
+        # No workspace lookup: the environment row is already tenant-scoped by
+        # ``_require_environment``, and nothing released below is addressed by
+        # the remote URL anymore.
         async with environment_lock_by_key(
             model.workspace_id, model.name, operation="destroy"
         ):
@@ -773,25 +911,30 @@ class EnvironmentRegistry:
                 actor_user_id=actor_user_id,
             )
 
+            # Probed even under ``force``: the counts are what makes the audit
+            # trail able to answer "how much did that reclaim actually throw
+            # away", and force only removes the refusal, not the record.
+            pending = await self._collect_pending_work(
+                tenant_id=tenant_id,
+                workspace_id=model.workspace_id,
+                environment=model.name,
+                branch=model.branch,
+                members=members,
+            )
             if not force:
-                await self._assert_no_uncommitted_work(
-                    tenant_id=tenant_id,
-                    workspace_id=model.workspace_id,
-                    environment=model.name,
-                    members=members,
+                self._assert_no_uncommitted_work(
+                    pending, model.name, model.workspace_id
                 )
+            unpushed_discarded = sum(work.unpushed for work in pending.values())
 
             await self._repo.update_status(environment_id, naming.STATUS_ARCHIVING)
 
             released = await self._release_all_resources(
                 model=model,
-                workspace=workspace,
                 members=members,
-                delete_remote_branch=delete_remote_branch,
             )
             virtual_env_released = released.virtual_environment_released
             worktrees_removed = released.worktrees_removed
-            remote_deleted = released.remote_branch_deleted
             deployment_destroyed = released.deployment_destroyed
 
             await self._repo.update_status(environment_id, naming.STATUS_ARCHIVED)
@@ -801,11 +944,12 @@ class EnvironmentRegistry:
                 actor_user_id=actor_user_id,
                 trigger_type=trigger_type,
                 detail={
-                    "remote_branch_deleted": remote_deleted,
+                    "remote_branch_preserved": model.branch,
                     "virtual_environment_released": virtual_env_released,
                     "worktrees_removed": worktrees_removed,
                     "deployment_destroyed": deployment_destroyed,
                     "members_scanned": len(members),
+                    "unpushed_commits_discarded": unpushed_discarded,
                     "forced": force,
                 },
                 duration_ms=_elapsed_ms(started),
@@ -814,18 +958,37 @@ class EnvironmentRegistry:
                 "environment_destroyed",
                 environment_id=environment_id,
                 actor_user_id=actor_user_id,
-                remote_branch_deleted=remote_deleted,
                 virtual_environment_released=virtual_env_released,
                 worktrees_removed=worktrees_removed,
                 deployment_destroyed=deployment_destroyed,
                 members_scanned=len(members),
             )
+            # Stated explicitly rather than left to be inferred from the
+            # absence of a deletion: operators reading the log must be able to
+            # see that the branch survives this destroy on purpose.
+            logger.info(
+                "environment_remote_branch_preserved",
+                environment_id=environment_id,
+                branch=model.branch,
+            )
+            if unpushed_discarded:
+                # The one piece of code this destroy really did lose. Warned
+                # rather than refused (the user was told before confirming),
+                # but never left unrecorded.
+                logger.warning(
+                    "environment_unpushed_commits_discarded",
+                    environment_id=environment_id,
+                    branch=model.branch,
+                    commits=unpushed_discarded,
+                    members=sorted(pending),
+                )
             return DestroyResult(
                 archived=True,
-                remote_branch_deleted=remote_deleted,
                 virtual_environment_released=virtual_env_released,
                 worktrees_removed=worktrees_removed,
                 deployment_destroyed=deployment_destroyed,
+                preserved_branch=model.branch,
+                unpushed_commits_discarded=unpushed_discarded,
             )
 
     async def release_all_for_workspace(
@@ -844,9 +1007,9 @@ class EnvironmentRegistry:
           already confirmed the deletion of the whole workspace; asking again per
           environment would be a second dialog for the same decision.
 
-        ``delete_remote_branch`` is False throughout: the remote repository is
-        never modified by a workspace deletion, and its branches are part of it.
-        The local rows are removed by the caller afterwards.
+        The remote repository is untouched, as it is by every other release
+        path: its branches belong to the user, not to the workspace row. The
+        local rows are removed by the caller afterwards.
 
         Every environment is released independently: one unreachable resource
         must not strand the rest, and what fails here is picked up by the
@@ -858,7 +1021,6 @@ class EnvironmentRegistry:
             workspace_id, include_archived=True
         ):
             try:
-                workspace = await self._require_workspace(model.workspace_id, tenant_id)
                 members = await self._members_for_release(
                     tenant_id=tenant_id,
                     workspace_id=model.workspace_id,
@@ -866,9 +1028,7 @@ class EnvironmentRegistry:
                 )
                 await self._release_all_resources(
                     model=model,
-                    workspace=workspace,
                     members=members,
-                    delete_remote_branch=False,
                 )
                 released_environments += 1
             except Exception as exc:  # noqa: BLE001 - never block the deletion
@@ -973,11 +1133,15 @@ class EnvironmentRegistry:
     ) -> ReleasedResources:
         """Release resources still held by an ARCHIVED environment.
 
-        ``destroy`` reports honestly what it could not finish — a remote branch
-        whose deletion was refused, a virtual environment nobody had a working
-        copy for, a member copy that failed to unmount. This is the operation
-        that finishes the job later, and it is what the reconciler calls when it
-        finds an archived row still backed by live resources.
+        ``destroy`` reports honestly what it could not finish — a virtual
+        environment nobody had a working copy for, a member copy that failed to
+        unmount, a deployment the runtime refused to stop. This is the
+        operation that finishes the job later, and it is what the reconciler
+        calls when it finds an archived row still backed by live resources.
+
+        The remote branch is not part of that job: it is preserved by design,
+        so an archived row whose branch still exists is in its EXPECTED state,
+        not an unfinished cleanup.
 
         Refuses anything that is NOT archived: releasing the resources of a live
         environment is ``destroy``, which additionally protects uncommitted work
@@ -990,7 +1154,6 @@ class EnvironmentRegistry:
                 "use destroy to release a live environment"
             )
 
-        workspace = await self._require_workspace(model.workspace_id, tenant_id)
         async with environment_lock_by_key(
             model.workspace_id, model.name, operation="release"
         ):
@@ -1001,16 +1164,13 @@ class EnvironmentRegistry:
             )
             released = await self._release_all_resources(
                 model=model,
-                workspace=workspace,
                 members=members,
-                delete_remote_branch=True,
             )
 
         logger.info(
             "environment_archived_resources_released",
             environment_id=environment_id,
             worktrees_removed=released.worktrees_removed,
-            remote_branch_deleted=released.remote_branch_deleted,
             virtual_environment_released=released.virtual_environment_released,
             deployment_destroyed=released.deployment_destroyed,
         )
@@ -1020,9 +1180,7 @@ class EnvironmentRegistry:
         self,
         *,
         model: EnvironmentModel,
-        workspace: WorkspaceModel,
         members: t.Sequence[str],
-        delete_remote_branch: bool,
     ) -> ReleasedResources:
         """Release every resource backing an environment, in dependency order.
 
@@ -1032,6 +1190,10 @@ class EnvironmentRegistry:
         would be rebuilt FROM a working copy, and its teardown needs nothing
         but the frozen name. Shared by ``destroy`` and by the later cleanup of
         an archived environment, so both can never diverge.
+
+        Takes no workspace: every resource released here is addressed by the
+        environment row alone. The remote URL used to be needed for the branch
+        deletion, which no longer exists (see ``destroy``).
         """
         virtual_env_released = await self._release_virtual_environment(
             tenant_id=model.tenant_id,
@@ -1045,19 +1207,9 @@ class EnvironmentRegistry:
             branch=model.branch,
             members=members,
         )
-        remote_deleted = False
-        if delete_remote_branch and workspace.git_repo_url:
-            remote_deleted = await self._delete_remote_branch(
-                tenant_id=model.tenant_id,
-                workspace_id=model.workspace_id,
-                branch=model.branch,
-                git_repo_url=workspace.git_repo_url,
-                members=members,
-            )
         deployment_destroyed = await self._release_deployment(model)
 
         return ReleasedResources(
-            remote_branch_deleted=remote_deleted,
             virtual_environment_released=virtual_env_released,
             worktrees_removed=worktrees_removed,
             deployment_destroyed=deployment_destroyed,
@@ -1095,31 +1247,52 @@ class EnvironmentRegistry:
         ordered.extend(member for member in members if member != actor_user_id)
         return ordered
 
-    async def _assert_no_uncommitted_work(
+    async def _collect_pending_work(
         self,
         *,
         tenant_id: str,
         workspace_id: str,
         environment: str,
+        branch: str,
         members: t.Sequence[str],
-    ) -> None:
-        """Refuse to discard work that only exists in a working copy.
+    ) -> t.Dict[str, PendingWork]:
+        """Probe every member's copy for work a release would destroy.
 
-        Checks EVERY member: destroying an environment removes their worktrees
-        too, so another member's uncommitted work is exactly as unrecoverable as
-        the caller's own (design §13).
+        EVERY member, because destroying an environment removes their worktrees
+        too: another member's uncommitted work is exactly as unrecoverable as
+        the caller's own (design §13). Members with nothing pending are left
+        out, so the result reads as "who would lose something".
         """
-        dirty: t.Dict[str, int] = {}
+        pending: t.Dict[str, PendingWork] = {}
         for member in members:
-            count = await self._git.uncommitted_change_count(
+            work = await self._git.pending_work(
                 tenant_id=tenant_id,
                 workspace_id=workspace_id,
                 user_id=member,
                 environment=environment,
+                branch=branch,
             )
-            if count:
-                dirty[member] = count
+            if work.uncommitted or work.unpushed:
+                pending[member] = work
+        return pending
 
+    @staticmethod
+    def _assert_no_uncommitted_work(
+        pending: t.Mapping[str, PendingWork], environment: str, workspace_id: str
+    ) -> None:
+        """Refuse to discard changes that were never committed.
+
+        Only UNCOMMITTED work gates a destroy. Unpushed commits are reported to
+        the user before they confirm (the delete dialog reads the same probe)
+        but never block: the platform would otherwise refuse every environment
+        whose owner simply has not pushed yet, and the TTL reaper — which must
+        always be able to reclaim — would be the first victim.
+        """
+        dirty = {
+            member: work.uncommitted
+            for member, work in pending.items()
+            if work.uncommitted
+        }
         if not dirty:
             return
 
@@ -1151,10 +1324,10 @@ class EnvironmentRegistry:
         ``False``) rather than silently reported as done.
         """
         released = await self._sqlmesh.invalidate_virtual_environment(
-            # A well-formed working-copy path is all the binder needs to
-            # address the runtime endpoint; the runtime scans the members for
-            # a usable copy itself.
-            workspace_path=_any_worktree_path(tenant_id, workspace_id, environment),
+            # Tenant and workspace are all the runtime needs: it scans the
+            # members for a usable working copy itself.
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
             environment=environment,
         )
         if not released:
@@ -1206,44 +1379,6 @@ class EnvironmentRegistry:
                     error=str(exc),
                 )
         return removed
-
-    async def _delete_remote_branch(
-        self,
-        *,
-        tenant_id: str,
-        workspace_id: str,
-        branch: str,
-        git_repo_url: str,
-        members: t.Sequence[str],
-    ) -> bool:
-        """Delete the environment branch on the remote, via any usable clone.
-
-        Tries each member's repository in turn: the actor may never have
-        materialized this workspace (its repository would not exist) and any
-        given member may lack a credential for the remote, but the branch must
-        disappear — while it exists, the environment can be re-adopted or
-        re-pushed behind the registry's back.
-        """
-        for member in members:
-            # A synthetic repo path just carries tenancy over the wire; the
-            # runtime re-derives the actual clone for this member.
-            repo = self._git.repo_path(tenant_id, workspace_id, member)
-            result = await self._git.delete_remote_branch(
-                repo_path=repo,
-                branch=branch,
-                user_id=member,
-                git_repo_url=git_repo_url,
-            )
-            if result.ok:
-                return True
-
-        logger.warning(
-            "environment_remote_branch_delete_unresolved",
-            workspace_id=workspace_id,
-            branch=branch,
-            members_scanned=len(members),
-        )
-        return False
 
     async def _publish_branch(
         self,
@@ -1298,23 +1433,6 @@ class EnvironmentRegistry:
                 action=action,
                 error=str(exc),
             )
-
-
-def _any_worktree_path(tenant_id: str, workspace_id: str, environment: str) -> str:
-    """A layout-valid working-copy path for addressing the runtime.
-
-    The env-control API parses the path for tenancy and then derives its own
-    copy, so the user segment is a placeholder by design.
-    """
-    from src.config import settings
-
-    return ws_paths.environment_workspace_path(
-        os.path.expanduser(settings.workspace_base_path),
-        tenant_id,
-        workspace_id,
-        "_",
-        environment,
-    )
 
 
 def _expiry_for(env_type: str, ttl_hours: int) -> t.Tuple[t.Optional[datetime], int]:

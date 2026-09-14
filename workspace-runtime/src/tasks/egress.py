@@ -179,6 +179,88 @@ def warehouse_destinations_of(
     )
 
 
+class PackageIndexNotConfigured(RuntimeError):
+    """No package index is configured, so dependencies cannot be installed.
+
+    Deliberately an error rather than a fallback to the public index. Deriving
+    destinations from the working copy is correct for warehouses and Git — the
+    user declared those — but an index is different: a repository that could
+    name its own index would choose where the sandbox connects, which is the one
+    thing the platform-side allow-list exists to prevent. A deployment that
+    never configured an index therefore has the feature switched off, visibly.
+    """
+
+
+def package_index_destinations() -> tuple[EgressDestination, ...]:
+    """Destinations a dependency install may reach, from PLATFORM configuration.
+
+    Returns:
+        One destination per configured index host, on the URL's port (443/80 by
+        scheme when implicit), plus every ``trusted_hosts`` entry.
+
+    Raises:
+        PackageIndexNotConfigured: ``deps.index_url`` is unset.
+    """
+    from src.config import settings
+
+    primary = (settings.deps_index_url or "").strip()
+    if not primary:
+        raise PackageIndexNotConfigured(
+            "no package index is configured (deps.index_url is empty), so the "
+            "declared Python dependencies cannot be installed. Set it to the "
+            "index this deployment is allowed to reach."
+        )
+
+    urls = [primary, *_split_list(settings.deps_extra_index_urls)]
+    destinations: list[EgressDestination] = []
+    for url in urls:
+        destination = _index_destination(url)
+        if destination is None:
+            logger.warning("deps_index_url_unusable", url=url)
+            continue
+        destinations.append(destination)
+
+    if not destinations:
+        raise PackageIndexNotConfigured(
+            f"the configured package index {primary!r} has no usable host; "
+            "expected a URL such as https://pypi.org/simple"
+        )
+
+    for host in _split_list(settings.deps_trusted_hosts):
+        normalized = normalize_host(host)
+        if normalized:
+            destinations.append(
+                EgressDestination(
+                    host=normalized,
+                    ports=(443, 80),
+                    kind="package_index",
+                    note="deps.trusted_hosts",
+                )
+            )
+
+    return _deduplicate(destinations)
+
+
+def _index_destination(url: str) -> Optional[EgressDestination]:
+    """Turn one index URL into a destination, or None when unusable."""
+    parsed = urlparse(url.strip())
+    host = normalize_host(parsed.hostname or "")
+    if not host:
+        return None
+    if parsed.port:
+        ports: tuple[int, ...] = (int(parsed.port),)
+    else:
+        ports = (443,) if parsed.scheme != "http" else (80,)
+    return EgressDestination(
+        host=host, ports=ports, kind="package_index", note="platform package index"
+    )
+
+
+def _split_list(raw: str) -> tuple[str, ...]:
+    """Split a comma-separated configuration value, dropping blanks."""
+    return tuple(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
 def git_destination(remote_url: str) -> Optional[EgressDestination]:
     """Derive the Git server destination from a remote URL.
 
@@ -313,8 +395,10 @@ def _deduplicate(
 
 
 __all__ = [
+    "PackageIndexNotConfigured",
     "WorkingCopyEgress",
     "git_destination",
+    "package_index_destinations",
     "resolve_working_copy_egress",
     "warehouse_destinations_of",
 ]

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from datacode_common.isolation import IsolationLevel, IsolationProfile
+from datacode_common.python_deps import TASK_KIND_DEPS_SYNC, site_packages_path
 from datacode_common.task_protocol import (
     ERR_NO_RESULT,
     ERR_SANDBOX_OOM,
@@ -45,6 +46,7 @@ from datacode_common.task_protocol import (
 from datacode_common.workspace_layout import tool_home
 
 from src.config import settings
+from src.deps.manifest import overlay_for_injection
 from src.tasks.backends.base import TaskBackend, TaskBackendError
 from src.tasks.credentials import SandboxCredentials
 from src.utils.logging import get_logger
@@ -466,6 +468,25 @@ class KubernetesBackend(TaskBackend):
         return volumes, mounts
 
     @staticmethod
+    def _overlay_env(spec: TaskSpec) -> str:
+        """``PYTHONPATH`` for the Job (injection point 3 of 3), or ``""``.
+
+        The DECISION is made against the runtime's own view of the copy (that is
+        where the manifest is readable), while the VALUE must be the container's
+        view — the copy is mounted at :data:`WORKSPACE_MOUNT_PATH`, so a
+        runtime-side path here would name a directory that does not exist in the
+        Pod. Getting these two the wrong way round is silent: the variable is set,
+        nothing is importable, and the error surfaces inside user code.
+
+        An install task gets no overlay: it is the process that builds that tree.
+        """
+        if spec.kind == TASK_KIND_DEPS_SYNC:
+            return ""
+        if not overlay_for_injection(spec.workspace_path, consumer="sandbox_job"):
+            return ""
+        return site_packages_path(WORKSPACE_MOUNT_PATH)
+
+    @staticmethod
     def _workcopy_sub_path(workspace_path: str) -> str:
         """Return the working copy's path RELATIVE to the storage root.
 
@@ -576,6 +597,20 @@ class KubernetesBackend(TaskBackend):
         """Create the Job. Every hardening field below comes from the profile."""
         volumes, mounts = self._volumes(spec, job_name)
         scheduling = self._scheduling(profile)
+        env = [
+            self._api.V1EnvVar(name="DATACODE_TASK_ID", value=spec.task_id),
+            self._api.V1EnvVar(name="DATACODE_TASK_SPEC_PATH", value=SPEC_FILE_PATH),
+            # The image's HOME belongs to its unprivileged uid and points at a
+            # path that does not exist on a read-only root filesystem. Pointing
+            # it into the platform's own state directory inside the mounted copy
+            # gives every tool a writable home that is ignored by Git and hidden
+            # from the explorer.
+            self._api.V1EnvVar(name="HOME", value=tool_home(WORKSPACE_MOUNT_PATH)),
+            self._api.V1EnvVar(name="TZ", value="UTC"),
+        ]
+        overlay = self._overlay_env(spec)
+        if overlay:
+            env.append(self._api.V1EnvVar(name="PYTHONPATH", value=overlay))
 
         container = self._api.V1Container(
             name="runner",
@@ -585,21 +620,7 @@ class KubernetesBackend(TaskBackend):
             # entrypoint is the runner, so a Job cannot be repurposed to run
             # something else in this sandbox.
             args=[SPEC_FILE_PATH],
-            env=[
-                self._api.V1EnvVar(name="DATACODE_TASK_ID", value=spec.task_id),
-                self._api.V1EnvVar(
-                    name="DATACODE_TASK_SPEC_PATH", value=SPEC_FILE_PATH
-                ),
-                # The image's HOME belongs to its unprivileged uid and points
-                # at a path that does not exist on a read-only root filesystem.
-                # Pointing it into the platform's own state directory inside
-                # the mounted copy gives every tool a writable home that is
-                # ignored by Git and hidden from the explorer.
-                self._api.V1EnvVar(
-                    name="HOME", value=tool_home(WORKSPACE_MOUNT_PATH)
-                ),
-                self._api.V1EnvVar(name="TZ", value="UTC"),
-            ],
+            env=env,
             # Credentials arrive as environment from the per-task Secret, so they
             # are never written to a filesystem the task could exfiltrate from.
             env_from=(

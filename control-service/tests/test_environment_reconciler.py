@@ -43,6 +43,7 @@ from src.environments.reconciler import (
     DRIFT_ORPHAN_CODELOC_POD,
     DRIFT_ORPHAN_LEASE,
     DRIFT_ORPHAN_SQLMESH_ENV,
+    DRIFT_PRESERVED_REMOTE_BRANCH,
     DRIFT_STALE_DEPLOYMENT,
     DRIFT_STALE_LEASE,
     DRIFT_STALE_RESOURCES,
@@ -225,14 +226,15 @@ class _FakeSqlMesh:
         self.ensured.append(environment)
         return self.ensure_ok
 
-    async def invalidate_virtual_environment(self, *, workspace_path, environment):
+    async def invalidate_virtual_environment(
+        self, *, tenant_id, workspace_id, environment
+    ):
         self.invalidated.append(environment)
         return self.invalidate_ok
 
 
 @dataclass
 class _Released:
-    remote_branch_deleted: bool = True
     virtual_environment_released: bool = True
     worktrees_removed: int = 1
     deployment_destroyed: bool = False
@@ -585,9 +587,13 @@ async def test_data_applied_from_uncommitted_code_is_reported(build):
 
 
 async def test_archived_leftovers_are_released(build):
-    """Finishes what a partial destroy honestly reported it could not do."""
+    """Finishes what a partial destroy honestly reported it could not do.
+
+    Driven by a LOCAL leftover (a working copy that failed to unmount): the
+    remote branch is no longer a leftover at all.
+    """
     env = _Env(name="dev_alice", status=naming.STATUS_ARCHIVED)
-    git = _FakeGit(remote_branches={env.branch})
+    git = _FakeGit(local_branches={env.branch}, worktrees={env.name})
     sqlmesh = _FakeSqlMesh({"dev_alice"})
     registry = _FakeRegistry()
     instance, _ = build([env], git, sqlmesh, registry)
@@ -599,6 +605,68 @@ async def test_archived_leftovers_are_released(build):
     drift = next(d for d in report.drifts if d.kind == DRIFT_STALE_RESOURCES)
     assert drift.repaired is True
     assert registry.calls[0]["environment_id"] == env.id
+    # The preserved remote branch must never appear among the things the
+    # archived environment is accused of still holding.
+    assert "remote_branch" not in drift.detail
+
+
+async def test_preserved_remote_branch_is_reported_not_released(build):
+    """An archived environment whose ONLY remaining resource is its remote
+    branch is in its expected state: nothing is released, and the preservation
+    is stated rather than left to be inferred."""
+    env = _Env(name="dev_alice", status=naming.STATUS_ARCHIVED)
+    git = _FakeGit(remote_branches={env.branch})
+    sqlmesh = _FakeSqlMesh({"prod"})
+    registry = _FakeRegistry()
+    instance, _ = build([env], git, sqlmesh, registry)
+
+    report = await instance.reconcile_environment(
+        model=env, workspace=_Workspace(), actor_user_id="alice"
+    )
+
+    assert _kinds(report) == {DRIFT_PRESERVED_REMOTE_BRANCH}
+    drift = report.drifts[0]
+    assert (drift.repairable, drift.repaired) == (False, False)
+    assert env.branch in drift.detail
+    # No release was attempted: there is nothing left to release.
+    assert registry.calls == []
+
+
+async def test_archived_row_still_claims_its_branch(build):
+    """The branch a destroy preserved has a registry row naming it — the very
+    row a same-named create reactivates — so it is not an orphan."""
+    archived = _Env(name="dev_alice", status=naming.STATUS_ARCHIVED)
+    git = _FakeGit(remote_branches={archived.branch, "env/from_outside"})
+    sqlmesh = _FakeSqlMesh({"prod"})
+    instance, _ = build([archived], git, sqlmesh, _FakeRegistry())
+
+    report = await instance.reconcile_workspace(
+        workspace=_Workspace(), actor_user_id="alice"
+    )
+
+    orphans = [d for d in report.drifts if d.kind == DRIFT_ORPHAN_BRANCH]
+    assert [d.environment for d in orphans] == ["from_outside"]
+
+
+async def test_archived_row_does_not_claim_its_virtual_environment(build):
+    """Views ARE released by destroy, so an archived row must not vouch for
+    them: the claim rule differs per resource on purpose."""
+    archived = _Env(name="dev_alice", status=naming.STATUS_ARCHIVED)
+    # A live sibling holds the working copy the engine state is read through;
+    # without one the pass is truncated and detects no orphan at all.
+    live = _Env(name="dev_bob")
+    git = _FakeGit(
+        local_branches={live.branch}, remote_branches={live.branch}, worktrees={live.name}
+    )
+    sqlmesh = _FakeSqlMesh({"dev_alice", "dev_bob", "prod"})
+    instance, _ = build([archived, live], git, sqlmesh, _FakeRegistry())
+
+    report = await instance.reconcile_workspace(
+        workspace=_Workspace(), actor_user_id="alice"
+    )
+
+    orphans = [d for d in report.drifts if d.kind == DRIFT_ORPHAN_SQLMESH_ENV]
+    assert [d.environment for d in orphans] == ["dev_alice"]
 
 
 async def test_healthy_archived_environment_reports_nothing(build):
@@ -806,7 +874,6 @@ async def test_archived_deployment_is_destroyed_via_release(build):
     deployment = _FakeDeployment({env.expected_deployment})
     registry = _FakeRegistry(
         _Released(
-            remote_branch_deleted=False,
             virtual_environment_released=False,
             worktrees_removed=0,
             deployment_destroyed=True,

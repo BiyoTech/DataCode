@@ -652,6 +652,12 @@ export default {
     deleteDirConfirm:
       'Delete "{name}" and everything inside it? This cannot be undone.',
     deleted: 'Deleted',
+    // Upload from the explorer's context menu: the target is the folder the
+    // menu was opened on, and an existing file with the same name is
+    // overwritten (the same contract as saving in the editor).
+    uploadHere: 'Upload files here',
+    uploaded: 'Uploaded {count} file(s) to {dir}',
+    uploadFailed: 'Upload failed',
   },
   workspaceInfo: {
     title: 'Workspace',
@@ -886,6 +892,149 @@ export default {
     reload: 'Reload only',
     reloading: 'Working...',
     reloadSuccess: 'Code location reloaded.',
+    reloadFailed: 'The reload did not finish — see the reason below.',
+    reloadCancel: 'Cancel',
+    reloadCancelFailed: 'Could not cancel the reload.',
+    reloadAttached: 'Already running',
+    // A reload installs the declared Python packages before starting the code
+    // location, so the user sees which stage it is in rather than a spinner.
+    reloadStage: {
+      queued: 'Queued',
+      resolving_deps: 'Reading dependencies',
+      installing_deps: 'Installing dependencies',
+      starting_code_location: 'Starting code location',
+      loading_definitions: 'Loading definitions',
+      ready: 'Ready',
+      failed: 'Failed',
+    },
+    // One sentence per failure code, because the next action differs for each.
+    reloadFailure: {
+      deps_declaration_invalid:
+        'asset-dag/pyproject.toml could not be parsed, so no dependency can be ' +
+        'read from it. Fix the syntax, then reload.',
+      deps_platform_conflict:
+        'A declared package is pinned to a version the platform does not ship. ' +
+        'The declaration is valid — it just cannot be installed, because a ' +
+        'workspace overlay would shadow the platform\'s own copy.',
+      deps_platform_transitive:
+        'A declared package needs a version of a package the platform already ' +
+        'provides. Nothing in your declaration mentions that package — it is ' +
+        'pulled in as a dependency. The platform released every such package it ' +
+        'safely could and retried; the one below is part of its own runtime and ' +
+        'cannot be overridden.',
+      deps_install_failed:
+        'The declared packages could not be installed. The installer output below ' +
+        'names the package and the reason.',
+      deps_index_not_configured:
+        'This deployment has no package index configured, so dependencies cannot ' +
+        'be installed. Ask an operator to configure one.',
+      deps_shadow_platform:
+        'The installed tree ended up containing a package the platform itself ' +
+        'provides. No declaration can cause this — report it to an operator.',
+      deps_too_large:
+        'The installed dependency tree exceeds the size limit for one working copy. ' +
+        'Remove the heaviest packages, or ask an operator to raise the limit.',
+      code_load_failed:
+        'The code location started but could not load your definitions. The ' +
+        'traceback below is from your own code.',
+      sandbox_unavailable:
+        'The platform could not start a sandbox to install the dependencies. ' +
+        'Nothing was changed; retrying usually helps.',
+      internal_error: 'The reload failed unexpectedly.',
+    },
+    reloadErrorLog: 'Full details archived in logs/errors/ (error id {id})',
+    showOutput: 'Show output',
+    hideOutput: 'Hide output',
+    // Dependency drift, reported by ensure WITHOUT installing anything.
+    depsHint: {
+      drifted:
+        'The dependency declaration changed since the last install. Reload to ' +
+        'install the {count} declared package(s).',
+      missing:
+        '{count} declared Python package(s) are not installed in this working copy ' +
+        'yet. Reload to install them.',
+      incompatible:
+        'The installed dependencies were built for a different Python baseline. ' +
+        'Reload to rebuild them.',
+      failed: 'The last dependency install failed. Reload to try again.',
+      declaration_invalid:
+        'asset-dag/pyproject.toml cannot be read, so no dependency can be installed.',
+    },
+    // A declaration the platform baseline cannot satisfy. Surfaced BEFORE a
+    // reload is attempted, because a reload cannot fix it — only an edit can.
+    depsConflict: {
+      title: 'These dependencies cannot be installed',
+      explain:
+        'A workspace overlay is loaded before the platform\'s own packages, so it ' +
+        'would replace them rather than coexist. Declare the version the platform ' +
+        'ships, or remove the line — the package is importable either way.',
+      column: 'Declared',
+      suggested: 'Change to',
+      platform: 'Platform ships',
+      fixOne: 'Apply',
+      fixAll: 'Apply all',
+      fixed: 'asset-dag/pyproject.toml updated. Reload to install.',
+      fixFailed: 'Could not update asset-dag/pyproject.toml.',
+      viewBaseline: 'What does the platform provide?',
+      // Shown in the editor, on the line that declares the package.
+      marker:
+        'The platform provides {platform} and a workspace overlay would shadow it ' +
+        'rather than coexist with it. Declare {suggested} instead, or remove this ' +
+        'line — the package is importable either way.',
+    },
+    // A declared package whose OWN dependencies clash with the baseline. Shown
+    // only after the platform has already tried releasing the pins it may
+    // release, so every row here ends in an edit or in an operator's hands.
+    depsTransitive: {
+      title: 'These dependencies need a platform package the platform cannot yield',
+      explain:
+        'Each package below is compatible with the platform on its own — it is ' +
+        'one of its dependencies that asks for a different version of a package ' +
+        'the platform provides. Where the platform could step aside it already ' +
+        'has; the ones left are part of its own runtime, so the fix is another ' +
+        'release of what you declared.',
+      blocker: '{name} {required} is required, but the platform ships {platform}',
+      blockerVia:
+        '{via} requires {name} {required}, but the platform ships {platform}',
+      suggested: 'Change to',
+      resolvesTo: '(installs {version})',
+      apply: 'Apply',
+      fixed: 'asset-dag/pyproject.toml updated. Reload to install.',
+      fixFailed: 'Could not update asset-dag/pyproject.toml.',
+      noFix:
+        'No release of this package fits this platform baseline — ask an operator ' +
+        'to upgrade it.',
+      noFixProtected:
+        '{packages} is part of the platform\'s own runtime (a compiled extension, ' +
+        'or a component the platform is built on), so its version cannot be ' +
+        'overridden for a workspace. Ask an operator to upgrade the platform ' +
+        'baseline, or to allow this package to be overridden.',
+      viewBaseline: 'What does the platform provide?',
+    },
+    // A successful install that had to override platform packages. Not an
+    // error: the one place a standing divergence is visible.
+    depsRelaxed: {
+      title: 'This working copy overrides some platform packages',
+      explain:
+        'Your dependencies required versions the platform does not ship. These ' +
+        'packages are safe to override for one working copy, so the platform ' +
+        'stepped aside and the install succeeded. Your assets and shells now use ' +
+        'the versions below instead of the platform\'s.',
+      override: 'platform {platform} → {overlay}',
+      requiredBy: '(required by {via})',
+    },
+    depsBaseline: {
+      title: 'Platform packages',
+      subtitle:
+        'Importable without declaring anything (Python {python}). Declaring one ' +
+        'installs nothing; pinning one to another version is refused.',
+      name: 'Package',
+      version: 'Version',
+      declare: 'Declare as',
+      showAll: 'Show all {count}',
+      showCommon: 'Show only what user code usually imports',
+      empty: 'The platform baseline could not be read.',
+    },
     pullReload: 'Pull & Reload',
     pullReloadSuccess: 'Latest code pulled and code location reloaded.',
     pullReloadFailed: 'Failed to pull the latest code.',
@@ -972,10 +1121,22 @@ export default {
       'The current data was applied from uncommitted code, so no commit describes it. Commit and apply again to make code and data match.',
     cannotDestroyCurrent:
       'Switch to another environment before destroying this one.',
+    confirmDestroyTitle: 'Destroy environment "{name}"?',
+    confirmRetryReclaimTitle: 'Finish releasing "{name}"?',
+    retryReclaimBody:
+      'Its previous release did not finish — it is still marked "archiving", which usually means the process stopped part-way through. This runs the release again; steps already done are no-ops. The remote branch is kept either way.',
+    retryReclaim: 'Finish release',
+    retryReclaimHint: 'Finish a release that did not complete',
     confirmDestroy:
-      'Destroy environment "{name}"? Its branch, working copy and data views are released. This cannot be undone.',
+      'Its working copies, local branch, data views and deployment are released.',
+    destroyKeepsRemoteBranch:
+      'The remote branch {branch} is kept. Creating an environment with the same name later picks it back up.',
+    destroyUnpushedWarning:
+      'Warning: {count} commit(s) have not been pushed yet. Those are the only changes that cannot be recovered afterwards — push them first if you want to keep them.',
     confirmDestroyForce:
       '{reason}\n\nDiscard those changes and destroy the environment anyway?',
+    branchReused:
+      'Environment "{name}" resumed the existing remote branch {branch}, so it already contains that branch\'s code.',
   },
   git: {
     sourceControl: 'Source Control',

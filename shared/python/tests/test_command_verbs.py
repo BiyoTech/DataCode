@@ -188,6 +188,9 @@ class TestGuardBehaviourEndToEnd:
             "dc run nightly",
             "dc assets",
             "dc deployment status",
+            "dc deps sync",
+            "pip install polars",
+            "pip3 install polars",
         ],
     )
     def test_a_governed_verb_is_refused(self, sandbox, command):
@@ -213,12 +216,23 @@ class TestGuardBehaviourEndToEnd:
             "sqlmesh audit",
             "sqlmesh dag",
             "sqlmesh --version",
+            # Only `install` is governed: reading what IS installed is how a user
+            # or an agent diagnoses a dependency problem, and refusing it would
+            # remove the tool needed to understand the refusal.
+            "pip list",
+            "pip show polars",
         ],
     )
     def test_everything_else_reaches_the_real_binary(self, sandbox, command):
         result = self._run(sandbox, command)
         assert result.returncode == 0, result.stderr
         assert "NATIVE" in result.stdout
+
+    def test_the_pip_refusal_names_the_declaration_and_the_command(self, sandbox):
+        """A refusal that does not say what to do instead is just an obstacle."""
+        result = self._run(sandbox, "pip install polars")
+        assert "pyproject.toml" in result.stderr
+        assert "dc deps sync" in result.stderr
 
     def test_the_desk_calculator_still_works(self, sandbox):
         """`dc` is also POSIX dc, and the guard must not shadow it.
