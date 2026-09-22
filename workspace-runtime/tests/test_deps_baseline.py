@@ -489,6 +489,33 @@ def test_the_install_plan_carries_the_yieldable_set(monkeypatch):
     assert InstallPlan.from_params(plan.to_params()).relaxable == plan.relaxable
 
 
+def test_source_builds_are_off_until_an_operator_names_a_package(monkeypatch):
+    """The wheel-only rule is the default, and the exception is per package.
+
+    A working copy can never ask for a source build — the permission is read from
+    PLATFORM configuration and carried in the plan, the same provenance rule the
+    index URL follows, because a declaration that could widen it would be a way
+    to run a build script from inside the code under review.
+    """
+    from datacode_common.python_deps import InstallPlan, parse_declaration
+
+    from src.config import settings
+    from src.deps.service import DepsService
+
+    monkeypatch.setattr(settings, "deps_index_url", "https://index.invalid/simple")
+    declaration = parse_declaration('[project]\ndependencies = ["pyspark>=3.5.0"]\n')
+
+    monkeypatch.setattr(settings, "deps_allow_source_packages", "")
+    assert DepsService._build_plan(declaration).source_allowed == frozenset()
+
+    # Canonicalised, so the config file's spelling cannot miss the requirement's.
+    monkeypatch.setattr(settings, "deps_allow_source_packages", "PySpark, other")
+    plan = DepsService._build_plan(declaration)
+    assert plan.source_allowed == {"pyspark", "other"}
+    # Survives the only path it has: task parameters.
+    assert InstallPlan.from_params(plan.to_params()).source_allowed == plan.source_allowed
+
+
 # ── a yielded pin is visible afterwards ───────────────────────────────────
 
 

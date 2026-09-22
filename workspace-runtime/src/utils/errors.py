@@ -567,7 +567,7 @@ def extract_root_cause(exc: Exception, max_depth: int = 5) -> Optional[Exception
     return root
 
 
-def _classify_db_error(exc: Exception) -> Optional[tuple[ErrorCode, int]]:
+def classify_db_error(exc: Exception) -> Optional[tuple[ErrorCode, int]]:
     """Classify a database-driver exception into (ErrorCode, status_code).
 
     Returns ``None`` when ``exc`` is not a recognized DB-driver error.
@@ -663,7 +663,7 @@ def service_error_from_exception(
       ``message`` (so CLI/frontend always show the actionable reason) and it
       maps to HTTP 422 rather than a 500-class server incident.
     * Database-driver error (psycopg2 / sqlite3 / asyncpg ...): classified by
-      ``_classify_db_error`` into ``DB_ENGINE_ERROR`` (422),
+      ``classify_db_error`` into ``DB_ENGINE_ERROR`` (422),
       ``DB_CONNECTION_ERROR`` (503), or ``DB_TRANSACTION_ERROR`` (409). The
       raw error text becomes the top-level ``message`` so the user/DBA sees
       the actionable reason (e.g. "cannot delete from table _versions because
@@ -700,7 +700,7 @@ def service_error_from_exception(
         return service_error
 
     # 2. Database-driver error — classify and surface raw reason.
-    db_classification = _classify_db_error(exc)
+    db_classification = classify_db_error(exc)
     if db_classification is not None:
         db_code, db_status = db_classification
         # Build a detail string that preserves the full cause chain so that

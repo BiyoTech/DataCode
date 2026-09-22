@@ -109,6 +109,22 @@ ERR_SQLMESH_EVALUATE = "evaluate_failed"
 ERR_TIMEOUT = "operation_timeout"
 ERR_RESOURCE_LIMIT = "resource_limit"   # rlimit hit (RLIMIT_AS/CPU/NPROC/...)
 ERR_CRASHED = "executor_crashed"        # synthesized by the runtime, never sent
+# Warehouse-driver failures, classified IN the sandbox and carried across by
+# code so the runtime does not have to re-derive the class from a string. An
+# unreachable warehouse is the user's connection settings to fix, not a
+# platform fault, and it must not arrive at the API as a 500.
+ERR_DB_CONNECTION = "db_connection_error"
+ERR_DB_ENGINE = "db_engine_error"
+ERR_DB_TRANSACTION = "db_transaction_error"
+
+# ErrorCode (runtime) -> executor error code. One direction only: the runtime
+# maps what the sandbox classified, never the other way round, because the
+# sandbox is the only side that ever held the original exception.
+DB_ERROR_CODES: dict[str, str] = {
+    "DB_CONNECTION_ERROR": ERR_DB_CONNECTION,
+    "DB_ENGINE_ERROR": ERR_DB_ENGINE,
+    "DB_TRANSACTION_ERROR": ERR_DB_TRANSACTION,
+}
 
 
 # ── Serializable result envelopes ──────────────────────────────────────────

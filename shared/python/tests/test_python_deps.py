@@ -26,6 +26,7 @@ from datacode_common.python_deps import (
     DepsManifest,
     InstallPlan,
     PlatformCoreConflict,
+    SourceOnlyRequirement,
     TransitiveConflict,
     baseline_constraints,
     blockers_from_resolution,
@@ -38,8 +39,10 @@ from datacode_common.python_deps import (
     interpreter_mismatch,
     interpreter_platform_tag,
     interpreter_python_version,
+    is_missing_distribution,
     manifest_path,
     manifest_state,
+    missing_distribution_requirements,
     parse_declaration,
     pins_implicated_in_conflict,
     relax_upper_bounds,
@@ -47,6 +50,7 @@ from datacode_common.python_deps import (
     requirement_name,
     site_packages_path,
     split_platform_provided,
+    versions_matching,
 )
 
 
@@ -755,3 +759,96 @@ def test_a_declared_package_named_in_the_report_is_not_a_platform_pin():
     """The filter that keeps a yield from being offered for the wrong package."""
     raw = "    feast 0.65.0 depends on pyarrow>=16.1.0\n"
     assert pins_implicated_in_conflict(raw, {"tenacity": "9.1.4"}) == {}
+
+
+# ── a package the index has, but only as source ───────────────────────────
+#
+# The real pip output that started this: pyspark publishes exactly one artefact
+# per release, a source distribution, and a wheel-only install therefore reports
+# the SAME sentence it uses for a version that does not exist.
+
+_REAL_NO_WHEEL = """Collecting feast>=0.60.0 (from feast[postgres]>=0.60.0)
+  Using cached feast-0.66.0-py3-none-any.whl.metadata (27 kB)
+ERROR: Could not find a version that satisfies the requirement pyspark>=3.5.0 \
+(from versions: none)
+ERROR: No matching distribution found for pyspark>=3.5.0
+"""
+
+
+def test_the_missing_distribution_shape_is_recognised():
+    assert is_missing_distribution(_REAL_NO_WHEEL)
+    assert not is_missing_distribution(
+        "ERROR: ResolutionImpossible: conflicting versions"
+    )
+
+
+def test_the_unsatisfiable_requirement_is_read_from_pips_own_sentence():
+    """Not from the declaration: the requirement can be a TRANSITIVE one.
+
+    Its specifier then exists nowhere else — the file says nothing about it, so
+    reading the declaration would diagnose the wrong package or none at all.
+    """
+    found = missing_distribution_requirements(_REAL_NO_WHEEL)
+
+    # One entry although pip printed two sentences about the same requirement.
+    assert found == ("pyspark>=3.5.0",)
+    # feast resolved fine and must not be dragged into the diagnosis.
+    assert not any("feast" in item for item in found)
+
+
+def test_english_that_parses_to_no_requirement_yields_no_diagnosis():
+    """This reads prose, so it degrades to silence rather than to a wrong name."""
+    assert missing_distribution_requirements(
+        "ERROR: No matching distribution found for ???"
+    ) == ()
+    assert missing_distribution_requirements("pip exited with code 1") == ()
+
+
+def test_the_index_answer_is_filtered_by_the_declared_specifier():
+    """"The index has versions" only matters when one of them was ASKED for.
+
+    Without the filter a declaration of ``pyspark>=9`` would be reported as "no
+    wheel" on the strength of 3.5.7 existing — a diagnosis for a version nobody
+    requested.
+    """
+    listed = ["4.0.1", "4.0.0", "3.5.7", "3.4.1"]
+
+    # Sorted by version, oldest first; 3.4.1 is below the declared floor.
+    assert versions_matching("pyspark>=3.5.0", listed) == ("3.5.7", "4.0.0", "4.0.1")
+    assert versions_matching("pyspark>=9.0", listed) == ()
+    # Newest last, so a message can name the version the user would get.
+    assert versions_matching("pyspark", listed)[-1] == "4.0.1"
+    # Junk from a scraped listing is dropped, not treated as a version.
+    assert versions_matching("pyspark", ["not-a-version", "3.5.7"]) == ("3.5.7",)
+
+
+def test_the_no_wheel_message_names_the_one_thing_that_cannot_be_edited():
+    """The whole point of the separate failure: no version bound fixes this."""
+    message = SourceOnlyRequirement(
+        requirement="pyspark>=3.5.0", name="pyspark", versions=("3.5.7", "4.0.1")
+    ).message()
+
+    assert "4.0.1" in message, "the version the index HAS must be named"
+    assert "no wheel" in message
+    # Both routes out, because the user can take neither alone.
+    assert "platform image" in message
+    assert "deps.allow_source_packages" in message
+
+
+def test_source_builds_are_off_unless_an_operator_names_the_package():
+    """Default empty, and it survives the only path it has: task parameters."""
+    plan = InstallPlan(requirements=("pyspark>=3.5.0",), fingerprint="fp")
+    assert plan.source_allowed == frozenset()
+
+    allowed = InstallPlan(
+        requirements=("pyspark>=3.5.0",),
+        fingerprint="fp",
+        allow_source_packages=("PySpark",),
+    )
+    # Canonicalised on the way in, so a config file's spelling cannot miss.
+    round_tripped = InstallPlan.from_params(allowed.to_params())
+    assert round_tripped.source_allowed == {"pyspark"}
+    # A malformed payload must not widen the permission.
+    assert InstallPlan.from_params(
+        {"requirements": [], "allow_source_packages": "pyspark"}
+    ).source_allowed == frozenset()

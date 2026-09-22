@@ -293,7 +293,18 @@ def create_agent(
     user_id=user_id, environment=environment,
 )
         except Exception as e:
-            logger.warning("shell_tool_injection_failed", agent=name, error=str(e))
+            # ERROR, not warning: the agent is still built, but WITHOUT the tool
+            # its prompt tells it to use. The model then reports "I have no
+            # terminal here" — a truthful answer to a broken assembly, and the
+            # hardest kind of defect to trace back to a log line nobody reads.
+            logger.error(
+                "shell_tool_injection_failed",
+                agent=name,
+                workspace_path=workspace_path,
+                error=str(e),
+                hint="this agent will run without shell; commands will be "
+                     "refused as unavailable",
+            )
 
     # Resolve handoff agents recursively (skip background workers with exposed=false).
     # `or []` guards against an empty `handoffs:` YAML key: PyYAML parses a key

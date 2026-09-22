@@ -79,6 +79,15 @@ echo "==> building 8 images as ${REGISTRY}/<service>:${TAG}"
 # the warnings an operator actually needs to read. Passed per image instead.
 GO_BUILD_ARGS=(--build-arg "GO_BUILD_PARALLEL=${GO_BUILD_PARALLEL:-1}")
 
+# Extras baked into the workspace-runtime image, comma-separated (see that
+# service's pyproject.toml). Only that image declares the build-arg, for the same
+# "unconsumed build-arg" reason as above.
+#
+# The one case this exists for today is RUNTIME_EXTRAS=spark: pyspark publishes no
+# wheel, so a working copy can never install it — putting it in the image makes it
+# part of the platform baseline instead. Costs ~600 MB plus a JRE, hence opt-in.
+RUNTIME_BUILD_ARGS=(--build-arg "RUNTIME_EXTRAS=${RUNTIME_EXTRAS:-}")
+
 # One build context (the repository root) for every image: the shared packages
 # are local path dependencies and the Dockerfiles COPY them from the context.
 # Anything after the dockerfile is forwarded to `docker build` verbatim.
@@ -97,7 +106,7 @@ build gateway          gateway/Dockerfile          "${GO_BUILD_ARGS[@]}"
 build identity-service identity-service/Dockerfile "${GO_BUILD_ARGS[@]}"
 build control-service  control-service/Dockerfile
 build agent-service    agent-service/Dockerfile
-build workspace-runtime workspace-runtime/Dockerfile
+build workspace-runtime workspace-runtime/Dockerfile "${RUNTIME_BUILD_ARGS[@]}"
 build task-runner      task-runner/Dockerfile
 build egress-proxy     egress-proxy/Dockerfile
 build frontend         frontend/Dockerfile

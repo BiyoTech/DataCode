@@ -68,9 +68,9 @@ def _resolve_runner_root() -> Path:
     """Locate the task-runner package.
 
     Falls back to the sibling checkout directory, which is where it lives in
-    development. A missing package is a configuration error, not something to
-    work around: silently skipping execution would look like a task that does
-    nothing.
+    development and where the container image bakes it. A missing package is a
+    configuration error, not something to work around: silently skipping
+    execution would look like a task that does nothing.
     """
     configured = (settings.task_runner_root or "").strip()
     if configured:
@@ -82,10 +82,25 @@ def _resolve_runner_root() -> Path:
 
     if not (root / "src" / "main.py").is_file():
         raise TaskBackendError(
-            f"task-runner package not found at {root} "
-            "(expected src/main.py); set task_runner_root"
+            f"task-runner package not found at {root} (expected src/main.py); "
+            "set task.runner_root to the package directory, or bake "
+            "task-runner/src/ into the workspace-runtime image at "
+            f"{Path(__file__).resolve().parents[4] / 'task-runner'}"
         )
     return root
+
+
+def assert_vehicle_available() -> None:
+    """Fail when the local vehicle cannot run at all, BEFORE anything runs.
+
+    Called at startup (``main.lifespan``) so a packaging mistake fails the
+    rollout, where the operator is present — not the first user's first
+    dependency install. Mirrors :func:`src.codeloc.pod.assert_vehicle_supported`
+    for the same reason, and is a separate function for the same cause: the
+    preflight must not build the backend (which also generates the command
+    guard directory it does not need in order to answer this question).
+    """
+    _resolve_runner_root()
 
 
 class LocalProcessBackend(TaskBackend):

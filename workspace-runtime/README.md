@@ -102,6 +102,20 @@ Six decisions worth knowing before changing anything here:
   the copy now diverges from the platform on those packages. Anything shadowing
   the platform that was NOT yielded still FAILS the install — it is unreachable
   through any declaration, so it means the two images are out of step.
+* **Only wheels are installed, and a package without one says so.** The install
+  sandbox has no compiler and never runs a package's build script, so
+  `--only-binary=:all:` is not a tuning choice. pip reports the resulting
+  filtered candidate set as `(from versions: none)` — the same sentence it uses
+  for a version that does not exist — so a failed install asks the index directly
+  (`pip index versions`, which downloads nothing) and reports `deps_no_wheel`
+  naming the package when a matching version IS there. `pyspark` is the standing
+  example: PyPI carries one ~300 MB sdist per release, so no declaration of it can
+  ever install. The route for such a package is the IMAGE
+  (`docker build --build-arg RUNTIME_EXTRAS=spark`, which also installs a JRE),
+  which makes it part of the baseline and importable without being declared;
+  `deps.allow_source_packages` is the per-package escape hatch — the wheel-only
+  flag stays and is overridden by NAME, so nothing else in the same resolution
+  gains a source build.
 * **`ensure` never installs.** It is on the asset page's load path and reports
   drift and platform conflicts only; the install runs inside a reload job the
   user triggered, and a failed install FAILS that reload rather than starting a

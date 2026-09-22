@@ -29,6 +29,24 @@ explanation. Refusing up front also removes the "arbitrary ``setup.py`` executes
 during install" path, which is the only code execution an install would
 otherwise perform before anything else validates it.
 
+The cost of that rule is a diagnosis: pip reports a filtered-out candidate set as
+``(from versions: none)``, which reads as "that version does not exist". So when
+an install fails that way, the index is asked — with ``pip index versions``,
+which downloads no distribution and builds nothing — whether a matching version
+is actually there. If it is, the failure is reported as ``deps_no_wheel`` and
+names the package, because no edit to the declaration can fix it.
+
+An operator can re-admit source builds per package
+(``deps.allow_source_packages``, carried in
+:attr:`InstallPlan.allow_source_packages`). That permission is NARROW, and the
+spelling matters: pip keeps ``--only-binary=:all:`` as a default and lets a
+per-name ``--no-binary=<pkg>`` override it for that name alone
+(``FormatControl.get_allowed_formats`` tests the name before ``:all:``), so
+everything else in the same resolution stays wheel-only. The ORDER on the command
+line is load-bearing too — a ``--only-binary=:all:`` appearing after the per-name
+flag CLEARS it (``handle_mutual_excludes``), which is why the general flag is
+always emitted first.
+
 Why the platform baseline arrives in the task parameters
 --------------------------------------------------------
 Because this image is NOT the platform. The overlay is consumed by the
@@ -74,6 +92,7 @@ from datacode_common.python_deps import (
     CONSTRAINTS_FILENAME,
     FAILURE_DECLARATION_INVALID,
     FAILURE_INSTALL_FAILED,
+    FAILURE_NO_WHEEL,
     FAILURE_PLATFORM_CONFLICT,
     FAILURE_PLATFORM_TRANSITIVE,
     FAILURE_SHADOW_PLATFORM,
@@ -83,6 +102,7 @@ from datacode_common.python_deps import (
     InstallPlan,
     PlatformCoreConflict,
     ShadowedPlatformPackage,
+    SourceOnlyRequirement,
     TransitiveConflict,
     baseline_constraints,
     blockers_from_resolution,
@@ -93,12 +113,15 @@ from datacode_common.python_deps import (
     install_log_path,
     interpreter_platform_tag,
     interpreter_python_version,
+    is_missing_distribution,
+    missing_distribution_requirements,
     pins_implicated_in_conflict,
     relax_upper_bounds,
     requirement_name,
     resolution_report_path,
     site_packages_path,
     split_platform_provided,
+    versions_matching,
 )
 
 from src.sqlmesh_ops import SqlMeshOpError
@@ -119,6 +142,10 @@ ERR_DEPS_PLATFORM_TRANSITIVE = FAILURE_PLATFORM_TRANSITIVE
 ERR_DEPS_INSTALL = FAILURE_INSTALL_FAILED
 ERR_DEPS_TOO_LARGE = FAILURE_TOO_LARGE
 ERR_DEPS_SHADOWED = FAILURE_SHADOW_PLATFORM
+# The index has a matching version, it just ships no usable wheel. Separate from
+# ERR_DEPS_INSTALL because the generic message points at the declaration, and this
+# is the one failure where the declaration is correct.
+ERR_DEPS_NO_WHEEL = FAILURE_NO_WHEEL
 
 # Kept with a failure. Long enough for pip's resolver conflict report, which is
 # the one message that actually explains an unsatisfiable declaration.
@@ -128,6 +155,12 @@ _OUTPUT_TAIL_CHARS = 16384
 # because a diagnosis is worth less than the install it explains: if the index
 # is slow here, the answer is the plain pip output, not a longer wait.
 _PROBE_TIMEOUT_SECONDS = 240
+
+# How many requirements one "is it only a source distribution?" diagnosis asks the
+# index about. Bounded for the same reason as the timeout above: the answer is
+# already actionable after the first few names, and a declaration of two hundred
+# packages must not turn one failure into two hundred index round trips.
+_MAX_INDEX_PROBES = 5
 
 # Guardrail on the transcript file: pip's per-file progress is chatty and the
 # file lives on the user's own volume.
@@ -293,9 +326,29 @@ def op_deps_sync(
     yielded: dict[str, str] = {}
 
     if to_install:
+        # Source builds are a per-package operator decision, and they stay that
+        # way in the pip invocation (see the module docstring). Announced in the
+        # transcript because a tree built from source is not the same artefact as
+        # a downloaded wheel, and six months later that has to be visible.
+        source_packages = tuple(
+            sorted(plan.source_allowed & {requirement_name(item) for item in to_install})
+        )
+        if source_packages:
+            transcript.write(
+                "this deployment permits building "
+                + ", ".join(source_packages)
+                + " from source (deps.allow_source_packages); every other "
+                "package in this install stays wheel-only"
+            )
         try:
             yielded = _install_with_yields(
-                to_install, target, workspace_path, plan, constraints, transcript
+                to_install,
+                target,
+                workspace_path,
+                plan,
+                constraints,
+                transcript,
+                source_packages=source_packages,
             )
         except SqlMeshOpError:
             # A failed pip leaves whatever it managed to unpack. That half tree
@@ -525,8 +578,17 @@ def _run_pip(
     plan: InstallPlan,
     constraints: Path,
     transcript: _Transcript,
+    *,
+    source_packages: tuple[str, ...] = (),
 ) -> int:
     """Run one pip install, streaming its output into the transcript.
+
+    Args:
+        source_packages: Canonical names this deployment allows to be built from
+            a source distribution (``deps.allow_source_packages``). Emitted as
+            per-name ``--no-binary`` flags AFTER the general wheel-only flag,
+            which is what confines the permission to those names — see the module
+            docstring for both halves of that contract.
 
     Returns pip's exit code. Deciding what a non-zero one MEANS is the caller's
     job (:func:`_install_with_yields`), because the answer depends on state this
@@ -552,7 +614,14 @@ def _run_pip(
         "--progress-bar",
         "off",
         # See the module docstring: no compiler here, and no setup.py execution.
+        # FIRST, always: pip clears the per-name exceptions below when it sees
+        # this flag, so emitting it later would silently revoke them.
         "--only-binary=:all:",
+    ]
+    for name in source_packages:
+        # Overrides the line above for this name only.
+        argv.append(f"--no-binary={name}")
+    argv += [
         # The platform baseline, as a resolver bound. This is the flag that
         # makes a transitive conflict impossible rather than merely unlikely:
         # without it a declaration of `polars` can resolve numpy 2.x into the
@@ -610,6 +679,8 @@ def _install_with_yields(
     plan: InstallPlan,
     constraints: Path,
     transcript: _Transcript,
+    *,
+    source_packages: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Install *requirements*, releasing yieldable platform pins if needed.
 
@@ -627,6 +698,11 @@ def _install_with_yields(
     pip implicated, so a third would only be answering a conflict that involves
     a pin which may NOT move — which is a diagnosis, not another attempt.
 
+    Args:
+        source_packages: Forwarded to every attempt, unchanged. Which packages
+            may be built from source is an operator's decision about this
+            deployment; it is not something a retry may widen.
+
     Returns:
         ``name -> requiring package`` for the pins actually released. Empty on
         the normal path, which is also what a caller must see when nothing
@@ -635,10 +711,18 @@ def _install_with_yields(
     Raises:
         SqlMeshOpError: The install failed for good. Tagged
             ``ERR_DEPS_PLATFORM_TRANSITIVE`` when the cause is a baseline pin
-            that cannot move, otherwise ``ERR_DEPS_INSTALL``.
+            that cannot move, ``ERR_DEPS_NO_WHEEL`` when the index has the
+            version but publishes no usable wheel, otherwise
+            ``ERR_DEPS_INSTALL``.
     """
     exit_code = _run_pip(
-        requirements, target, workspace_path, plan, constraints, transcript
+        requirements,
+        target,
+        workspace_path,
+        plan,
+        constraints,
+        transcript,
+        source_packages=source_packages,
     ) or 0
     if exit_code == 0:
         return {}
@@ -669,6 +753,7 @@ def _install_with_yields(
                 plan,
                 relaxed_constraints,
                 transcript,
+                source_packages=source_packages,
             ) or 0
             if exit_code == 0:
                 for name, holder in sorted(yielded.items()):
@@ -711,11 +796,19 @@ def _raise_install_failure(
 ) -> None:
     """Turn a final pip failure into the most actionable error available.
 
-    A resolution failure is the one case where pip's own report is not an answer
-    but a pointer: it names versions the user never wrote, because the bound
-    they cannot move is the platform's. Diagnosed here — where pip, the index
-    and the constraints file all are — so what reaches the UI is "declare X
-    instead", not a puzzle.
+    Two shapes get a diagnosis, because in both of them pip's own report is not
+    an answer but a pointer:
+
+    * a refused RESOLUTION names versions the user never wrote, because the bound
+      they cannot move is the platform's (:func:`_diagnose_transitive`);
+    * "no matching distribution" is what pip prints both when the version does
+      not exist AND when every candidate was filtered out by the wheel-only rule.
+      Only the index can tell those apart (:func:`_diagnose_source_only`), and
+      the difference decides whether the next action is an edit or a request to
+      an operator.
+
+    Diagnosed here — where pip, the index and the constraints file all are — so
+    what reaches the UI is an action, not a puzzle.
     """
     conflicts = (
         _diagnose_transitive(
@@ -735,6 +828,16 @@ def _raise_install_failure(
             _transitive_message(conflicts, tail),
             detail={"transitive_conflicts": [item.to_dict() for item in conflicts]},
         )
+
+    if is_missing_distribution(tail):
+        source_only = _diagnose_source_only(plan, transcript=transcript, tail=tail)
+        if source_only:
+            raise SqlMeshOpError(
+                ERR_DEPS_NO_WHEEL,
+                _source_only_message(source_only, tail),
+                detail={"source_only": [item.to_dict() for item in source_only]},
+            )
+
     raise SqlMeshOpError(
         ERR_DEPS_INSTALL, _classify_failure(tail, exit_code, plan.baseline)
     )
@@ -991,6 +1094,128 @@ def _resolved_version(report: Optional[Mapping[str, Any]], name: str) -> str:
     return ""
 
 
+# ── diagnosing a package the index has only as source ─────────────────────
+#
+# pip's "(from versions: none)" is printed for two different worlds: a version
+# that is not on the index, and a version that is there but was filtered out
+# before the candidate list was built (`--only-binary=:all:`). The user's next
+# action differs completely — fix the version bound, versus ask an operator —
+# and the message that conflated them sent people to check a version number that
+# was correct all along.
+
+# `pip index versions <name>` prints one such line. Parsed rather than derived
+# from the install output, because the install output is exactly what cannot
+# distinguish the two cases.
+_AVAILABLE_VERSIONS_RE = re.compile(
+    r"^\s*Available versions:\s*(?P<versions>.+)$", re.MULTILINE
+)
+
+
+def _index_versions(
+    name: str,
+    plan: InstallPlan,
+    transcript: _Transcript,
+) -> tuple[str, ...]:
+    """Versions of *name* the configured index serves, newest first.
+
+    ``pip index versions`` asks the index for the project's file list and stops
+    there: no distribution is downloaded, no metadata is built, so no package
+    code runs. That property is what makes it usable for a diagnosis about
+    packages the user chose — the same reason the resolution probes use
+    ``--dry-run``.
+
+    Returns an empty tuple on any failure (including a pip release without the
+    subcommand): a diagnosis that cannot be produced must not replace the failure
+    it was meant to explain.
+    """
+    argv = [
+        sys.executable,
+        "-m",
+        "pip",
+        "index",
+        "versions",
+        name,
+        "--no-input",
+        "--isolated",
+        "--disable-pip-version-check",
+    ]
+    if plan.index_url:
+        argv += ["--index-url", plan.index_url]
+    for extra in plan.extra_index_urls:
+        argv += ["--extra-index-url", extra]
+    for host in plan.trusted_hosts:
+        argv += ["--trusted-host", host]
+
+    try:
+        process = subprocess.run(  # noqa: S603 — the argv is built here
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        transcript.write(f"could not ask the index about {name}: {exc}")
+        return ()
+    if process.returncode != 0:
+        return ()
+    match = _AVAILABLE_VERSIONS_RE.search(process.stdout or "")
+    if not match:
+        return ()
+    return tuple(
+        item.strip() for item in match.group("versions").split(",") if item.strip()
+    )
+
+
+def _diagnose_source_only(
+    plan: InstallPlan,
+    *,
+    transcript: _Transcript,
+    tail: str,
+) -> tuple[SourceOnlyRequirement, ...]:
+    """Which unsatisfiable requirements the index actually HAS.
+
+    One index query per requirement pip named, bounded by
+    :data:`_MAX_INDEX_PROBES`. A requirement whose versions are on the index
+    while a wheel-only install could not find any distribution for it is, by
+    elimination, one with no wheel this interpreter can use.
+
+    Returns an empty tuple when the index confirms pip: the declaration really
+    does name a version that is not there, and the plain message is correct.
+    """
+    found: list[SourceOnlyRequirement] = []
+    for requirement in missing_distribution_requirements(tail)[:_MAX_INDEX_PROBES]:
+        name = requirement_name(requirement)
+        if name in plan.source_allowed:
+            # pip was allowed to build this one from source and still found
+            # nothing: the index cannot add anything the failure does not already
+            # say, and "no wheel" would be the wrong verdict — the build, or the
+            # version, is what failed.
+            continue
+        transcript.write(f"asking the index which versions of {name} exist")
+        matching = versions_matching(requirement, _index_versions(name, plan, transcript))
+        if not matching:
+            continue
+        transcript.write(
+            f"{name}: the index has {', '.join(matching[-5:])} — the install "
+            f"found none of them installable, so this package publishes no "
+            f"wheel for this interpreter"
+        )
+        found.append(
+            SourceOnlyRequirement(
+                requirement=requirement, name=name, versions=matching
+            )
+        )
+    return tuple(found)
+
+
+def _source_only_message(
+    records: tuple[SourceOnlyRequirement, ...], tail: str
+) -> str:
+    """One sentence per package with no usable wheel, then pip's own output."""
+    lead = "\n".join(item.message() for item in records)
+    return f"{lead}\n\n{tail}"
+
+
 def _classify_failure(
     output: str,
     exit_code: int,
@@ -1013,8 +1238,17 @@ def _classify_failure(
     tail = output[-_OUTPUT_TAIL_CHARS:]
 
     if "no matching distribution" in lowered or "could not find a version" in lowered:
+        # Deliberately NOT "this version does not exist on the index". pip prints
+        # this sentence for a filtered candidate set as well, and the index has
+        # already been asked by the time this runs (:func:`_diagnose_source_only`)
+        # — reaching here means it agreed with pip, or could not be reached at
+        # all. Both possibilities are named, because the reader's next action
+        # depends on which it was.
         reason = (
-            "no version matching the declaration exists on the configured index"
+            "pip found no installable distribution for the declaration. Either "
+            "no version on the index matches it, or the versions that match "
+            "publish no wheel for this interpreter — dependencies are installed "
+            "from wheels only, since the sandbox has no compiler toolchain"
         )
     elif "none of the wheels" in lowered or "no binary" in lowered or (
         "source distribution" in lowered
@@ -1154,6 +1388,7 @@ def _tree_size(target: Path) -> int:
 __all__ = [
     "ERR_DEPS_DECLARATION",
     "ERR_DEPS_INSTALL",
+    "ERR_DEPS_NO_WHEEL",
     "ERR_DEPS_PLATFORM_CONFLICT",
     "ERR_DEPS_PLATFORM_TRANSITIVE",
     "ERR_DEPS_SHADOWED",

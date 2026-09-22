@@ -12,6 +12,7 @@ Three things are asserted here, in order of importance:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -587,3 +588,74 @@ class TestBackendLifecycle:
 
         with pytest.raises(TaskSubmissionError, match="unknown task backend"):
             asyncio.run(submitter.submit("sqlmesh.plan", "/w/copy"))
+
+
+class TestLocalVehiclePackage:
+    """The local backend spawns `python -m src.main` from the runner package.
+
+    It has no image to pull and no cluster to talk to, so its ONE precondition is
+    a directory — which makes it the easiest thing in the plane to forget: the
+    container image used to ship without the package, and the omission surfaced
+    as a failed dependency install ("could not start a sandbox") three layers
+    away from the COPY that caused it.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+    def test_the_default_resolution_is_the_sibling_checkout(self, monkeypatch):
+        """Untouched config finds the package next to workspace-runtime/.
+
+        That is the layout of a source checkout AND of the container image
+        (/app/workspace-runtime/src/... -> /app/task-runner), so one default
+        covers both.
+        """
+        monkeypatch.setattr("src.tasks.backends.local.settings.task_runner_root", "")
+        from src.tasks.backends.local import _resolve_runner_root
+
+        assert _resolve_runner_root() == self._REPO_ROOT / "task-runner"
+
+    def test_a_configured_root_wins(self, monkeypatch, tmp_path):
+        package = tmp_path / "runner"
+        (package / "src").mkdir(parents=True)
+        (package / "src" / "main.py").write_text("", encoding="utf-8")
+        monkeypatch.setattr(
+            "src.tasks.backends.local.settings.task_runner_root", str(package)
+        )
+        from src.tasks.backends.local import _resolve_runner_root
+
+        assert _resolve_runner_root() == package.resolve()
+
+    def test_a_missing_package_names_the_setting_and_the_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            "src.tasks.backends.local.settings.task_runner_root", str(tmp_path / "nope")
+        )
+        from src.tasks.backends.local import _resolve_runner_root
+
+        with pytest.raises(TaskBackendError) as excinfo:
+            _resolve_runner_root()
+        message = str(excinfo.value)
+        assert "task.runner_root" in message
+        assert str(tmp_path / "nope") in message
+
+    def test_the_startup_preflight_refuses_a_broken_image(self, monkeypatch, tmp_path):
+        """Checked at boot, so the rollout fails instead of the first install."""
+        monkeypatch.setattr(
+            "src.tasks.backends.local.settings.task_runner_root", str(tmp_path / "nope")
+        )
+        from src.tasks.backends.local import assert_vehicle_available
+
+        with pytest.raises(TaskBackendError):
+            assert_vehicle_available()
+
+    def test_the_startup_preflight_passes_when_the_package_is_present(
+        self, monkeypatch, tmp_path
+    ):
+        package = tmp_path / "runner"
+        (package / "src").mkdir(parents=True)
+        (package / "src" / "main.py").write_text("", encoding="utf-8")
+        monkeypatch.setattr(
+            "src.tasks.backends.local.settings.task_runner_root", str(package)
+        )
+        from src.tasks.backends.local import assert_vehicle_available
+
+        assert_vehicle_available()  # does not raise

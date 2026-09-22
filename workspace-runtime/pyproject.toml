@@ -96,14 +96,22 @@ allow-direct-references = true
 mysql = ["aiomysql>=0.2.0", "pymysql>=1.1.0"]
 clickhouse = ["clickhouse-connect>=0.8.0"]
 # Also the opt-in for pyspark in USER code: installed this way, pyspark becomes
-# importable from code locations too, since they share this interpreter.
+# importable from code locations too, since they share this interpreter — and it
+# becomes part of the platform BASELINE, so a working copy that declares pyspark
+# installs nothing instead of failing.
 #
-# Deliberately NOT in the default image. PySpark ships as a source distribution
-# of ~450 MB (it bundles the JVM jars), and running it additionally needs a JRE
-# that the slim base image does not carry — so baking it in would add well over
-# half a gigabyte to every replica for the benefit of the deployments that
-# actually use Spark. `pip install "./workspace-runtime[spark]"` in a derived
-# image is the supported way to opt in.
+# That failure is the reason this extra is the only supported route. PyPI carries
+# exactly one artefact per pyspark release: a ~300 MB SOURCE distribution (it
+# bundles the JVM jars). The dependency installer takes wheels only — there is no
+# compiler in the install sandbox and a package's build script is never executed —
+# so `pyspark>=3.5.0` in `asset-dag/pyproject.toml` fails with `deps_no_wheel` for
+# every version that exists. Declaring it is not the fix; being in the image is.
+#
+# Deliberately NOT in the default image: pyspark plus the JRE it needs is well
+# over half a gigabyte on every replica, for the benefit of the deployments that
+# actually use Spark. `docker build --build-arg RUNTIME_EXTRAS=spark` (see the
+# Dockerfile, which also installs the JRE) is how a deployment opts in;
+# `pip install "./workspace-runtime[spark]"` is the equivalent for a dev venv.
 spark = ["pyspark>=3.5.0"]
 trino = ["trino>=0.330.0"]
 mssql = ["pyodbc>=5.1.0"]

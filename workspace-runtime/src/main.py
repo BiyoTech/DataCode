@@ -174,6 +174,21 @@ async def lifespan(app: FastAPI):
 
         assert_vehicle_supported(isolation)
 
+    # Task vehicle (`task.backend`, design 06 P6a): the local vehicle spawns the
+    # task-runner package as a child of this process, so a missing package is a
+    # PACKAGING error rather than a user error — same reasoning as the vehicle
+    # above, and the same reason to refuse the boot instead of failing the first
+    # dependency install with a message only its operator can act on.
+    #
+    # Not reachable on Kubernetes: that profile selects the `kubernetes` backend,
+    # which runs the separate task-runner image and never reads a local package.
+    from src.isolation.policy import BACKEND_LOCAL
+
+    if (settings.task_backend or "").strip().lower() == BACKEND_LOCAL:
+        from src.tasks.backends.local import assert_vehicle_available
+
+        assert_vehicle_available()
+
     # Dagster data plane: the instance daemon and webserver (local mode) plus
     # the supervisor that respawns them and every code location.
     #

@@ -18,7 +18,7 @@ import pytest
 
 import src.sqlmesh.metadata_context as md_module
 from src.sqlmesh.metadata_context import MetadataContextStore
-from src.utils.errors import ModelNotFoundError, ServiceError
+from src.utils.errors import ErrorCode, ModelNotFoundError, ServiceError
 
 WS = "/data/workspaces/t1/ws1/user/env"
 
@@ -165,6 +165,56 @@ class TestErrorTranslation:
         assert verdict == {"valid": True, "errors": [], "warnings": []}
 
 
+class TestWarehouseFailures:
+    """An unreachable warehouse is the user's config to fix, not a 500.
+
+    Before this classification the driver's text travelled as an opaque
+    ``op_failed`` and reached the API as INTERNAL_ERROR with the reason only in
+    ``detail`` — so a wrong host in sql-warehouse/config.yaml looked like a
+    platform incident.
+    """
+
+    async def test_an_unreachable_warehouse_is_a_503_not_a_500(self, store, manager):
+        from src.executor.process import ExecutorError
+
+        manager.error = ExecutorError(
+            "db_connection_error",
+            'connection to server at "10.0.0.1", port 5432 failed: timeout expired',
+        )
+
+        with pytest.raises(ServiceError) as excinfo:
+            await store.models(WS, gateway="postgres")
+
+        assert excinfo.value.code == ErrorCode.DB_CONNECTION_ERROR
+        assert excinfo.value.status_code == 503
+        # The driver's own text is the message: it names the host that could not
+        # be reached, which is the one thing the user can act on.
+        assert "10.0.0.1" in excinfo.value.message
+
+    async def test_a_warehouse_engine_error_keeps_its_422(self, store, manager):
+        from src.executor.process import ExecutorError
+
+        manager.error = ExecutorError("db_engine_error", 'relation "x" does not exist')
+
+        with pytest.raises(ServiceError) as excinfo:
+            await store.environments(WS, gateway="postgres")
+
+        assert excinfo.value.code == ErrorCode.DB_ENGINE_ERROR
+        assert excinfo.value.status_code == 422
+        assert "does not exist" in excinfo.value.message
+
+    async def test_model_not_found_still_wins_over_the_db_classification(
+        self, store, manager
+    ):
+        """Specific beats generic: a 404 is more useful than a 503."""
+        from src.executor.process import ExecutorError
+
+        manager.error = ExecutorError("model_not_found", "model not found: db.missing")
+
+        with pytest.raises(ModelNotFoundError):
+            await store.model_detail(WS, "db.missing", gateway="postgres")
+
+
 class TestGatewayAggregation:
     async def test_no_gateway_lists_every_gateway_merged(self, store, manager, monkeypatch):
         """One gateway failing must not blank the whole listing."""
@@ -202,6 +252,71 @@ class TestGatewayAggregation:
             if c[1] == "metadata.models"
         }
         assert gateways_called  # aggregation actually queried gateways
+        # The failure is REPORTED, not dropped: a partial listing the client
+        # cannot tell apart from a complete one is how an unreachable warehouse
+        # became "this project has no models" with nothing on screen.
+        assert result["gateway_errors"][0]["gateway"] == "broken"
+        # The REASON, not just "the sandbox failed": a gateway that could not be
+        # loaded is the user's config to fix, so the entry has to say why.
+        assert "no credentials" in result["gateway_errors"][0]["message"]
+
+    async def test_every_gateway_failing_raises_instead_of_returning_empty(
+        self, store, manager, monkeypatch
+    ):
+        """`{"models": []}` here is indistinguishable from an empty project."""
+
+        class FakeGatewayConfig:
+            def __init__(self, name):
+                self.name = name
+
+        class FakeConfig:
+            gateways = {"broken": FakeGatewayConfig("broken")}
+            default_gateway_name = "broken"
+
+        import src.sqlmesh.config_access as config_access
+
+        monkeypatch.setattr(
+            config_access, "load_workspace_config", lambda ws: FakeConfig()
+        )
+
+        async def fake_call(workspace_path, environment, op, params=None, *, gateway=""):
+            raise md_module.ExecutorError(
+                "db_connection_error", 'connection to server at "10.0.0.1" failed'
+            )
+
+        monkeypatch.setattr(manager, "call", fake_call)
+
+        with pytest.raises(ServiceError) as excinfo:
+            await store.models(WS)
+
+        assert excinfo.value.code == ErrorCode.DB_CONNECTION_ERROR
+        assert "10.0.0.1" in excinfo.value.message
+
+    async def test_a_project_with_no_models_is_not_a_failure(
+        self, store, manager, monkeypatch
+    ):
+        """The negative control: empty is only a verdict when nothing failed."""
+
+        class FakeGatewayConfig:
+            def __init__(self, name):
+                self.name = name
+
+        class FakeConfig:
+            gateways = {"duck": FakeGatewayConfig("duck")}
+            default_gateway_name = "duck"
+
+        import src.sqlmesh.config_access as config_access
+
+        monkeypatch.setattr(
+            config_access, "load_workspace_config", lambda ws: FakeConfig()
+        )
+
+        async def fake_call(workspace_path, environment, op, params=None, *, gateway=""):
+            return {"models": []}
+
+        monkeypatch.setattr(manager, "call", fake_call)
+
+        assert await store.models(WS) == {"models": []}
 
 
 class TestInvalidateUnderPath:

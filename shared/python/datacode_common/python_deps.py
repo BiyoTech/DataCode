@@ -203,6 +203,16 @@ FAILURE_INSTALL_FAILED = "deps_install_failed"
 FAILURE_SHADOW_PLATFORM = "deps_shadow_platform"
 FAILURE_TOO_LARGE = "deps_too_large"
 FAILURE_INDEX_NOT_CONFIGURED = "deps_index_not_configured"
+# The index HAS a version the declaration accepts, but it publishes no wheel this
+# interpreter can install. Its own code because every other failure sends the user
+# to edit a version bound, and no bound can fix this one: the package ships only a
+# source distribution (or wheels for other interpreters), and the install sandbox
+# has no compiler and never runs a package's build script.
+#
+# Without this code the case is reported as FAILURE_INSTALL_FAILED with pip's
+# "(from versions: none)" line, which reads as "the version you asked for does not
+# exist" — a sentence that sent users to check a version number that was correct.
+FAILURE_NO_WHEEL = "deps_no_wheel"
 
 # ── packages that may never be shadowed ───────────────────────────────────
 #
@@ -463,6 +473,55 @@ class TransitiveConflict:
         return "".join(parts)
 
 
+@dataclass(frozen=True)
+class SourceOnlyRequirement:
+    """A requirement the index satisfies, but only with a source distribution.
+
+    The third shape of "cannot be installed", and the only one no edit to the
+    declaration can fix. A :class:`PlatformConflict` is fixed by accepting the
+    platform's version, a :class:`TransitiveConflict` by another release of the
+    declared package — here the version the user asked for exists and is exactly
+    the one they want; what is missing is a wheel, and the install sandbox
+    installs nothing else (no compiler, and no build script is ever executed).
+
+    Attributes:
+        requirement: The requirement as pip reported it unsatisfiable.
+        name: Canonical distribution name.
+        versions: Versions on the index that DO satisfy the requirement, newest
+            last. Carried because "the index has 4.0.1, 3.5.7, ..." is what turns
+            "no matching distribution" from a contradiction into a diagnosis.
+    """
+
+    requirement: str
+    name: str
+    versions: tuple[str, ...] = ()
+
+    @property
+    def newest(self) -> str:
+        return self.versions[-1] if self.versions else ""
+
+    def message(self) -> str:
+        have = f" (the index has {self.newest})" if self.newest else ""
+        return (
+            f"{self.requirement!r} cannot be installed: a matching version "
+            f"exists{have}, but it publishes no wheel this platform can install "
+            f"— only a source distribution, or wheels for other interpreters. "
+            f"Dependencies are installed from wheels only: the install sandbox "
+            f"has no compiler toolchain and never runs a package's build "
+            f"script. Either declare a package that ships wheels, or ask an "
+            f"operator to add {self.name} to the platform image (it is then "
+            f"importable without being declared) or to allow source builds for "
+            f"it (deps.allow_source_packages)."
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requirement": self.requirement,
+            "name": self.name,
+            "versions": list(self.versions),
+        }
+
+
 class ShadowedPlatformPackage(ValueError):
     """A finished overlay contains a platform distribution nobody yielded.
 
@@ -665,6 +724,21 @@ class InstallPlan:
     index_url: str = ""
     extra_index_urls: tuple[str, ...] = ()
     trusted_hosts: tuple[str, ...] = ()
+    # Declared packages an OPERATOR allows to be built from a source
+    # distribution, as canonical names (``deps.allow_source_packages``). Empty by
+    # default, which is the shipped behaviour: wheels only.
+    #
+    # The escape hatch for a package that publishes no wheel at all — pyspark is
+    # the canonical example, it ships one 300 MB sdist that merely unpacks bundled
+    # jars. Opting in re-admits the one code path the wheel-only rule exists to
+    # close (a build backend running inside the install sandbox), so it is a
+    # deployment decision, per package, never something a working copy can ask for.
+    allow_source_packages: tuple[str, ...] = ()
+
+    @property
+    def source_allowed(self) -> frozenset[str]:
+        """Canonical names this deployment allows to build from source."""
+        return frozenset(self.allow_source_packages)
 
     @property
     def baseline(self) -> dict[str, str]:
@@ -686,6 +760,7 @@ class InstallPlan:
             "index_url": self.index_url,
             "extra_index_urls": list(self.extra_index_urls),
             "trusted_hosts": list(self.trusted_hosts),
+            "allow_source_packages": list(self.allow_source_packages),
         }
 
     @classmethod
@@ -718,7 +793,24 @@ class InstallPlan:
             trusted_hosts=tuple(
                 str(item) for item in (params.get("trusted_hosts") or ())
             ),
+            allow_source_packages=_canonical_names(
+                params.get("allow_source_packages")
+            ),
         )
+
+
+def _canonical_names(value: Any) -> tuple[str, ...]:
+    """Coerce a transported list of distribution names, sorted and canonical.
+
+    Anything unreadable becomes the empty tuple rather than a partial list: every
+    consumer of this shape treats "no names" as the restrictive default, so a
+    malformed payload must not be able to widen a rule.
+    """
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        sorted({canonicalize_name(str(item)) for item in value if item})
+    )
 
 
 def _baseline_pairs(value: Any) -> tuple[tuple[str, str], ...]:
@@ -889,6 +981,80 @@ def relax_upper_bounds(requirement: str) -> str:
     specifier = ",".join(sorted(str(spec) for spec in kept))
     marker = f"; {req.marker}" if req.marker else ""
     return f"{name}{extras}{specifier}{marker}"
+
+
+# The two sentences pip uses when it found no installable distribution. BOTH are
+# needed: the first is printed by the resolver, the second by the installer, and
+# which one appears depends on where in the run pip gave up.
+#
+#   ERROR: Could not find a version that satisfies the requirement pyspark>=3.5.0
+#          (from versions: none)
+#   ERROR: No matching distribution found for pyspark>=3.5.0
+#
+# Note what the message does NOT say: whether the version is absent from the
+# index, or present but filtered out by ``--only-binary=:all:``. "from versions:
+# none" is printed for both, because the candidates were filtered before the list
+# was built — which is why recognising this shape is only the first half of a
+# diagnosis (see the runner's index probe).
+_MISSING_DISTRIBUTION_RE = re.compile(
+    r"(?:could not find a version that satisfies the requirement"
+    r"|no matching distribution found for)\s+(?P<requirement>[^\s()]+)",
+    re.IGNORECASE,
+)
+
+
+def is_missing_distribution(output: str) -> bool:
+    """Whether pip failed because it found nothing installable to download."""
+    return bool(_MISSING_DISTRIBUTION_RE.search(output))
+
+
+def missing_distribution_requirements(output: str) -> tuple[str, ...]:
+    """Requirements pip reported as having no installable distribution.
+
+    Read from pip's output rather than from the declaration, because the
+    unsatisfiable requirement is frequently NOT one the user wrote: it can be a
+    transitive dependency, and its specifier then exists nowhere else.
+
+    Returns normalised requirement strings, first mention first, de-duplicated.
+    Tokens that are not valid PEP 508 are skipped: this parses English, so it
+    must degrade to "no diagnosis" rather than to a wrong one.
+    """
+    found: list[str] = []
+    for match in _MISSING_DISTRIBUTION_RE.finditer(output):
+        try:
+            requirement = _normalise_requirement(match.group("requirement"))
+        except DepsDeclarationError:
+            continue
+        if requirement not in found:
+            found.append(requirement)
+    return tuple(found)
+
+
+def versions_matching(requirement: str, versions: Iterable[str]) -> tuple[str, ...]:
+    """The versions in *versions* that satisfy *requirement*, oldest first.
+
+    Sorted by version rather than by the order the index listed them, so the last
+    element is the newest match and can be named in a message. Unparsable
+    versions are dropped.
+    """
+    try:
+        req = Requirement(requirement)
+    except InvalidRequirement:
+        return ()
+    parsed: list[Version] = []
+    for raw in versions:
+        try:
+            candidate = Version(str(raw).strip())
+        except InvalidVersion:
+            continue
+        # prereleases=True for the same reason as :func:`_satisfies`: an index
+        # that only has a release candidate still HAS the package, and reporting
+        # "nothing matches" would hide the actual problem.
+        if req.specifier.contains(candidate, prereleases=True) or not str(
+            req.specifier
+        ):
+            parsed.append(candidate)
+    return tuple(str(item) for item in sorted(parsed))
 
 
 def blockers_from_resolution(
@@ -1579,6 +1745,7 @@ __all__ = [
     "FAILURE_DECLARATION_INVALID",
     "FAILURE_INDEX_NOT_CONFIGURED",
     "FAILURE_INSTALL_FAILED",
+    "FAILURE_NO_WHEEL",
     "FAILURE_PLATFORM_CONFLICT",
     "FAILURE_PLATFORM_TRANSITIVE",
     "FAILURE_SHADOW_PLATFORM",
@@ -1605,6 +1772,7 @@ __all__ = [
     "PlatformConflict",
     "PlatformCoreConflict",
     "ShadowedPlatformPackage",
+    "SourceOnlyRequirement",
     "TransitiveConflict",
     "baseline_constraints",
     "blockers_from_resolution",
@@ -1620,8 +1788,10 @@ __all__ = [
     "interpreter_mismatch",
     "interpreter_platform_tag",
     "interpreter_python_version",
+    "is_missing_distribution",
     "manifest_path",
     "manifest_state",
+    "missing_distribution_requirements",
     "parse_declaration",
     "pins_implicated_in_conflict",
     "relax_upper_bounds",
@@ -1631,4 +1801,5 @@ __all__ = [
     "site_packages_path",
     "split_platform_provided",
     "utc_now_iso",
+    "versions_matching",
 ]

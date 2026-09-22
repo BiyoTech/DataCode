@@ -49,7 +49,10 @@ task:
   #               backend validates at startup.
   backend: "local"
   # Root of the task-runner package (holds src/main.py). Empty resolves to the
-  # sibling task-runner/ directory of this checkout.
+  # sibling task-runner/ directory of this checkout — which is also where the
+  # container image bakes it (/app/task-runner), so the default holds in a
+  # container too. Only the `local` backend reads it: `kubernetes` runs the
+  # separate task-runner image.
   runner_root: ""
   # Ceiling on top of the profile's own timeout: a profile may allow an hour
   # while a deployment still wants a shorter maximum.
@@ -107,6 +110,26 @@ deps:
   # wins. Comma-separated. This is the key a failed install names when the pin
   # in the way is one only an operator can release.
   relaxable_packages: ""
+  # Packages allowed to be BUILT FROM SOURCE. Comma-separated canonical names,
+  # empty means wheels only — which is the rule, not a default: the install
+  # sandbox has no compiler, and unpacking a source distribution runs that
+  # package's own build script inside it.
+  #
+  # The escape hatch for a package that publishes no wheel at all. `pyspark` is
+  # the example: PyPI carries a single ~300 MB sdist for every release, so a
+  # wheel-only install of it fails with `deps_no_wheel` no matter what version is
+  # declared. Two things to know before using this instead of the runtime image:
+  #
+  #   * the permission is per package, in the pip invocation as well: the general
+  #     wheel-only flag stays and is overridden by NAME for these packages only,
+  #     so nothing else in the same resolution gains a source build.
+  #   * a source build needs whatever the package's build backend needs. Anything
+  #     with a C extension still fails here, just later and with a compiler error.
+  #
+  # The better answer for a package a whole deployment needs is the image:
+  # `docker build --build-arg RUNTIME_EXTRAS=spark` makes pyspark part of the
+  # platform baseline, importable without being declared at all.
+  allow_source_packages: ""
 
 error_archive:
   enabled: true

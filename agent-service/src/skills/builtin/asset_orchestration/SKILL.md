@@ -155,6 +155,14 @@ The rules, and why each one exists:
     what you declared (the failure carries a rewrite that pip verified), or tell
     the user an operator has to upgrade the baseline. Do not attempt to install
     the blocking package yourself — that is the one thing the platform refuses.
+- **Only wheels are installed.** The install sandbox has no compiler and never
+  runs a package's build script. A package that publishes only a source
+  distribution therefore cannot be installed at any version, and fails with
+  `deps_no_wheel` naming it — `pyspark` is the usual one (PyPI carries a single
+  ~300 MB sdist per release). Do NOT try other version bounds: the failure says
+  a matching version EXISTS, so changing the bound cannot help. Either use a
+  package that ships wheels, or tell the user an operator must add it to the
+  platform image (then it is importable without being declared at all).
 
 **Check before reloading** (both are cheap and install nothing):
 

@@ -66,7 +66,7 @@ def fake_pip(monkeypatch, tmp_path):
     """
     calls: list[list[str]] = []
 
-    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript):
+    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         calls.append(list(requirements))
         transcript.write("Collecting polars")
         for name in requirements:
@@ -232,7 +232,7 @@ def test_a_transitive_baseline_version_is_removed_from_the_overlay(
     """
     path = _workspace(tmp_path)
 
-    def _pull_numpy(requirements, target, workspace_path, plan, constraints, transcript):
+    def _pull_numpy(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         _dist_info(Path(target), "polars", "1.2.0")
         _dist_info(Path(target), "numpy", "1.26.4")  # == the baseline
 
@@ -262,7 +262,7 @@ def test_a_record_entry_pointing_outside_the_overlay_is_ignored(
     victim = Path(path) / "asset-dag" / "definitions.py"
     victim.write_text("defs = None\n")
 
-    def _evil(requirements, target, workspace_path, plan, constraints, transcript):
+    def _evil(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         _dist_info(Path(target), "numpy", "1.26.4")
         info = Path(target) / "numpy-1.26.4.dist-info"
         (info / "RECORD").write_text("../../asset-dag/definitions.py,sha256=x,10\n")
@@ -293,7 +293,7 @@ def test_a_failed_install_leaves_no_partial_tree(monkeypatch, tmp_path):
     """A half tree on PYTHONPATH is an import error inside user code."""
     path = _workspace(tmp_path)
 
-    def _explode(requirements, target, workspace_path, plan, constraints, transcript):
+    def _explode(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         _dist_info(Path(target), "half", "0.1.0")
         raise SqlMeshOpError(deps_ops.ERR_DEPS_INSTALL, "boom")
 
@@ -326,7 +326,7 @@ def test_a_surviving_shadow_fails_the_install(monkeypatch, tmp_path):
     path = _workspace(tmp_path)
 
     def _pull_old_numpy(
-        requirements, target, workspace_path, plan, constraints, transcript
+        requirements, target, workspace_path, plan, constraints, transcript, **_kwargs
     ):
         _dist_info(Path(target), "polars", "1.2.0")
         _dist_info(Path(target), "numpy", "1.20.0")  # != the baseline
@@ -345,7 +345,7 @@ def test_shadowing_a_protected_package_names_the_consequence(monkeypatch, tmp_pa
     path = _workspace(tmp_path)
 
     def _pull_grpcio(
-        requirements, target, workspace_path, plan, constraints, transcript
+        requirements, target, workspace_path, plan, constraints, transcript, **_kwargs
     ):
         _dist_info(Path(target), "polars", "1.2.0")
         _dist_info(Path(target), "grpcio", "1.0.0")
@@ -367,9 +367,15 @@ def test_shadowing_a_protected_package_names_the_consequence(monkeypatch, tmp_pa
 @pytest.mark.parametrize(
     ("output", "expected"),
     [
-        ("ERROR: No matching distribution found for polars", "no version matching"),
+        (
+            "ERROR: No matching distribution found for polars",
+            "no installable distribution",
+        ),
         ("ResolutionImpossible: conflicting versions", "cannot be satisfied together"),
-        ("ERROR: Could not find a version that satisfies", "no version matching"),
+        (
+            "ERROR: Could not find a version that satisfies",
+            "no installable distribution",
+        ),
         ("proxy CONNECT tunnel failed", "unreachable from the sandbox"),
         ("something nobody anticipated", "pip exited with code 1"),
     ],
@@ -380,6 +386,23 @@ def test_pip_failures_are_classified_before_the_raw_output(output, expected):
     assert expected in message
     # pip's own text is frequently the only place the version pair appears.
     assert output in message
+
+
+def test_a_missing_distribution_is_not_claimed_to_be_a_missing_version():
+    """pip prints "(from versions: none)" for a FILTERED candidate set too.
+
+    The old wording asserted the version did not exist on the index, which sent
+    users to check a version number that was correct — the package simply ships
+    no wheel. Both possibilities are named now, because reaching this sentence
+    means the index either agreed with pip or could not be asked.
+    """
+    message = deps_ops._classify_failure(
+        "ERROR: No matching distribution found for pyspark>=3.5.0", 1
+    )
+
+    assert "no version on the index matches it" in message
+    assert "publish no wheel" in message
+    assert "exists on the configured index" not in message
 
 
 def test_a_conflict_against_a_baseline_pin_is_worded_differently():
@@ -645,10 +668,12 @@ def test_an_unfixable_declaration_says_none_fits_rather_than_guessing(
 
 
 def test_a_failure_that_is_not_a_resolution_is_not_diagnosed(monkeypatch, tmp_path):
-    """A missing wheel cannot be fixed by rewriting a bound.
+    """A missing distribution cannot be fixed by rewriting a version bound.
 
-    Probing it would double the wait and then say nothing, so the diagnosis is
-    gated on pip actually failing to resolve.
+    So the RESOLUTION diagnosis — two extra resolves per requirement — is gated on
+    pip actually failing to resolve. The index is still asked one question (is the
+    version there at all?), which is a different and much cheaper one; here it
+    answers "no", so the plain failure stands.
     """
     path = _workspace(tmp_path)
     _failing_pip(monkeypatch, "ERROR: No matching distribution found for feast==9")
@@ -657,12 +682,15 @@ def test_a_failure_that_is_not_a_resolution_is_not_diagnosed(monkeypatch, tmp_pa
         raise AssertionError("a non-resolution failure must not be diagnosed")
 
     monkeypatch.setattr(deps_ops, "_probe_resolution", _explode)
+    monkeypatch.setattr(
+        deps_ops, "_index_versions", lambda name, plan, transcript: ()
+    )
 
     with pytest.raises(SqlMeshOpError) as excinfo:
         deps_ops.op_deps_sync(path, _params("feast==9", baseline={"numpy": "2.5.2"}))
 
     assert excinfo.value.code == deps_ops.ERR_DEPS_INSTALL
-    assert "no version matching the declaration" in str(excinfo.value)
+    assert "no installable distribution" in str(excinfo.value)
 
 
 # ── yielding a platform pin ───────────────────────────────────────────────
@@ -689,7 +717,7 @@ def _two_pass_pip(monkeypatch, *, second_succeeds: bool) -> list[dict]:
     """
     attempts: list[dict] = []
 
-    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript):
+    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         body = Path(constraints).read_text()
         attempts.append({"pins": body, "requirements": list(requirements)})
         if len(attempts) == 1:
@@ -758,7 +786,7 @@ def test_a_conflict_over_a_protected_pin_is_not_retried(monkeypatch, tmp_path):
     path = _workspace(tmp_path)
     attempts: list[str] = []
 
-    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript):
+    def _fake_run(requirements, target, workspace_path, plan, constraints, transcript, **_kwargs):
         attempts.append(Path(constraints).read_text())
         # The conflict marker matters: the yield path is gated on pip having
         # failed to RESOLVE, so an output without it would make this test pass
@@ -914,3 +942,210 @@ def test_a_dead_end_names_the_protected_blocker(monkeypatch, tmp_path):
     assert "deps.relaxable_packages" in str(excinfo.value) or "operator" in str(
         excinfo.value
     )
+
+
+# ── no wheel: the index has the version, pip could not use it ─────────────
+#
+# Verbatim from the failure that forced this diagnosis. pyspark publishes one
+# source distribution per release and no wheel at all, so a wheel-only install
+# prints the same "(from versions: none)" it prints for a version that does not
+# exist — and the user was told to fix a version number that was correct.
+_REAL_NO_WHEEL = """Collecting feast>=0.60.0 (from feast[postgres]>=0.60.0)
+  Using cached feast-0.66.0-py3-none-any.whl.metadata (27 kB)
+ERROR: Could not find a version that satisfies the requirement pyspark>=3.5.0 (from versions: none)
+ERROR: No matching distribution found for pyspark>=3.5.0
+"""
+
+
+def test_a_package_that_ships_no_wheel_is_reported_as_such(monkeypatch, tmp_path):
+    """The index is asked, because pip's own output cannot answer the question.
+
+    The failure code matters more than the prose here: `deps_install_failed`
+    sends the agent and the user to edit the declaration, and no edit to it can
+    make a wheel exist.
+    """
+    path = _workspace(tmp_path)
+    _failing_pip(monkeypatch, _REAL_NO_WHEEL)
+    _no_probe(monkeypatch)
+    asked: list[str] = []
+
+    def _versions(name, plan, transcript):
+        asked.append(name)
+        return ("4.0.1", "4.0.0", "3.5.7")
+
+    monkeypatch.setattr(deps_ops, "_index_versions", _versions)
+
+    with pytest.raises(SqlMeshOpError) as excinfo:
+        deps_ops.op_deps_sync(path, _params("pyspark>=3.5.0"))
+
+    assert excinfo.value.code == deps_ops.ERR_DEPS_NO_WHEEL
+    # Only the requirement pip named, not every declared package.
+    assert asked == ["pyspark"]
+    message = str(excinfo.value)
+    assert "4.0.1" in message, "the version the index HAS is the diagnosis"
+    assert "platform image" in message and "deps.allow_source_packages" in message
+    # The structured record travels too: the reload envelope carries it.
+    assert excinfo.value.detail["source_only"][0]["name"] == "pyspark"
+
+
+def test_a_version_that_really_is_absent_keeps_the_plain_failure(
+    monkeypatch, tmp_path
+):
+    """The negative control, and the reason the index is consulted at all.
+
+    A typo in a version bound must not be reported as "ask an operator to change
+    the platform image".
+    """
+    path = _workspace(tmp_path)
+    _failing_pip(
+        monkeypatch,
+        "ERROR: No matching distribution found for polars>=99.0\n",
+    )
+    _no_probe(monkeypatch)
+    # The index serves the project, but nothing that satisfies the declaration.
+    monkeypatch.setattr(
+        deps_ops, "_index_versions", lambda name, plan, transcript: ("1.2.0",)
+    )
+
+    with pytest.raises(SqlMeshOpError) as excinfo:
+        deps_ops.op_deps_sync(path, _params("polars>=99.0"))
+
+    assert excinfo.value.code == deps_ops.ERR_DEPS_INSTALL
+
+
+def test_an_unreachable_index_does_not_invent_a_diagnosis(monkeypatch, tmp_path):
+    """A diagnosis that cannot be produced must not replace the real failure."""
+    path = _workspace(tmp_path)
+    _failing_pip(monkeypatch, _REAL_NO_WHEEL)
+    _no_probe(monkeypatch)
+    monkeypatch.setattr(
+        deps_ops, "_index_versions", lambda name, plan, transcript: ()
+    )
+
+    with pytest.raises(SqlMeshOpError) as excinfo:
+        deps_ops.op_deps_sync(path, _params("pyspark>=3.5.0"))
+
+    assert excinfo.value.code == deps_ops.ERR_DEPS_INSTALL
+
+
+# ── the operator's escape hatch ───────────────────────────────────────────
+
+
+def test_allowing_source_builds_names_the_package_not_the_install(
+    monkeypatch, tmp_path
+):
+    """The permission is per package, and pip can express exactly that.
+
+    `--only-binary=:all:` stays, and a per-name `--no-binary=pyspark` overrides it
+    for that name alone — pip's FormatControl tests the name BEFORE the `:all:`
+    entry. The order on the command line is the other half of the contract: a
+    `--only-binary=:all:` seen after the per-name flag clears it, so the general
+    flag must come first or the exception is silently revoked.
+    """
+    path = _workspace(tmp_path)
+    recorded = _failing_pip(monkeypatch, "Collecting pyspark\n", exit_code=0)
+
+    deps_ops.op_deps_sync(
+        path, _params("pyspark>=3.5.0", allow_source_packages=("PySpark",))
+    )
+
+    argv = recorded[0]
+    assert "--only-binary=:all:" in argv, (
+        "dropping the general flag would let every package in this resolution "
+        "build from source, which is not what the operator allowed"
+    )
+    # Canonicalised, so the config file's spelling cannot miss the requirement's.
+    assert "--no-binary=pyspark" in argv
+    assert argv.index("--only-binary=:all:") < argv.index("--no-binary=pyspark")
+    # Still bounded by the baseline: a source build is not permission to shadow
+    # a platform package.
+    assert "--constraint" in argv
+
+
+def test_the_transcript_says_source_builds_were_allowed(monkeypatch, tmp_path):
+    """The permission is per package, its EFFECT is per install. Say so."""
+    path = _workspace(tmp_path)
+    _failing_pip(monkeypatch, "Collecting pyspark\n", exit_code=0)
+
+    deps_ops.op_deps_sync(
+        path, _params("pyspark>=3.5.0", allow_source_packages=("pyspark",))
+    )
+
+    log = (Path(path) / ".datacode" / "deps" / "install.log").read_text()
+    assert "deps.allow_source_packages" in log
+    assert "pyspark" in log
+    # The scope is stated, because "a source build was allowed" reads much wider
+    # than it is.
+    assert "every other package in this install stays wheel-only" in log
+
+
+def test_a_package_nobody_allowed_gets_no_exception(monkeypatch, tmp_path):
+    """The allow-list is matched against THIS install's requirements."""
+    path = _workspace(tmp_path)
+    recorded = _failing_pip(monkeypatch, "Collecting polars\n", exit_code=0)
+
+    deps_ops.op_deps_sync(
+        path, _params("polars>=1.0", allow_source_packages=("pyspark",))
+    )
+
+    argv = recorded[0]
+    assert "--only-binary=:all:" in argv
+    assert not any(item.startswith("--no-binary") for item in argv)
+
+
+def test_an_allowed_source_build_that_fails_is_not_diagnosed_as_missing_wheel(
+    monkeypatch, tmp_path
+):
+    """Probing the index would only rediscover the version pip just refused."""
+    path = _workspace(tmp_path)
+    _failing_pip(monkeypatch, _REAL_NO_WHEEL)
+    _no_probe(monkeypatch)
+
+    def _must_not_run(name, plan, transcript):
+        raise AssertionError("the index must not be asked for an allowed build")
+
+    monkeypatch.setattr(deps_ops, "_index_versions", _must_not_run)
+
+    with pytest.raises(SqlMeshOpError) as excinfo:
+        deps_ops.op_deps_sync(
+            path, _params("pyspark>=3.5.0", allow_source_packages=("pyspark",))
+        )
+
+    assert excinfo.value.code == deps_ops.ERR_DEPS_INSTALL
+
+
+def test_pips_format_control_confines_the_exception_to_the_named_package():
+    """The pip behaviour the per-package escape hatch rests on, asserted directly.
+
+    Two properties, both load-bearing and neither documented as stable:
+
+    * a per-name `--no-binary` overrides `--only-binary=:all:` for that name only
+      (`get_allowed_formats` tests the name BEFORE the `:all:` entry). Were that
+      ever reversed, the named package would end up with an EMPTY format set —
+      pip would then install nothing for it while exiting successfully, and the
+      first symptom would be a missing import inside user code;
+    * the general flag seen LAST clears the per-name exceptions
+      (`handle_mutual_excludes`), which is why the installer always emits it
+      first.
+
+    Reaching into pip's internals is the point here: this test exists to fail when
+    pip changes, not to describe the installer.
+    """
+    from pip._internal.models.format_control import FormatControl
+
+    ordered = FormatControl(set(), set())
+    ordered.handle_mutual_excludes(":all:", ordered.only_binary, ordered.no_binary)
+    ordered.handle_mutual_excludes("pyspark", ordered.no_binary, ordered.only_binary)
+    assert set(ordered.get_allowed_formats("pyspark")) == {"source"}
+    assert set(ordered.get_allowed_formats("polars")) == {"binary"}, (
+        "the exception leaked to a package the operator did not name"
+    )
+
+    reversed_order = FormatControl(set(), set())
+    reversed_order.handle_mutual_excludes(
+        "pyspark", reversed_order.no_binary, reversed_order.only_binary
+    )
+    reversed_order.handle_mutual_excludes(
+        ":all:", reversed_order.only_binary, reversed_order.no_binary
+    )
+    assert set(reversed_order.get_allowed_formats("pyspark")) == {"binary"}

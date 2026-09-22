@@ -22,6 +22,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Shared package first (layer caching: it changes less often than the service).
 COPY shared/python/ shared/python/
 COPY workspace-runtime/pyproject.toml workspace-runtime/
+# Extras baked into this image on top of `[usercode]`, comma-separated (see
+# workspace-runtime/pyproject.toml). This is how a package that user code needs
+# but PyPI ships without a wheel enters the PLATFORM BASELINE — `pyspark` is the
+# case that forced the knob: it publishes one ~300 MB source distribution per
+# release, and the dependency installer only installs wheels (no compiler in the
+# sandbox, no build script ever executed). A package in this image is provided by
+# the platform, so a working copy declaring it installs nothing at all.
+#
+#   docker build --build-arg RUNTIME_EXTRAS=spark ...
+#
+# Empty by default: every extra is paid for by every replica, and Spark alone is
+# well over half a gigabyte plus a JRE.
+ARG RUNTIME_EXTRAS=""
+
 # Install shared and the service in ONE pip command: the resolver then
 # satisfies the service's `datacode-common` requirement from the local
 # directory candidate (never published to any index). The PostgreSQL driver
@@ -32,12 +46,34 @@ COPY workspace-runtime/pyproject.toml workspace-runtime/
 # location, which runs on this interpreter. It is NOT an optional group here:
 # an asset that imports pandas is not a special deployment, it is the ordinary
 # case, and a promise that is only kept in the dev venv is not a promise.
-RUN pip install --no-cache-dir ./shared/python -e "./workspace-runtime[usercode]"
+RUN pip install --no-cache-dir ./shared/python \
+    -e "./workspace-runtime[usercode${RUNTIME_EXTRAS:+,${RUNTIME_EXTRAS}}]"
+
+# A JVM, and only when Spark was asked for. pyspark bundles the Spark jars but
+# not a runtime to execute them, so without this the import succeeds and the
+# first action fails with "JAVA_HOME is not set" — the quietest possible way to
+# ship a broken image.
+RUN case ",${RUNTIME_EXTRAS}," in \
+      *,spark,*) apt-get update \
+        && apt-get install -y --no-install-recommends default-jre-headless \
+        && rm -rf /var/lib/apt/lists/* ;; \
+    esac
 
 # Service source. conf/ is NOT baked in: container deployments mount a
 # config directory via CONFIG_PATH (see deploy/) so one image serves every
 # environment.
 COPY workspace-runtime/src/ workspace-runtime/src/
+
+# The task-runner package, for the LOCAL task backend (`task.backend: local`,
+# the single-node default). That vehicle spawns `python -m src.main` with this
+# package as the child's cwd, on THIS image's interpreter — there is no sibling
+# checkout inside a container to fall back to, so without this copy every
+# sandboxed task (deps install, agent shell) is refused at submit time.
+#
+# The Kubernetes backend does not read it: it runs the separate task-runner
+# image. Sharing the checkout here is deliberate — a version skew between the
+# two fails every deps.sync (see task-runner/src/deps_ops.py).
+COPY task-runner/src/ task-runner/src/
 
 WORKDIR /app/workspace-runtime
 

@@ -650,9 +650,11 @@ def create_native_shell_tool(
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "List of shell commands to execute sequentially inside the agent workspace. "
-                    "Each command runs in the workspace root with the agent-local "
-        "Python venv activated."
+                    "Shell commands to run sequentially, one command per string. "
+                    "Each runs with the working copy root as the working "
+                    "directory; do not prepend `cd`. A command containing `&&`, "
+                    "`;`, `|` or `$(...)` is treated as a compound command and "
+                    "cannot be served by the platform's governed verbs."
                 ),
             },
             "timeout_ms": {
@@ -780,10 +782,20 @@ def create_native_shell_tool(
     return FunctionTool(
         name="shell",
         description=(
-            "Execute shell commands inside the agent workspace. Supports batch execution of "
-            "multiple commands sequentially. The workspace has a Python 3.13 venv activated. "
-            "Returns structured JSON with stdout, stderr, exit_code, and "
-        "timed_out for each command."
+            "Run shell commands in the workspace. This is a GENERAL command "
+            "channel, not a CLI wrapper: git, ls, cat, grep, find, python, "
+            "project scripts — whatever the sandbox image provides — all work, "
+            "with the working copy root as the working directory. Commands in "
+            "one call run sequentially. Execution happens inside the platform's "
+            "sandbox: the environment is cleared (no platform addresses, no "
+            "credentials), network access is whatever the deployment's isolation "
+            "profile allows, and the sandbox is destroyed when the command "
+            "returns — so anything installed by hand is gone, and files must be "
+            "written into the working copy to survive. A few governed verbs "
+            "(`sqlmesh plan|apply`, `dc ...`) are served by the platform itself "
+            "instead of the sandbox; `pip install` is refused — declare packages "
+            "in asset-dag/pyproject.toml and run `dc deps sync`. Returns JSON "
+            "with stdout, stderr, exit_code and timed_out per command."
         ),
         params_json_schema=_PARAMS_SCHEMA,
         on_invoke_tool=_on_invoke,

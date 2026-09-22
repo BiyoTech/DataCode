@@ -34,6 +34,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from datacode_common.executor_protocol import (
+    ERR_DB_CONNECTION,
+    ERR_DB_ENGINE,
+    ERR_DB_TRANSACTION,
     OP_CONTEXT_REFRESH,
     OP_EVALUATE,
     OP_METADATA_COLUMNS,
@@ -95,6 +98,16 @@ _CACHEABLE_OPS = frozenset(
 # params) is execute-class, so lineage is special-cased in _cacheable().
 _LINEAGE_OP = OP_METADATA_LINEAGE
 
+# Warehouse failures the sandbox classified for us. They are NOT platform
+# faults: the connection settings live in the user's sql-warehouse/config.yaml,
+# so they surface as 503/422/409 with the driver's own text as the message
+# rather than as a 500 whose real reason is only in `detail`.
+_DB_ERRORS: dict[str, tuple[ErrorCode, int]] = {
+    ERR_DB_CONNECTION: (ErrorCode.DB_CONNECTION_ERROR, 503),
+    ERR_DB_ENGINE: (ErrorCode.DB_ENGINE_ERROR, 422),
+    ERR_DB_TRANSACTION: (ErrorCode.DB_TRANSACTION_ERROR, 409),
+}
+
 # Default TTL for cached metadata (seconds). Overridable via settings.
 _DEFAULT_TTL_SECONDS = 60.0
 
@@ -103,6 +116,27 @@ def _cacheable(op: str, params: Dict[str, Any]) -> bool:
     if op == _LINEAGE_OP:
         return not params.get("column")
     return op in _CACHEABLE_OPS
+
+
+def _gateway_error(gateway: str, exc: BaseException) -> Dict[str, Any]:
+    """One gateway's failure, in the shape the client can show.
+
+    Structured rather than a ``"gw: message"`` string so the frontend can name
+    the gateway and the error code separately — a 503 for one warehouse next to
+    a working listing is a different message from a configuration error.
+
+    The original text is appended when the translator had to keep a generic
+    top-level ``message``: a client told only "sandbox operation failed" cannot
+    act on it, and "no credentials" is the part that matters.
+    """
+    if isinstance(exc, ServiceError):
+        code = exc.code.value if isinstance(exc.code, ErrorCode) else str(exc.code)
+        text = exc.message
+        detail = exc.detail if isinstance(exc.detail, str) else ""
+        if detail and detail not in text:
+            text = f"{text}: {detail}"
+        return {"gateway": gateway, "code": code, "message": text}
+    return {"gateway": gateway, "code": "", "message": str(exc)}
 
 
 class _CachedPayload:
@@ -192,8 +226,12 @@ class MetadataContextStore:
 
         Aggregation mirrors the pre-split behavior: with no explicit gateway,
         every configured gateway's listing is fetched and merged (deduplicated
-        by FQN), and a gateway that fails to load is skipped rather than
-        blanking the whole listing.
+        by FQN). A gateway that fails is skipped when another one answered — but
+        its failure is REPORTED (``gateway_errors``), because a partial listing
+        the client cannot distinguish from a complete one is how an unreachable
+        warehouse turned into "this project has no models" with nothing on
+        screen to explain it. When NO gateway answered, the first failure is
+        raised instead: an empty list then would be a lie.
         """
         if gateway is not None:
             return await self._call(
@@ -223,7 +261,7 @@ class MetadataContextStore:
 
         merged: Dict[str, Dict[str, Any]] = {}
         metrics: List[Dict[str, Any]] = []
-        errors: List[str] = []
+        failures: List[tuple[str, BaseException]] = []
 
         # The default gateway is just one of the names; no special casing —
         # every gateway contributes its external models.
@@ -251,14 +289,21 @@ class MetadataContextStore:
                     gateway=gw,
                     error=str(result),
                 )
-                errors.append(f"{gw}: {result}")
+                failures.append((gw, result))
                 continue
             for item in result.get("models", []):
                 merged.setdefault(item.get("fqn", item.get("name", "")), item)
             metrics.extend(result.get("metrics", []))
 
+        if not merged and failures:
+            # Nothing was listed at all. Returning `{"models": []}` here is what
+            # made an unreachable warehouse look like an empty project.
+            raise failures[0][1]
+
         models = sorted(merged.values(), key=lambda m: m.get("fqn", m.get("name", "")))
         payload: Dict[str, Any] = {"models": models}
+        if failures:
+            payload["gateway_errors"] = [_gateway_error(gw, exc) for gw, exc in failures]
         if include_metrics:
             # Metric names are gateway-independent; dedupe + sort.
             seen = {m.get("name") for m in metrics}
@@ -606,6 +651,16 @@ class MetadataContextStore:
         """
         if exc.code == "model_not_found":
             return ModelNotFoundError(str(exc).removeprefix("model not found: "))
+        classified = _DB_ERRORS.get(exc.code)
+        if classified is not None:
+            code, status = classified
+            # Not archived: it is the user's warehouse to fix, and the driver's
+            # own text already says everything the archive would.
+            return ServiceError(
+                code=code,
+                message=str(exc) or "the warehouse refused the operation",
+                status_code=status,
+            )
         if exc.code == "lint_failed":
             # Structured lint results travel inside the error payload; keep
             # them on the ServiceError for the REST layer's 422 handling.

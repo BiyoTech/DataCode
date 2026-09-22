@@ -489,6 +489,8 @@ export default {
     owner: '负责人',
     lastModified: '最后修改',
     noModels: '项目中未找到模型。',
+    // 列表会跳过连不上的 gateway 而不是整体失败，因此树可能不完整却看不出异常。
+    gatewayUnavailable: '网关 “{gateway}” 无法读取',
     filterByKind: '按类型筛选',
     selectModel: '从左侧树中选择一个模型查看详情',
     search: '搜索模型...',
@@ -892,6 +894,8 @@ export default {
       deps_platform_transitive:
         '某个已声明的包需要平台已提供的包的另一个版本。你的声明里并没有写这个包——它是被间接依赖引入的。平台已经把可以安全让位的同类包全部让出并重试过；下面这个属于平台自身运行时，无法被覆盖。',
       deps_install_failed: '声明的依赖安装失败。下方安装输出中包含具体包名与原因。',
+      deps_no_wheel:
+        '声明的某个包在索引上确实有匹配版本，但它没有发布本平台可安装的预编译 wheel。依赖只从 wheel 安装——安装沙箱内没有编译器。改版本号无法解决：请改用提供 wheel 的包，或联系管理员把它加入平台镜像。',
       deps_index_not_configured:
         '当前部署未配置软件包索引，无法安装依赖，请联系管理员配置。',
       deps_shadow_platform:

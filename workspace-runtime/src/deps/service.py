@@ -513,6 +513,12 @@ class DepsService:
             index_url=index_url,
             extra_index_urls=extras,
             trusted_hosts=_split(settings.deps_trusted_hosts),
+            # Packages an operator allows to be built from a source distribution.
+            # Carried in the plan rather than read by the installer from its own
+            # environment, for the same reason as the index: the two vehicles
+            # build that environment differently, so a setting that survives in
+            # only one of them is a setting that silently does not apply.
+            allow_source_packages=_canonical(settings.deps_allow_source_packages),
         )
 
     # ── failure handling ───────────────────────────────────────────────
@@ -716,6 +722,18 @@ def archive_failure(
 def _split(raw: str) -> tuple[str, ...]:
     """Split a comma-separated configuration value, dropping blanks."""
     return tuple(item.strip() for item in (raw or "").split(",") if item.strip())
+
+
+def _canonical(raw: str) -> tuple[str, ...]:
+    """Same, for values that are distribution NAMES.
+
+    Canonicalised here rather than at the comparison site: the installer matches
+    these against names derived from requirements, and ``PySpark`` in a config
+    file must mean the same package as ``pyspark`` in a declaration.
+    """
+    from packaging.utils import canonicalize_name
+
+    return tuple(sorted({canonicalize_name(item) for item in _split(raw)}))
 
 
 _service: Optional[DepsService] = None

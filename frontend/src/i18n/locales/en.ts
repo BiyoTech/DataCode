@@ -504,6 +504,9 @@ export default {
     owner: 'Owner',
     lastModified: 'Last Modified',
     noModels: 'No models found in this project.',
+    // The listing skips a gateway it cannot reach instead of failing, so the
+    // tree can be incomplete without looking wrong. This names what is missing.
+    gatewayUnavailable: 'Gateway "{gateway}" could not be listed',
     filterByKind: 'Filter by kind',
     selectModel: 'Select a model from the tree to view details',
     search: 'Search models...',
@@ -925,6 +928,12 @@ export default {
       deps_install_failed:
         'The declared packages could not be installed. The installer output below ' +
         'names the package and the reason.',
+      deps_no_wheel:
+        'A declared package exists on the index in a matching version, but it ' +
+        'publishes no pre-built wheel this platform can install. Dependencies ' +
+        'are installed from wheels only — the install sandbox has no compiler. ' +
+        'No version bound fixes this: use a package that ships wheels, or ask ' +
+        'an operator to add it to the platform image.',
       deps_index_not_configured:
         'This deployment has no package index configured, so dependencies cannot ' +
         'be installed. Ask an operator to configure one.',

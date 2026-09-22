@@ -521,7 +521,15 @@ ensure_service_venvs() {
   # interpreter, so those packages are part of what "a healthy venv" means
   # here. Omitting them is not a smaller dev install, it is a dev environment
   # where ordinary assets fail to import.
-  ensure_python_venv workspace-runtime "$VENV_PROBE_runtime" "dev,usercode"
+  #
+  # RUNTIME_EXTRAS mirrors the image build-arg of the same name (see
+  # scripts/build-images.sh): `RUNTIME_EXTRAS=spark scripts/dev-start.sh` gives
+  # the dev baseline the packages a `--build-arg RUNTIME_EXTRAS=spark` image has,
+  # so "pyspark is provided by the platform" means the same thing in both. The
+  # probe above deliberately does not name them — an existing venv that satisfies
+  # it is never reinstalled, so set this before the venv exists, or delete it.
+  ensure_python_venv workspace-runtime "$VENV_PROBE_runtime" \
+    "dev,usercode${RUNTIME_EXTRAS:+,$RUNTIME_EXTRAS}"
 }
 
 # ── Ports & processes ────────────────────────────────────────────────────

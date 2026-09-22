@@ -223,6 +223,18 @@ class Settings(BaseSettings):
     # in its message, so an operator who has decided a specific package is safe
     # to override does not need a platform release to say so.
     deps_relaxable_packages: str = ""
+    # Packages this deployment allows to be BUILT FROM SOURCE, comma-separated
+    # canonical names. Empty — wheels only — is the shipped behaviour: the install
+    # sandbox has no compiler, and installing a source distribution runs the
+    # package's own build script inside it.
+    #
+    # The escape hatch for a package that publishes no wheel at all (pyspark is
+    # the canonical example: one 300 MB sdist that merely unpacks bundled jars).
+    # Per package and operator-owned on purpose — a working copy can never ask for
+    # it — and per package in the pip invocation too: the general wheel-only flag
+    # stays, overridden by name for these packages only. Prefer adding the package
+    # to the runtime image (RUNTIME_EXTRAS) when a whole deployment needs it.
+    deps_allow_source_packages: str = ""
 
     # ── Kubernetes task backend ────────────────────────────────────────
     # Namespace the Jobs are created in. Must be the namespace whose
@@ -523,6 +535,7 @@ def _flatten_yaml(data: dict) -> dict:
         "deps.install_timeout_seconds": "deps_install_timeout_seconds",
         "deps.protected_packages": "deps_protected_packages",
         "deps.relaxable_packages": "deps_relaxable_packages",
+        "deps.allow_source_packages": "deps_allow_source_packages",
         "error_archive.enabled": "error_archive_enabled",
         "error_archive.retention": "error_archive_retention",
         "error_archive.max_sql_len": "error_archive_max_sql_len",

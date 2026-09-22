@@ -33,6 +33,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S_MANIFEST = _REPO_ROOT / "deploy" / "k8s" / "base" / "workspace-runtime.yaml"
 _COMPOSE_FILE = _REPO_ROOT / "deploy" / "docker-compose.data-plane.yml"
+_RUNTIME_DOCKERFILE = _REPO_ROOT / "workspace-runtime" / "Dockerfile"
+
+
+def _dockerfile_instructions(path: Path) -> list[tuple[str, str]]:
+    """(instruction, arguments) pairs, comments and continuations aside.
+
+    Parsed rather than shelled out to a builder: this runs in CI, where no
+    daemon exists and a build would take minutes to tell us about a missing
+    COPY.
+    """
+    instructions = []
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        instruction, _, arguments = line.partition(" ")
+        instructions.append((instruction.upper(), arguments.strip()))
+    return instructions
 
 
 def _k8s_docs() -> dict:
@@ -227,6 +245,65 @@ class TestComposeTransitionalShape:
             distributed_env_lock=backend in ("auto", "redis"),
         )
         assert any("P4a transitional" in w for w in contract.warnings)
+
+
+class TestRuntimeImageShipsTheLocalTaskVehicle:
+    """`task.backend=local` needs the runner package INSIDE this image.
+
+    The local vehicle spawns `python -m src.main` with the package as the
+    child's cwd; in a container there is no sibling checkout to fall back to,
+    so an image without it refuses every sandboxed task — which the UI reports
+    as "could not start a sandbox to install the dependencies", three layers
+    away from the omission. The Kubernetes backend is unaffected: it runs the
+    separate datacode/task-runner image.
+    """
+
+    @pytest.fixture()
+    def instructions(self) -> list[tuple[str, str]]:
+        return _dockerfile_instructions(_RUNTIME_DOCKERFILE)
+
+    def _copies(self, instructions) -> dict[str, str]:
+        """destination -> source, for every COPY in the image."""
+        copies = {}
+        for instruction, arguments in instructions:
+            if instruction != "COPY":
+                continue
+            parts = arguments.split()
+            if len(parts) >= 2:
+                copies[parts[1].rstrip("/")] = parts[0].rstrip("/")
+        return copies
+
+    def test_the_package_is_baked_in(self, instructions):
+        copies = self._copies(instructions)
+        assert any(dest.startswith("task-runner/") for dest in copies), (
+            "the runtime image does not ship task-runner/, so task.backend="
+            "local cannot start a vehicle (deps install, agent shell)"
+        )
+
+    def test_it_lands_where_the_backend_resolves_it_by_default(self, instructions):
+        """The empty `task.runner_root` resolves to <image root>/task-runner.
+
+        That path is parents[4] of the backend module, i.e. the WORKDIR the
+        service sources are copied under. Pinning both halves here is what
+        makes the default hold: a COPY into another directory would satisfy
+        the test above and still not be found.
+        """
+        workdirs = [
+            arguments
+            for instruction, arguments in instructions
+            if instruction == "WORKDIR"
+        ]
+        image_root = workdirs[0]
+        copies = self._copies(instructions)
+        assert copies.get("workspace-runtime/src") == "workspace-runtime/src", (
+            "the service package must sit directly under the image root for "
+            "the default runner resolution to reach task-runner/"
+        )
+        runner_dest = next(
+            dest for dest in copies if dest.startswith("task-runner/")
+        )
+        expected = f"{image_root}/{runner_dest.split('/')[0]}"
+        assert expected == "/app/task-runner"
 
 
 def _go_modules() -> list[Path]:

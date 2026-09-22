@@ -300,9 +300,9 @@ class ReloadJobInfo(BaseModel):
         description=(
             "deps_declaration_invalid | deps_platform_conflict | "
             "deps_platform_transitive | deps_install_failed | "
-            "deps_index_not_configured | deps_shadow_platform | "
-            "deps_too_large | code_load_failed | sandbox_unavailable | "
-            "internal_error"
+            "deps_no_wheel | deps_index_not_configured | "
+            "deps_shadow_platform | deps_too_large | code_load_failed | "
+            "sandbox_unavailable | internal_error"
         ),
     )
     conflicts: list[DepsConflict] = Field(

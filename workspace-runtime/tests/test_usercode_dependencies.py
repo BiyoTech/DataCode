@@ -119,7 +119,12 @@ class TestThePromiseIsInstalledWhereTheCodeRuns:
 
     def test_the_image_installs_it(self) -> None:
         commands = _install_commands(DOCKERFILE.read_text(encoding="utf-8"))
-        assert any("workspace-runtime[usercode]" in c for c in commands), (
+        # `[usercode` rather than `[usercode]`: the image takes an optional
+        # RUNTIME_EXTRAS build-arg (spark, for a package with no wheel), which is
+        # APPENDED to this extra. What must not happen is usercode being replaced
+        # by it — then production code locations lose pandas because somebody
+        # asked for Spark.
+        assert any("workspace-runtime[usercode" in c for c in commands), (
             "the runtime image installs the service without `[usercode]`, so "
             "the packages this service promises user code are absent exactly "
             "where production code locations load"
@@ -129,13 +134,15 @@ class TestThePromiseIsInstalledWhereTheCodeRuns:
         source = (REPO_ROOT / "scripts" / "dev-lib.sh").read_text(encoding="utf-8")
         # The extras reach the install as an ARGUMENT, so the call site is what
         # has to name them — the install line itself only interpolates $extras.
-        calls = [
-            line.split("#", 1)[0].strip()
+        # The call spans two lines since RUNTIME_EXTRAS may be appended, so
+        # continuations are joined before matching.
+        text = " ".join(
+            line.split("#", 1)[0].rstrip("\\").strip()
             for line in source.splitlines()
-            if "ensure_python_venv workspace-runtime" in line.split("#", 1)[0]
-        ]
+        )
+        calls = re.findall(r"ensure_python_venv workspace-runtime[^\n;]*", text)
         assert calls, "dev-lib.sh no longer sets up workspace-runtime's venv"
-        assert any('"dev,usercode"' in call for call in calls), (
+        assert any('"dev,usercode' in call for call in calls), (
             "dev-lib.sh installs workspace-runtime without the `usercode` "
             "extra, so a fresh dev venv is an environment where ordinary assets "
             "fail to import while production works"
@@ -150,6 +157,50 @@ class TestThePromiseIsInstalledWhereTheCodeRuns:
             "CI installs workspace-runtime without `[usercode]`, which would "
             "make this module — the one place meant to catch a missing package "
             "— unable to see it"
+        )
+
+
+class TestTheSparkRouteIsWholeOrAbsent:
+    """The one package a working copy can NEVER declare its way to.
+
+    pyspark publishes a single source distribution per release and no wheel, and
+    dependency installs are wheel-only (no compiler in the sandbox, no build
+    script ever executed). So the image is the only route — and it has two halves,
+    the second of which fails silently: pyspark bundles the Spark jars but not a
+    JVM, so an image with the package and no JRE imports fine and dies on first
+    use with "JAVA_HOME is not set".
+    """
+
+    def test_the_extra_exists_so_the_route_is_installable(self) -> None:
+        import tomllib
+
+        extras = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+            "optional-dependencies"
+        ]
+        assert any("pyspark" in item for item in extras.get("spark", ())), (
+            "the `spark` extra is the documented way into the platform baseline; "
+            "without it `deps_no_wheel` on pyspark has no answer at all"
+        )
+
+    def test_the_image_can_bake_the_extra_in(self) -> None:
+        source = DOCKERFILE.read_text(encoding="utf-8")
+        assert "ARG RUNTIME_EXTRAS" in source
+        # Asserted as one literal string rather than "both words appear in the
+        # install command": comment text and the JRE step below also mention the
+        # build-arg, and a looser check keeps passing when the interpolation is
+        # dropped from the install — the only regression this catches.
+        assert "workspace-runtime[usercode${RUNTIME_EXTRAS" in source, (
+            "RUNTIME_EXTRAS is declared but never appended to the installed "
+            "extras, so `--build-arg RUNTIME_EXTRAS=spark` builds an image "
+            "without pyspark and says nothing"
+        )
+
+    def test_asking_for_spark_also_installs_a_jvm(self) -> None:
+        source = DOCKERFILE.read_text(encoding="utf-8")
+        assert ",spark," in source, "the JRE step no longer keys on the extra"
+        assert "jre" in source, (
+            "pyspark without a JRE is an image that imports and then fails on "
+            "the first action — the quietest possible way to ship it broken"
         )
 
 

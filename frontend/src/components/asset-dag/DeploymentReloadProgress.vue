@@ -80,6 +80,7 @@ const failureText = computed(() => {
     'deps_platform_conflict',
     'deps_platform_transitive',
     'deps_install_failed',
+    'deps_no_wheel',
     'deps_index_not_configured',
     'deps_shadow_platform',
     'deps_too_large',

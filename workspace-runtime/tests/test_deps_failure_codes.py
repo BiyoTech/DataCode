@@ -35,6 +35,10 @@ DEPS_FAILURE_CODES = (
     # declared, or an operator — never "accept the platform's version of it".
     "deps_platform_transitive",
     "deps_install_failed",
+    # The index HAS a matching version, it just publishes no usable wheel. Its own
+    # code because every other failure asks the user to edit a version bound, and
+    # this is the one where the bound is already correct.
+    "deps_no_wheel",
     "deps_index_not_configured",
     "deps_shadow_platform",
     "deps_too_large",

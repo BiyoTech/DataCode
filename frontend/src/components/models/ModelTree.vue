@@ -175,6 +175,25 @@ const emit = defineEmits<{
 
     <!-- Tables tab content -->
     <template v-if="activeTab === 'tables'">
+      <!-- Gateways that could not be listed. Shown above the tree because the
+           tree itself looks normal: the listing skips a failing gateway rather
+           than failing, so without this the sidebar silently shows fewer
+           models than the project defines. -->
+      <div v-if="modelsStore.gatewayErrors.length" class="gateway-errors">
+        <div
+          v-for="failure in modelsStore.gatewayErrors"
+          :key="failure.gateway"
+          class="gateway-error"
+          :title="failure.message"
+        >
+          <t-icon name="error-circle" size="14px" />
+          <span class="gateway-error-text">
+            {{ t('models.gatewayUnavailable', { gateway: failure.gateway }) }}
+          </span>
+          <span class="gateway-error-reason">{{ failure.message }}</span>
+        </div>
+      </div>
+
       <!-- Loading -->
       <div v-if="modelsStore.modelsLoading" class="tree-loading">
         <t-icon name="loading" size="16px" class="spinning" />
@@ -254,6 +273,42 @@ const emit = defineEmits<{
 
 .search-input::placeholder {
   color: var(--td-text-color-placeholder);
+}
+
+/* ─── Unreachable gateways ─── */
+.gateway-errors {
+  border-bottom: 1px solid var(--td-warning-color-3);
+  background: var(--td-warning-color-1);
+  padding: 6px 10px;
+}
+
+.gateway-error {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--td-warning-color);
+  font-size: var(--td-font-size-body-small);
+  line-height: 1.4;
+}
+
+.gateway-error:not(:last-child) {
+  margin-bottom: 6px;
+}
+
+.gateway-error-text {
+  font-weight: 600;
+}
+
+/* Clamped rather than hidden: the driver's text names the host that could not
+   be reached, which is the one thing the user can act on. */
+.gateway-error-reason {
+  color: var(--td-text-color-secondary);
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 /* ─── Tab strip ─── */

@@ -482,6 +482,28 @@ def _write_frame_to(stream, message: dict) -> None:
 _MAX_FRAME = 64 * 1024 * 1024
 
 
+def _db_error_code(exc: BaseException) -> str:
+    """The executor error code for a warehouse-driver failure, else ``""``.
+
+    Classified HERE, in the sandbox, because this is the only side that still
+    holds the original exception object. Whatever escapes as ``op_failed``
+    reaches the runtime as a bare string, and the runtime would then have to
+    recognise a warehouse that cannot be reached by matching text — which is how
+    "connection to server at X failed: timeout expired" came back to the user as
+    a 500 INTERNAL_ERROR with the real reason buried in ``detail``.
+    """
+    try:
+        from src.utils.errors import classify_db_error
+    except Exception:  # noqa: BLE001 — classification is best-effort
+        return ""
+    classification = classify_db_error(exc)  # type: ignore[arg-type]
+    if classification is None:
+        return ""
+    from datacode_common.executor_protocol import DB_ERROR_CODES
+
+    return DB_ERROR_CODES.get(classification[0].value, "")
+
+
 def _dispatch(message: dict) -> dict | None:
     """Run one request and build its response frame (None = no response)."""
     req_id = message.get("id")
@@ -502,8 +524,11 @@ def _dispatch(message: dict) -> dict | None:
         error = {"code": exc.code, "message": exc.message, **exc.extra}
         return {"v": 1, "id": req_id, "ok": False, "error": error}
     except Exception as exc:  # noqa: BLE001 — protocol boundary
+        # Warehouse failures keep their class across the wire; everything else
+        # stays the generic `op_failed` the runtime has always handled.
+        code = _db_error_code(exc) or "op_failed"
         return {"v": 1, "id": req_id, "ok": False,
-                "error": {"code": "op_failed", "message": str(exc)}}
+                "error": {"code": code, "message": str(exc)}}
 
 
 def main() -> int:
