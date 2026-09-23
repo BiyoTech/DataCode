@@ -528,6 +528,10 @@ ensure_service_venvs() {
   # so "pyspark is provided by the platform" means the same thing in both. The
   # probe above deliberately does not name them — an existing venv that satisfies
   # it is never reinstalled, so set this before the venv exists, or delete it.
+  #
+  # `k8s` is NOT appended on purpose: dev runs the local task backend and never
+  # talks to a cluster. The image installs it unconditionally (one image, every
+  # deployment), which is a difference between the two and not a drift.
   ensure_python_venv workspace-runtime "$VENV_PROBE_runtime" \
     "dev,usercode${RUNTIME_EXTRAS:+,$RUNTIME_EXTRAS}"
 }

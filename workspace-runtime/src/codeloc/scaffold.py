@@ -49,6 +49,12 @@ logger = get_logger(__name__)
 # Relative location of the Dagster project inside a workspace.
 ASSET_DAG_SUBDIR = "asset-dag"
 
+# The project's single Dagster entrypoint: the file a code location loads, in
+# BOTH vehicles. Named here — next to the scaffold that writes it — because
+# three places need it and a fourth spelling would be a fourth place for pod
+# mode to point at a file that does not exist.
+DEFINITIONS_FILE = "definitions.py"
+
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates"
 _WORKSPACE_PLACEHOLDER = "{{ workspace_name }}"
 
@@ -71,7 +77,7 @@ _SCAFFOLD_BASELINE_NAMES = ("dagster", "getdaft", "httpx")
 # asset-dag/). Every file, including each package ``__init__.py``, has a
 # template, so rendering is a single uniform pass.
 _SCAFFOLD_FILES = {
-    "definitions.py.tpl": "definitions.py",
+    "definitions.py.tpl": DEFINITIONS_FILE,
     "pyproject.toml.tpl": "pyproject.toml",
     "README.md.tpl": "README.md",
     # defs/ auto-discovery root

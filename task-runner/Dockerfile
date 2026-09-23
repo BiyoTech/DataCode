@@ -33,7 +33,36 @@ COPY shared/python/ shared/python/
 COPY task-runner/pyproject.toml task-runner/
 # One pip command so the resolver satisfies `datacode-common` from the local
 # directory candidate (never published to any index).
-RUN pip install --no-cache-dir ./shared/python -e ./task-runner
+#
+# RUNNER_EXTRAS mirrors workspace-runtime's build-arg of the same shape: it
+# bakes optional groups (see task-runner/pyproject.toml) into the image, which
+# is the only route for a package that publishes no wheel. Empty by default —
+# this image is created once per task and every megabyte is paid on every cold
+# start, so nothing is added to it without being asked for.
+#
+#   docker build --build-arg RUNNER_EXTRAS=spark ...
+#
+# Note it is APPENDED, never substituted: the base install is unconditional and
+# has no extras of its own, so the brackets appear only when the arg is set.
+ARG RUNNER_EXTRAS=""
+RUN pip install --no-cache-dir ./shared/python \
+    -e "./task-runner${RUNNER_EXTRAS:+[${RUNNER_EXTRAS}]}"
+
+# Same assertion as the runtime image, for the same reason: pip downgrades an
+# unknown extra to a warning, so without this a malformed build-arg ships an
+# image that omits the packages and says nothing.
+RUN python -m datacode_common.image_extras \
+    task-runner/pyproject.toml RUNNER_EXTRAS "${RUNNER_EXTRAS}"
+
+# A JVM, and only when Spark was asked for — same reason as the identical step
+# in the workspace-runtime image: pyspark bundles the Spark jars but not a
+# runtime to execute them, so without this `import pyspark` succeeds and the
+# first action dies with "JAVA_HOME is not set".
+RUN case ",${RUNNER_EXTRAS}," in \
+      *,spark,*) apt-get update \
+        && apt-get install -y --no-install-recommends default-jre-headless \
+        && rm -rf /var/lib/apt/lists/* ;; \
+    esac
 
 COPY task-runner/src/ task-runner/src/
 

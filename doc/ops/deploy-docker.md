@@ -80,6 +80,29 @@ egress-proxy, frontend), all built from the repository root as context. No
 image is ever referenced as `:latest` in a deployment — a mutable tag makes
 "what is running" unanswerable after the second deploy.
 
+### Package groups baked into an image
+
+Two images take optional groups at build time, and they are the only route for
+a package that publishes no wheel (`pyspark` is the standing example: one
+~300 MB source distribution per release, and installs are wheel-only):
+
+```bash
+RUNTIME_EXTRAS=spark RUNNER_EXTRAS=spark make images
+RUNTIME_EXTRAS=spark make build up          # compose forwards it to the build
+```
+
+Set both or neither. They are separate arguments because they are separate
+jobs: `workspace-runtime` decides what the platform already provides (the
+baseline is read off its own interpreter), `task-runner` is where the import
+actually happens once tasks and code locations run in Pods. One without the
+other produces the worst pairing — the install refuses a package the sandbox
+would have imported happily.
+
+Every compose stack forwards `RUNTIME_EXTRAS` to the runtime build, so the
+variable is enough. The `k8s` group (the Kubernetes task backend's cluster
+client) is NOT opt-in: the runtime image installs it unconditionally, because
+one image serves every deployment and a missing client is a startup failure.
+
 ## Data and volumes
 
 | Stack | Volumes |

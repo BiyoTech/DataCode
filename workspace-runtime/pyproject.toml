@@ -147,6 +147,11 @@ usercode = [
 # optional so a single-node or development install — which uses the local
 # backend — does not carry it. `task_backend: kubernetes` without this extra
 # fails at startup with a message naming the extra, never silently.
+#
+# Optional here means optional for a VENV, not for a deployment: the image
+# installs it unconditionally (see the Dockerfile), because one image serves
+# every profile and a missing cluster client is a startup failure, not a
+# degraded feature. A dev venv never submits to Kubernetes.
 k8s = ["kubernetes>=31.0.0"]
 dev = [
     "pytest>=8.3.0",

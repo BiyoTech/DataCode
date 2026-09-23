@@ -31,10 +31,12 @@ from src.codeloc.pod import (
     APP_CODE_LOCATION,
     ASSET_DAG_SUBDIR,
     CODELOC_PORT,
+    WORKSPACE_MOUNT_PATH,
     CodeLocationPodBackend,
     CodeLocationPodError,
     build_pod_manifest,
     build_service_manifest,
+    code_location_command,
     code_location_namespace,
     pod_name,
     service_fqdn,
@@ -279,7 +281,7 @@ def _pod(environment: str = "dev", **overrides) -> dict:
         namespace=_contract_namespace(),
         location_name="ws-abc-dev",
         environment=environment,
-        image="datacode/task-runner:latest",
+        image="datacode/workspace-runtime:latest",
         image_pull_policy="IfNotPresent",
         service_account="task-runner-noperm",
         volumes=volumes,
@@ -333,7 +335,13 @@ class TestContractAlignment:
         container = _pod()["spec"]["containers"][0]
 
         assert container["name"] == expected["name"]
-        assert container["command"] == expected["command"]
+        # `<location-name>` is the one value the contract cannot hardcode: it
+        # differs per location and is what ties the server's reply to the entry
+        # the orchestrator dials.
+        assert container["command"] == [
+            part if part != "<location-name>" else "ws-abc-dev"
+            for part in expected["command"]
+        ]
         assert container["workingDir"] == expected["workingDir"]
         assert container["ports"] == [
             {"name": "grpc", "containerPort": expected["ports"][0]["containerPort"]}
@@ -374,6 +382,105 @@ class TestContractAlignment:
         assert pod["spec"]["containers"][0]["resources"] == {
             "limits": {"cpu": "1", "memory": "2Gi"}
         }
+
+
+class TestTheServerLoadsUserCode:
+    """A gRPC server started without a target serves nothing.
+
+    ``dagster api grpc`` with no ``-f`` / ``-m`` leaves ``loadable_target_origin``
+    unset (``dagster/_cli/api.py``), and the server then returns an EMPTY
+    workspace (``dagster/_grpc/server.py``): it binds the port, answers every
+    health question correctly and lists zero repositories. The location reports
+    alive while the asset DAG stays empty — the quietest possible shape for this
+    bug, and the reason the target is asserted here rather than left to review.
+    """
+
+    def test_the_command_names_the_definitions_file(self):
+        command = code_location_command("ws-abc-dev")
+
+        assert command[:3] == ["dagster", "api", "grpc"]
+        assert command[command.index("-f") + 1] == (
+            f"{WORKSPACE_MOUNT_PATH}/{ASSET_DAG_SUBDIR}/definitions.py"
+        )
+
+    def test_the_target_is_the_in_container_path(self):
+        """The runtime's own path does not exist inside the Pod."""
+        command = code_location_command("ws-abc-dev")
+
+        assert command[command.index("-f") + 1].startswith(WORKSPACE_MOUNT_PATH)
+
+    def test_the_location_name_travels_with_it(self):
+        """What ties the server's reply to the entry the orchestrator dials."""
+        command = code_location_command("ws-abc-dev")
+
+        assert command[command.index("--location-name") + 1] == "ws-abc-dev"
+
+    def test_the_contract_agrees(self):
+        command = _load_contract()["spec"]["containers"][0]["command"]
+
+        assert command[command.index("-f") + 1] == (
+            f"{WORKSPACE_MOUNT_PATH}/{ASSET_DAG_SUBDIR}/definitions.py"
+        )
+
+
+class TestTheImageCanRunTheCommand:
+    """``dagster api grpc`` needs dagster, and the runner image has none.
+
+    A code location also has to import the user's ``defs/`` package against the
+    SAME package set the platform advertises as its baseline, which is read off
+    the runtime's interpreter. The task-runner image satisfies neither, so pod
+    mode pointed at it could never start.
+    """
+
+    @staticmethod
+    def _core_dependencies(service: str) -> list[str]:
+        import tomllib
+
+        pyproject = REPO_ROOT / service / "pyproject.toml"
+        return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+            "dependencies"
+        ]
+
+    def test_the_default_image_is_the_runtime_image(self):
+        from src.config import Settings
+
+        image = Settings().code_location_container_image
+
+        assert image.split(":")[0] == "datacode/workspace-runtime", (
+            f"pod-mode code locations default to {image!r}; that image cannot "
+            f"run `dagster api grpc`, so every location fails to start (and the "
+            f"Dagster run launcher inherits the same image for its workers)"
+        )
+
+    def test_the_shipped_config_agrees_with_the_default(self):
+        """Two defaults for one setting is how the wrong one ships."""
+        from src.config import Settings
+
+        conf = yaml.safe_load(
+            (REPO_ROOT / "conf" / "workspace-runtime.yaml").read_text(encoding="utf-8")
+        )
+
+        assert conf["dagster"]["code_location_container_image"] == (
+            Settings().code_location_container_image
+        )
+
+    def test_the_runtime_image_carries_dagster(self):
+        assert any(
+            item.startswith("dagster")
+            for item in self._core_dependencies("workspace-runtime")
+        ), "the runtime image lost dagster, so no code location can serve"
+
+    def test_the_runner_image_does_not(self):
+        """The guard against pointing back at it.
+
+        If dagster ever lands in the runner, this fails and the decision has to
+        be made again deliberately — including the second requirement the runner
+        cannot meet: its package set is not the platform baseline.
+        """
+        assert not any(
+            item.startswith("dagster")
+            for item in self._core_dependencies("task-runner")
+        )
 
 
 class TestNetworkPolicyCoverage:

@@ -111,8 +111,12 @@ Six decisions worth knowing before changing anything here:
   naming the package when a matching version IS there. `pyspark` is the standing
   example: PyPI carries one ~300 MB sdist per release, so no declaration of it can
   ever install. The route for such a package is the IMAGE
-  (`docker build --build-arg RUNTIME_EXTRAS=spark`, which also installs a JRE),
-  which makes it part of the baseline and importable without being declared;
+  (`docker build --build-arg RUNTIME_EXTRAS=spark`, which also installs a JRE, or
+  `RUNTIME_EXTRAS=spark make build up` — every compose stack forwards it), which
+  makes it part of the baseline and importable without being declared.
+  A cluster deployment needs it in `task-runner` as well
+  (`RUNNER_EXTRAS=spark`): that is the image the Kubernetes task backend and
+  pod-mode code locations run user code in;
   `deps.allow_source_packages` is the per-package escape hatch — the wheel-only
   flag stays and is overridden by NAME, so nothing else in the same resolution
   gains a source build.

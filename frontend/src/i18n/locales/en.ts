@@ -736,7 +736,9 @@ export default {
     gitNicknameLabel: 'Nickname',
     gitNicknamePlaceholder: 'e.g. My Work GitHub',
     gitEmailLabel: 'Git Provider Email',
-    gitEmailPlaceholder: 'your@email.com',
+    // The literal escape {'@'} is REQUIRED here: a bare @ starts vue-i18n's
+    // linked-message syntax and this string fails to compile with error 10.
+    gitEmailPlaceholder: 'your{\'@\'}email.com',
     gitUsernameLabel: 'Username (optional)',
     gitUsernamePlaceholder: 'Git provider username',
     gitTokenLabel: 'Token',

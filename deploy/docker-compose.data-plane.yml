@@ -32,6 +32,10 @@ x-workspace-runtime: &workspace-runtime
   build:
     context: ..
     dockerfile: workspace-runtime/Dockerfile
+    # Forwarded so `RUNTIME_EXTRAS=... make data-plane-up` reaches the build;
+    # an unset variable passes "", which is the Dockerfile's own default.
+    args:
+      RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
   volumes:
     # P4a transitional shape: working copies still on the shared bind mount.
     # The storage contract accepts this ONLY because the Redis env lock stays

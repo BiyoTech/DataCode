@@ -130,6 +130,13 @@ services:
     build:
       context: ..
       dockerfile: workspace-runtime/Dockerfile
+      # Forwarded, or `RUNTIME_EXTRAS=spark make build up` silently builds an
+      # image without it: compose declares no build-arg for a service unless
+      # the compose file names it, and the Dockerfile's own default is empty.
+      # An unset variable passes "" — the same value the Dockerfile defaults
+      # to, so the ordinary build is byte-identical.
+      args:
+        RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
     environment:
       <<: *service-env
       WORKSPACE_RUNTIME_LEASE_ENABLED: "true"

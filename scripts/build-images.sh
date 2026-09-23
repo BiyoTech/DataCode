@@ -31,6 +31,11 @@ Options:
 Environment:
   IMAGE_REGISTRY   Registry prefix (default: "datacode" — local-only names)
   GO_BUILD_PARALLEL  Concurrent Go package compiles (default: 1, safe on small VMs)
+  RUNTIME_EXTRAS   Extra groups baked into workspace-runtime, comma-separated
+  RUNNER_EXTRAS    Same for task-runner (the image user code runs on in a
+                   cluster). Set BOTH for a package with no wheel: the platform
+                   baseline is computed by workspace-runtime, the import
+                   happens in task-runner.
 EOF
 }
 
@@ -79,14 +84,22 @@ echo "==> building 8 images as ${REGISTRY}/<service>:${TAG}"
 # the warnings an operator actually needs to read. Passed per image instead.
 GO_BUILD_ARGS=(--build-arg "GO_BUILD_PARALLEL=${GO_BUILD_PARALLEL:-1}")
 
-# Extras baked into the workspace-runtime image, comma-separated (see that
-# service's pyproject.toml). Only that image declares the build-arg, for the same
-# "unconsumed build-arg" reason as above.
+# Extras baked into the two images user code runs on, comma-separated (see each
+# service's pyproject.toml). Only those images declare the build-arg, for the
+# same "unconsumed build-arg" reason as above.
 #
-# The one case this exists for today is RUNTIME_EXTRAS=spark: pyspark publishes no
-# wheel, so a working copy can never install it — putting it in the image makes it
-# part of the platform baseline instead. Costs ~600 MB plus a JRE, hence opt-in.
+# The one case this exists for today is spark: pyspark publishes no wheel, so a
+# working copy can never install it — putting it in an image makes it part of the
+# platform baseline instead. Costs ~600 MB plus a JRE, hence opt-in.
+#
+# They are two arguments and not one because they are two images with two jobs:
+# workspace-runtime decides what the platform already provides (the baseline is
+# read off ITS interpreter), task-runner is where the import actually happens
+# under the Kubernetes task backend. Setting only one of them produces the worst
+# pairing of symptoms — the install refuses pyspark as unavailable while the
+# sandbox that would have imported it fine never gets asked.
 RUNTIME_BUILD_ARGS=(--build-arg "RUNTIME_EXTRAS=${RUNTIME_EXTRAS:-}")
+RUNNER_BUILD_ARGS=(--build-arg "RUNNER_EXTRAS=${RUNNER_EXTRAS:-}")
 
 # One build context (the repository root) for every image: the shared packages
 # are local path dependencies and the Dockerfiles COPY them from the context.
@@ -107,7 +120,7 @@ build identity-service identity-service/Dockerfile "${GO_BUILD_ARGS[@]}"
 build control-service  control-service/Dockerfile
 build agent-service    agent-service/Dockerfile
 build workspace-runtime workspace-runtime/Dockerfile "${RUNTIME_BUILD_ARGS[@]}"
-build task-runner      task-runner/Dockerfile
+build task-runner      task-runner/Dockerfile "${RUNNER_BUILD_ARGS[@]}"
 build egress-proxy     egress-proxy/Dockerfile
 build frontend         frontend/Dockerfile
 

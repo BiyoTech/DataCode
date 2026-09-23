@@ -36,6 +36,12 @@ COPY workspace-runtime/pyproject.toml workspace-runtime/
 # well over half a gigabyte plus a JRE.
 ARG RUNTIME_EXTRAS=""
 
+# The Kubernetes task backend imports its cluster client at CONSTRUCTION time
+# (src/tasks/backends/kubernetes.py refuses to start without it), so this one is
+# NOT opt-in: one image serves every deployment, and a cluster rollout that
+# forgot a build-arg would fail at startup with nothing but the extra's name to
+# go on. It is a few megabytes of pure Python.
+
 # Install shared and the service in ONE pip command: the resolver then
 # satisfies the service's `datacode-common` requirement from the local
 # directory candidate (never published to any index). The PostgreSQL driver
@@ -47,7 +53,15 @@ ARG RUNTIME_EXTRAS=""
 # an asset that imports pandas is not a special deployment, it is the ordinary
 # case, and a promise that is only kept in the dev venv is not a promise.
 RUN pip install --no-cache-dir ./shared/python \
-    -e "./workspace-runtime[usercode${RUNTIME_EXTRAS:+,${RUNTIME_EXTRAS}}]"
+    -e "./workspace-runtime[usercode,k8s${RUNTIME_EXTRAS:+,${RUNTIME_EXTRAS}}]"
+
+# Fail the build when an extra was asked for but did not land. pip treats an
+# unknown extra as a WARNING and installs everything else, so a malformed value
+# — a misspelled group, or a whole shell fragment pasted into the build-arg —
+# yields an image that looks correct, silently omits the packages, and surfaces
+# much later as `deps_no_wheel` for the very package it was meant to provide.
+RUN python -m datacode_common.image_extras \
+    workspace-runtime/pyproject.toml RUNTIME_EXTRAS "${RUNTIME_EXTRAS}"
 
 # A JVM, and only when Spark was asked for. pyspark bundles the Spark jars but
 # not a runtime to execute them, so without this the import succeeds and the

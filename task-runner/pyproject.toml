@@ -34,6 +34,29 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# ── Platform-provided packages user code imports in the sandbox ───────────
+#
+# This image is where user code actually RUNS in a cluster deployment: the
+# Kubernetes task backend (`task.backend: kubernetes`) submits every task here,
+# and `dagster.code_location_mode: pod` loads a working copy's `defs/` package
+# in it. A package with no wheel can therefore only reach user code by being
+# baked into THIS image — the same reason workspace-runtime has the equivalent
+# extra, and the same example.
+#
+# `spark` is the only one today: pyspark publishes a single ~300 MB source
+# distribution per release, and installs are wheel-only (no compiler in the
+# sandbox, no build script ever executed), so a working copy can never declare
+# its way to it. Opt-in because it costs well over half a gigabyte plus a JRE:
+# `docker build --build-arg RUNNER_EXTRAS=spark` (see the Dockerfile, which also
+# installs the JRE).
+#
+# One thing to know when using it: the platform baseline that decides what is
+# ALREADY provided is computed by workspace-runtime, from its own interpreter
+# (see src/deps/baseline.py). So a working copy declaring pyspark is only
+# recognised as platform-provided when BOTH images carry it — bake it into the
+# runtime image too (`RUNTIME_EXTRAS=spark`), or the install still fails with
+# `deps_no_wheel` while the import would have worked.
+spark = ["pyspark>=3.5.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",

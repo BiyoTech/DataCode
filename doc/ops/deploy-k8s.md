@@ -56,6 +56,21 @@ The overlays read image tags from `deploy/k8s/base/kustomization.yaml`'s
 `images:` block; set your tag there (or per-overlay) — nothing deploys
 `:latest` on purpose.
 
+In a cluster, user code runs in `task-runner`, not in `workspace-runtime`: the
+Kubernetes task backend submits every task to it, and
+`dagster.code_location_mode: pod` loads a working copy's `defs/` package in it.
+A package with no wheel therefore has to be baked in there too:
+
+```bash
+RUNTIME_EXTRAS=spark RUNNER_EXTRAS=spark make images IMAGE_REGISTRY=<your-registry>
+```
+
+Both, not one: the platform baseline that decides "already provided" is
+computed by workspace-runtime off its own interpreter, while the import happens
+in the sandbox. The `k8s` group (the task backend's cluster client) needs no
+argument — the runtime image carries it always, since `task_backend:
+kubernetes` is what this overlay sets and a missing client refuses to start.
+
 ## 3. First deploy
 
 ```bash

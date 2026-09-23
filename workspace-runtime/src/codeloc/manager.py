@@ -48,14 +48,16 @@ from datacode_common.python_deps import site_packages_path
 from src.codeloc.errors import CodeLocationLoadError, WorkspacePathInvalidError
 from src.codeloc.pod import WORKSPACE_MOUNT_PATH as POD_WORKSPACE_MOUNT_PATH
 from src.codeloc.ports import PortSegmentAllocator
-from src.codeloc.scaffold import ASSET_DAG_SUBDIR, ensure_asset_dag_scaffold
+from src.codeloc.scaffold import (
+    ASSET_DAG_SUBDIR,
+    DEFINITIONS_FILE,
+    ensure_asset_dag_scaffold,
+)
 from src.config import Settings, settings
 from src.deps.manifest import overlay_for_injection
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-DEFINITIONS_FILE = "definitions.py"
 
 # Legacy single-replica port state (pre-segmentation). Still read once so an
 # upgraded replica keeps the assignments that fall inside its segment.

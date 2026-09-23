@@ -247,6 +247,59 @@ class TestComposeTransitionalShape:
         assert any("P4a transitional" in w for w in contract.warnings)
 
 
+class TestRuntimeExtrasReachTheComposeBuild:
+    """`RUNTIME_EXTRAS=spark make build` must actually reach docker build.
+
+    A compose build block without `args:` declares no build-arg at all, so the
+    Dockerfile's own default (empty) wins and the operator's environment
+    variable is ignored without a word — the image builds fine, starts fine,
+    and a working copy declaring pyspark still fails with `deps_no_wheel`.
+    Every stack that builds this image has to forward it.
+    """
+
+    def _runtime_builds(self) -> list[tuple[str, str, dict]]:
+        """(compose file, service name, build block) for every runtime build."""
+        found = []
+        for compose in sorted((_REPO_ROOT / "deploy").glob("docker-compose.*.yml")):
+            document = yaml.safe_load(compose.read_text())
+            for name, service in (document.get("services") or {}).items():
+                build = service.get("build")
+                if not isinstance(build, dict):
+                    continue
+                if str(build.get("dockerfile", "")).endswith(
+                    "workspace-runtime/Dockerfile"
+                ):
+                    found.append((compose.name, name, build))
+        return found
+
+    def test_every_stack_declares_the_build_arg(self):
+        builds = self._runtime_builds()
+        assert builds, "no compose file builds workspace-runtime any more"
+        missing = [
+            f"{file}:{name}" for file, name, build in builds
+            if "RUNTIME_EXTRAS" not in (build.get("args") or {})
+        ]
+        assert not missing, (
+            f"these compose builds do not forward RUNTIME_EXTRAS: {missing}. "
+            f"compose passes only the args a service declares, so the "
+            f"Dockerfile default (empty) silently wins."
+        )
+
+    def test_the_forwarded_value_defaults_to_empty(self):
+        """An unset variable must not break the ordinary build.
+
+        The Dockerfile's default is the empty string, so `${RUNTIME_EXTRAS:-}`
+        keeps a plain `make build` byte-identical. A `${RUNTIME_EXTRAS:?}`
+        would make every stack require an export nobody needs.
+        """
+        for file, name, build in self._runtime_builds():
+            value = (build.get("args") or {}).get("RUNTIME_EXTRAS", "")
+            assert str(value).startswith("${RUNTIME_EXTRAS:-"), (
+                f"{file}:{name} forwards RUNTIME_EXTRAS as {value!r}; it must "
+                f"default to an empty string so an unset variable still builds"
+            )
+
+
 class TestRuntimeImageShipsTheLocalTaskVehicle:
     """`task.backend=local` needs the runner package INSIDE this image.
 

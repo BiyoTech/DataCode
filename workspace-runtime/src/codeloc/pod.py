@@ -37,6 +37,7 @@ import asyncio
 import re
 from typing import Any, Optional
 
+from src.codeloc.scaffold import ASSET_DAG_SUBDIR, DEFINITIONS_FILE
 from src.config import settings
 from src.utils.logging import get_logger
 
@@ -57,7 +58,6 @@ LABEL_LOCATION = "datacode.io/code-location"
 # Where the working copy is mounted inside the Pod, and where Dagster expects
 # to be started from so ``defs/`` resolves as the auto-discovery root.
 WORKSPACE_MOUNT_PATH = "/workspace"
-ASSET_DAG_SUBDIR = "asset-dag"
 
 _VALID_NAME = re.compile(r"[^a-z0-9-]")
 
@@ -74,6 +74,33 @@ def pod_name(location_name: str) -> str:
     of stacking a second Pod beside a half-dead one.
     """
     return f"codeloc-{_slug(location_name)}-{hex(abs(hash(location_name)))[2:10]}"
+
+
+def code_location_command(location_name: str) -> list[str]:
+    """argv of the code location server, as the container must run it.
+
+    The ``-f`` is load-bearing and its absence is SILENT: ``dagster api grpc``
+    with no target leaves ``loadable_target_origin`` unset
+    (``dagster/_cli/api.py``), and the server then returns early with an empty
+    workspace (``dagster/_grpc/server.py``). It binds, serves gRPC, answers
+    every health question correctly — and reports zero repositories. A user sees
+    an empty asset DAG from a location the platform insists is alive.
+
+    ``--location-name`` is what makes the server's reply match the entry the
+    orchestrator is dialling; the process vehicle passes it
+    (``CodeLocationManager._spawn_grpc``) and pod mode must agree, since the two
+    feed the same workspace.yaml.
+
+    The path is the one inside the container, not the runtime's view of the
+    working copy: the copy is mounted at ``/workspace``.
+    """
+    return [
+        "dagster", "api", "grpc",
+        "-h", "0.0.0.0",
+        "-p", str(CODELOC_PORT),
+        "-f", f"{WORKSPACE_MOUNT_PATH}/{ASSET_DAG_SUBDIR}/{DEFINITIONS_FILE}",
+        "--location-name", location_name,
+    ]
 
 
 def service_name(environment: str) -> str:
@@ -156,11 +183,7 @@ def build_pod_manifest(
                 "name": "code-location",
                 "image": image,
                 "imagePullPolicy": image_pull_policy,
-                "command": [
-                    "dagster", "api", "grpc",
-                    "-h", "0.0.0.0",
-                    "-p", str(CODELOC_PORT),
-                ],
+                "command": code_location_command(location_name),
                 "workingDir": f"{WORKSPACE_MOUNT_PATH}/{ASSET_DAG_SUBDIR}",
                 "env": environment_env,
                 "ports": [{"name": "grpc", "containerPort": CODELOC_PORT}],
@@ -443,6 +466,7 @@ __all__ = [
     "WORKSPACE_MOUNT_PATH",
     "build_pod_manifest",
     "build_service_manifest",
+    "code_location_command",
     "pod_name",
     "service_fqdn",
     "service_name",

@@ -189,7 +189,7 @@ class TestTheSparkRouteIsWholeOrAbsent:
         # install command": comment text and the JRE step below also mention the
         # build-arg, and a looser check keeps passing when the interpolation is
         # dropped from the install — the only regression this catches.
-        assert "workspace-runtime[usercode${RUNTIME_EXTRAS" in source, (
+        assert "workspace-runtime[usercode,k8s${RUNTIME_EXTRAS" in source, (
             "RUNTIME_EXTRAS is declared but never appended to the installed "
             "extras, so `--build-arg RUNTIME_EXTRAS=spark` builds an image "
             "without pyspark and says nothing"
@@ -201,6 +201,71 @@ class TestTheSparkRouteIsWholeOrAbsent:
         assert "jre" in source, (
             "pyspark without a JRE is an image that imports and then fails on "
             "the first action — the quietest possible way to ship it broken"
+        )
+
+    def test_the_build_arg_has_no_baked_in_default(self) -> None:
+        """`ARG RUNTIME_EXTRAS=` must default to nothing.
+
+        Extras are opt-in per deployment and this arg comes from the OUTSIDE
+        (`--build-arg`, which every compose file forwards from the environment).
+        A value baked into the Dockerfile inverts that — every replica pays for
+        it — and has been a real accident: a shell command line
+        (`RUNTIME_EXTRAS=spark make build up`) pasted in as the default, which
+        pip then read as four extra NAMES, warned about, and skipped. The image
+        shipped without pyspark, the JRE step's `,spark,` match missed too, and
+        the only symptom was `deps_no_wheel` on the package the build was
+        supposed to provide.
+        """
+        default = re.search(
+            r"^ARG RUNTIME_EXTRAS=(.*)$", DOCKERFILE.read_text(encoding="utf-8"), re.M
+        )
+        assert default is not None, "ARG RUNTIME_EXTRAS is gone"
+        assert default.group(1).strip().strip('"').strip("'") == "", (
+            "ARG RUNTIME_EXTRAS has a baked-in default "
+            f"({default.group(1)!r}); pass it with --build-arg instead"
+        )
+
+    def test_an_extra_that_did_not_land_fails_the_build(self) -> None:
+        """pip only WARNS about an unknown extra, so the build has to check.
+
+        This is the guard that turns the accident above into a build failure
+        instead of an image that looks healthy and omits the packages.
+        """
+        source = DOCKERFILE.read_text(encoding="utf-8")
+        assert "datacode_common.image_extras" in source, (
+            "the runtime image does not verify that RUNTIME_EXTRAS landed, so a "
+            "misspelled or malformed value builds silently"
+        )
+
+
+class TestTheClusterClientIsNotABuildArgument:
+    """`task_backend: kubernetes` must not depend on somebody remembering.
+
+    The Kubernetes task backend imports its client while the backend object is
+    being CONSTRUCTED (``src/tasks/backends/kubernetes.py``), so a missing
+    package is a startup failure, not a task that fails later — and the only
+    clue would be an error message naming the extra. One image serves every
+    deployment, so the extra belongs in the image rather than in the build
+    command: a cluster rollout that forgets it is not a different deployment,
+    it is the ordinary one.
+    """
+
+    def test_the_image_installs_it_unconditionally(self) -> None:
+        commands = _install_commands(DOCKERFILE.read_text(encoding="utf-8"))
+        assert any("workspace-runtime[usercode,k8s" in c for c in commands), (
+            "the runtime image installs the service without the `k8s` extra, so "
+            "`task_backend=kubernetes` (what deploy/k8s/base sets) fails at "
+            "startup unless the operator happens to pass RUNTIME_EXTRAS=k8s"
+        )
+
+    def test_the_dev_venv_still_does_not_pay_for_it(self) -> None:
+        """Opt-in remains opt-in where there is no cluster to talk to."""
+        source = (REPO_ROOT / "scripts" / "dev-lib.sh").read_text(encoding="utf-8")
+        calls = re.findall(r"ensure_python_venv workspace-runtime[^\n;]*", source)
+        assert calls, "dev-lib.sh no longer sets up workspace-runtime's venv"
+        assert all(",k8s" not in call for call in calls), (
+            "dev-lib.sh installs the `k8s` extra into the dev venv; dev runs "
+            "the local task backend and has no cluster client to use"
         )
 
 

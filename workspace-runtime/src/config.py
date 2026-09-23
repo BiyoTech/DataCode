@@ -81,7 +81,18 @@ class Settings(BaseSettings):
     #             Requires a container isolation profile; the manager refuses to
     #             start rather than silently degrading to the process vehicle.
     code_location_mode: str = "process"
-    code_location_container_image: str = "datacode/task-runner:latest"
+    # Image a pod-mode code location runs on. It executes `dagster api grpc`
+    # and imports the working copy's `defs/` package, so it needs dagster AND
+    # the platform's user-code baseline — which is exactly what the runtime
+    # image is, and what the task-runner image is not (it carries sqlmesh and
+    # nothing else, so `dagster` is not on its PATH at all).
+    #
+    # It must also be the SAME interpreter the baseline was computed from: a
+    # location that resolves `pandas` against a different image makes
+    # "provided by the platform" a claim about a package set the user's code
+    # never sees. `datacode/task-runner` here was a pod mode that could not
+    # start; the honest choice is our own image.
+    code_location_container_image: str = "datacode/workspace-runtime:latest"
     code_location_pod_ready_timeout: int = 120
     code_location_host: str = "0.0.0.0"
     code_location_port: int = 4000

@@ -186,6 +186,10 @@ services:
     build:
       context: ..
       dockerfile: workspace-runtime/Dockerfile
+      # Forwarded, or `RUNTIME_EXTRAS=spark make cell-up` builds without it.
+      # Unset passes "", the Dockerfile's own default.
+      args:
+        RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
     environment:
       <<: *cell-env
       # Leases ON with per-replica volumes: the lease is the single-writer

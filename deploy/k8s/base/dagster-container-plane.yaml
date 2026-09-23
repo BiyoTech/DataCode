@@ -127,8 +127,18 @@ data:
           effect: NoSchedule
       containers:
         - name: code-location
-          # Same image family as the run worker: user code + dagster.
-          command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000"]
+          # Same image as the run worker: user code + dagster, i.e. the
+          # workspace-runtime image. It cannot be the task-runner image, which
+          # has no `dagster` on PATH.
+          #
+          # `-f` is what makes the server LOAD anything: with no target
+          # `dagster api grpc` starts an empty workspace — it binds, serves
+          # gRPC and lists zero repositories, so the location looks alive while
+          # the asset DAG stays empty. `--location-name` must match the entry
+          # the orchestrator dials.
+          command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000",
+                    "-f", "/workspace/asset-dag/definitions.py",
+                    "--location-name", "<location-name>"]
           working_dir: /workspace/asset-dag
           env:
             - name: DATACODE_ENVIRONMENT

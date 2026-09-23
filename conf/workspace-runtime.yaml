@@ -148,7 +148,12 @@ dagster:
   # Pod mode is discovered through a headless Service per environment
   # (codeloc-<env>), whose Endpoints are the registry.
   code_location_mode: "process"    # "process" | "pod"
-  code_location_container_image: "datacode/task-runner:latest"
+  # Image the pod vehicle runs: it executes `dagster api grpc` and imports the
+  # working copy's `defs/` package, so it needs dagster and the platform's
+  # user-code baseline — the runtime image, not the task-runner one (which
+  # carries sqlmesh and no dagster, and whose package set is not the baseline
+  # this service publishes to working copies).
+  code_location_container_image: "datacode/workspace-runtime:latest"
   code_location_pod_ready_timeout: 120
   code_location_host: "0.0.0.0"
   code_location_port: 4000
