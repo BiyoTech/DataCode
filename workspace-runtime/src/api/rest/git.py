@@ -208,15 +208,31 @@ async def git_unstage(req: GitUnstageRequest):
 
 @router.post("/commit")
 async def git_commit(req: GitCommitRequest):
-    """Commit staged changes."""
-    from src.git.ops import run_git_async
+    """Commit staged changes, authored by the acting user.
+
+    The author identity is resolved from the user's git credential (matching
+    the remote's host, else the default credential, else the platform
+    identity) and injected for THIS command only. A bare ``git commit`` relied
+    on the process user's global gitconfig — present on a dev machine, absent
+    in the container image, where the commit failed with "unable to
+    auto-detect email address".
+    """
+    from src.git.ops import author_args, run_git_async
     from src.sqlmesh.env_locks import check_environment_lock
+    from src.workspace.git_credentials import resolve_commit_identity
 
     # A commit landing mid-apply would desynchronize the recorded applied
     # commit from the code that actually ran; reject while apply holds the
     # environment lock (advisory pre-check, non-blocking).
     await check_environment_lock(req.workspace_path, operation="commit")
-    result = await run_git_async(req.workspace_path, ["commit", "-m", req.message])
+
+    remote = await run_git_async(req.workspace_path, ["remote", "get-url", "origin"])
+    remote_url = remote.stdout.strip() if remote.returncode == 0 else ""
+    author = await resolve_commit_identity(req.user_id, remote_url)
+
+    result = await run_git_async(
+        req.workspace_path, author_args(author) + ["commit", "-m", req.message]
+    )
     if result.returncode != 0:
         if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
             return {"success": False, "commit_hash": None, "message": "Nothing to commit"}

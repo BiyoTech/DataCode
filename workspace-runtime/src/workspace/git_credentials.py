@@ -14,7 +14,7 @@ behaves identically.
 
 import typing as t
 
-from src.git.ops import GitAuth, extract_git_host, run_git_async
+from src.git.ops import GitAuth, GitAuthor, extract_git_host, run_git_async
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -85,3 +85,65 @@ async def resolve_auth_for_workspace(
     if not remote_url:
         return ResolvedGitAuth(None, "", ""), ""
     return await resolve_auth_for_url(user_id, remote_url), remote_url
+
+
+def _identity_from(cred: t.Any) -> t.Optional[GitAuthor]:
+    """Build a commit identity from a credential row, or None when it cannot.
+
+    The email is mandatory — without it git still cannot author the commit, so
+    the credential is skipped and resolution moves on. The NAME falls back to
+    the email's local part: the form makes the username optional, and the local
+    part is how the forges themselves derive a display name.
+    """
+    email = (getattr(cred, "email", None) or "").strip()
+    if not email:
+        return None
+    name = (getattr(cred, "username", None) or "").strip() or email.split("@", 1)[0]
+    return GitAuthor(name=name, email=email)
+
+
+async def resolve_commit_identity(user_id: str, repo_url: str) -> GitAuthor:
+    """Author identity for a commit made by ``user_id`` against ``repo_url``.
+
+    Three-tier fallback, and it NEVER fails — a commit must not depend on any
+    credential existing, because a workspace without a remote still commits:
+
+    1. the credential matching the remote's host (the same one a push uses);
+    2. the user's DEFAULT credential — attribution, not authentication, so a
+       credential for another host is still better than a machine name;
+    3. the platform identity, for a user who never configured credentials.
+
+    The previous behaviour was to run a bare ``git commit``: it worked on a
+    dev machine only because the developer's global gitconfig answered, and
+    failed in the container (no HOME gitconfig) with "unable to auto-detect
+    email address".
+    """
+    from src.git.ops import GitWorktreeOperations
+
+    platform = GitAuthor(
+        GitWorktreeOperations.COMMITTER_NAME, GitWorktreeOperations.COMMITTER_EMAIL
+    )
+    if not user_id:
+        return platform
+
+    try:
+        from src.workspace.repository import UserGitCredentialRepository
+
+        repo = UserGitCredentialRepository()
+        host = extract_git_host(repo_url)
+        cred = await repo.get_for_host(user_id, host) if host else None
+        identity = _identity_from(cred) if cred is not None else None
+        if identity is None:
+            identity = _identity_from(await repo.get_default(user_id))
+    except Exception as exc:
+        logger.warning("git_commit_identity_lookup_failed", user_id=user_id, error=str(exc))
+        return platform
+
+    if identity is None:
+        logger.info(
+            "git_commit_identity_platform_fallback",
+            user_id=user_id,
+            host=extract_git_host(repo_url),
+        )
+        return platform
+    return identity

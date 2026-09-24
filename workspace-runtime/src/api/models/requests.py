@@ -249,6 +249,11 @@ class GitUnstageRequest(WorkspacePathMixin):
 
 class GitCommitRequest(WorkspacePathMixin):
     message: str
+    # Resolved server-side into the commit's author identity (the matching git
+    # credential, else the default one, else the platform identity). Optional
+    # like the other git operations: an absent id degrades attribution, never
+    # blocks the commit.
+    user_id: str = ""
 
 
 class GitPushRequest(WorkspacePathMixin):

@@ -103,6 +103,34 @@ class GitAuth:
         return token_username(self.provider)
 
 
+class GitAuthor(t.NamedTuple):
+    """Author/committer identity stamped on a commit.
+
+    A separate concept from :class:`GitAuth`: authentication proves the push
+    may happen, attribution records who wrote the content. A commit carries no
+    token and must never depend on one existing — a workspace without any
+    remote still commits, so resolution always ends at the platform identity
+    (see ``resolve_commit_identity`` in ``src.workspace.git_credentials``).
+
+    The identity is injected per command (``-c user.name=...``), never written
+    into the repository or global config: the service account has no global
+    gitconfig in the container image, and writing one would leak the LAST
+    user's identity into the NEXT user's commit on a shared replica.
+    """
+
+    name: str
+    email: str
+
+
+def author_args(author: GitAuthor) -> t.List[str]:
+    """The ``-c user.name/-c user.email`` pair placing an identity on one command.
+
+    Prepended to a git command's argument list (before the subcommand), so the
+    identity wins over any repository or global config without touching either.
+    """
+    return ["-c", f"user.name={author.name}", "-c", f"user.email={author.email}"]
+
+
 @dataclass
 class GitCommandResult:
     """Outcome of a remote git command.
@@ -536,7 +564,26 @@ class GitOperations:
             # so the explicit call in the /git/init endpoint is unaffected.
             ensure_gitignore(workspace_path)
             _run_git(workspace_path, ["add", "."])
-            _run_git(workspace_path, ["commit", "-m", "Initial commit", "--allow-empty"])
+            # Platform-authored bootstrap commit with the identity INJECTED:
+            # the service account has no global gitconfig in the container
+            # image, so a bare commit fails there (silently, since the result
+            # was once ignored) while succeeding on a dev machine.
+            commit = _run_git(
+                workspace_path,
+                author_args(
+                    GitAuthor(
+                        GitWorktreeOperations.COMMITTER_NAME,
+                        GitWorktreeOperations.COMMITTER_EMAIL,
+                    )
+                )
+                + ["commit", "-m", "Initial commit", "--allow-empty"],
+            )
+            if commit.returncode != 0:
+                logger.warning(
+                    "git_init_commit_failed",
+                    workspace=workspace_path,
+                    stderr=commit.stderr[-500:],
+                )
             logger.info("git_initialized", workspace=workspace_path)
             return True
         return False
@@ -1065,17 +1112,47 @@ class GitOperations:
         )
 
     @staticmethod
-    def commit_all(workspace_path: str, message: str) -> t.Optional[str]:
-        """Stage all changes and commit. Returns commit hash or None."""
+    def commit_all(
+        workspace_path: str, message: str, author: t.Optional[GitAuthor] = None
+    ) -> t.Optional[str]:
+        """Stage all changes and commit. Returns commit hash or None.
+
+        The identity is ALWAYS injected: the service account has no global
+        gitconfig in the container image, so a bare ``git commit`` fails with
+        "unable to auto-detect email address" there while succeeding on a dev
+        machine — the classic leak that made this bug invisible locally.
+        ``None`` means a platform-authored commit (scaffold bootstrap), which
+        carries the platform identity; user commits pass their credential's
+        name/email explicitly.
+        """
+        identity = author or GitAuthor(
+            GitWorktreeOperations.COMMITTER_NAME, GitWorktreeOperations.COMMITTER_EMAIL
+        )
         _run_git(workspace_path, ["add", "."])
-        result = _run_git(workspace_path, ["commit", "-m", message])
+        result = _run_git(workspace_path, author_args(identity) + ["commit", "-m", message])
         if result.returncode != 0:
-            logger.info("git_commit_no_changes", workspace=workspace_path)
+            combined = f"{result.stdout}\n{result.stderr}"
+            if "nothing to commit" in combined:
+                logger.info("git_commit_no_changes", workspace=workspace_path)
+                return None
+            # A real failure (index lock, hooks, disk) must not masquerade as
+            # "no changes" — that is exactly how the missing-identity failure
+            # above stayed invisible until it surfaced in the Git panel.
+            logger.warning(
+                "git_commit_failed",
+                workspace=workspace_path,
+                stderr=result.stderr[-500:],
+            )
             return None
 
         hash_result = _run_git(workspace_path, ["rev-parse", "HEAD"])
         commit_hash = hash_result.stdout.strip() if hash_result.returncode == 0 else ""
-        logger.info("git_committed", workspace=workspace_path, hash=commit_hash[:8])
+        logger.info(
+            "git_committed",
+            workspace=workspace_path,
+            hash=commit_hash[:8],
+            author=identity.email,
+        )
         return commit_hash
 
     @staticmethod
@@ -2656,36 +2733,3 @@ def _github_api_base(server_url: str) -> str:
     if host in ("", "github.com"):
         return "https://api.github.com"
     return f"{(server_url or f'https://{host}').rstrip('/')}/api/v3"
-
-
-# ---- Backward-compatible module-level functions ----
-# These are used by existing API endpoints in main.py
-
-def git_init(workspace_path: str) -> bool:
-    """Initialize a Git repository (backward-compatible wrapper)."""
-    return GitOperations.init(workspace_path)
-
-
-def git_status(workspace_path: str) -> t.Dict[str, t.Any]:
-    """Get Git status (backward-compatible wrapper)."""
-    return GitOperations.status(workspace_path)
-
-
-def git_commit(
-    workspace_path: str, message: str, paths: t.Optional[t.List[str]] = None
-) -> t.Optional[str]:
-    """Commit changes (backward-compatible wrapper)."""
-    if paths:
-        for p in paths:
-            _run_git(workspace_path, ["add", p])
-        result = _run_git(workspace_path, ["commit", "-m", message])
-        if result.returncode != 0:
-            return None
-        hash_result = _run_git(workspace_path, ["rev-parse", "HEAD"])
-        return hash_result.stdout.strip() if hash_result.returncode == 0 else ""
-    return GitOperations.commit_all(workspace_path, message)
-
-
-def git_diff(workspace_path: str, file_path: str = "") -> str:
-    """Get diff (backward-compatible wrapper)."""
-    return GitOperations.diff(workspace_path, file_path)

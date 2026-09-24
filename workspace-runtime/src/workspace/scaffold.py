@@ -578,12 +578,18 @@ model_defaults:
         attributed to code that was not the code it ran on.
         """
         from src.sqlmesh.env_locks import check_environment_lock
-        from src.workspace.git_credentials import resolve_auth_for_url
+        from src.workspace.git_credentials import (
+            resolve_auth_for_url,
+            resolve_commit_identity,
+        )
 
         await check_environment_lock(workspace_path, operation="commit")
 
+        # The sync commit is USER content: author it with the user's identity
+        # (resolved from their git credential), not the platform's.
+        author = await resolve_commit_identity(user_id, git_repo_url)
         commit_hash = await asyncio.to_thread(
-            GitOperations.commit_all, workspace_path, message
+            GitOperations.commit_all, workspace_path, message, author
         )
         if not commit_hash:
             logger.info(
