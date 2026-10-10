@@ -1,7 +1,7 @@
 """Workspace identifier and filesystem path conventions (design 07, P1).
 
 Promoted from ``sqlmesh-service/src/workspace/paths.py`` to the shared
-library so workspace-runtime and control-service (P5) derive paths from ONE
+library so workspace-runtime and control-service derive paths from ONE
 module. The naming algebra itself lives in :mod:`datacode_common.naming`;
 this module owns only the path layout.
 

@@ -1,4 +1,4 @@
-"""Task execution plane (design 04 §3, design 06 P6a).
+"""Task execution plane (design 04 §3).
 
 Work that must not run in this process is submitted here. The submitter picks the
 sandbox from the task's kind, a backend provides the vehicle, and the audit

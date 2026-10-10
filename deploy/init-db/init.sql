@@ -16,6 +16,13 @@
 -- must not interleave with the services' alembic chain.
 CREATE DATABASE dagster OWNER datacode;
 
+-- Gitea's own storage. The gitea service (infra stack, "gitea" profile) is
+-- configured with GITEA__database__NAME=gitea and, like Dagster, migrates its
+-- schema itself. It cannot create the database — its user is not a superuser —
+-- so without this line `make infra` starts a gitea that crash-loops on
+-- "database gitea does not exist".
+CREATE DATABASE gitea OWNER datacode;
+
 -- Extensions for the main datacode database.
 \c datacode;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

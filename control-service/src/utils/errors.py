@@ -269,7 +269,7 @@ class TimeoutError(ServiceError):
 
 
 class QuotaExceededError(ServiceError):
-    """A tenant-level resource quota was reached (design 06 P8).
+    """A tenant-level resource quota was reached (design 06).
 
     429 rather than 409 on purpose: the limit is not a conflict with the
     current state of one object — it is a rate the tenant has exhausted, and

@@ -9,6 +9,7 @@ each topic has its own page.
 | Run everything on your laptop for development | [deploy-host.md](deploy-host.md) |
 | Run everything in containers (one machine) | [deploy-docker.md](deploy-docker.md) |
 | Deploy to production Kubernetes | [deploy-k8s.md](deploy-k8s.md) |
+| Know what breaks (and what does not) when Redis is down | [redis-degradation-matrix.md](redis-degradation-matrix.md) |
 
 ## The three deployment shapes
 

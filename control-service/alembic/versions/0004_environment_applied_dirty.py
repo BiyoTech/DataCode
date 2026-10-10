@@ -24,8 +24,9 @@ Handed over verbatim from the legacy sqlmesh-service chain (P5).
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy import inspect
+
+from alembic import op
 
 revision: str = "0004_environment_applied_dirty"
 down_revision: Union[str, None] = "0003_environments"

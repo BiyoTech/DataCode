@@ -1,0 +1,326 @@
+# In-cluster PostgreSQL and Redis — LOCAL CLUSTERS ONLY (kind, colima, k3d).
+#
+# Why this is not part of the Kustomize base
+# ------------------------------------------
+# A real deployment points at managed instances: conf/platform.k8s-cell.yaml
+# and conf/platform.k8s-global.yaml name `postgres.datacode.svc`,
+# `global-pg.datacode-global.svc` and `redis.<ns>.svc` precisely so the
+# addresses can be re-pointed at a managed endpoint by editing ONE profile.
+# Shipping these objects in the base would make every cluster run a database
+# whose data survives nothing, and the first production install would discover
+# that only after a node reboot.
+#
+# So this file is applied EXPLICITLY, next to an overlay, and never by
+# `make k8s-apply`:
+#
+#   kubectl apply -f deploy/k8s/local/infra.yaml
+#   make k8s-apply OVERLAY=global
+#   make k8s-apply OVERLAY=kind
+#
+# What it provides, and why exactly these four
+# --------------------------------------------
+#   datacode/postgres          the CELL database   (database `datacode`)
+#   datacode/redis             the CELL Redis      (leases, env locks, SSE)
+#   datacode-global/global-pg  the GLOBAL database (database `identity`)
+#   datacode-global/redis      the GLOBAL Redis    (login rate limiting)
+#
+# The two tiers get separate instances here for the same reason they do in
+# production: a cell's database failure must not take identity down for every
+# other cell. Keeping the split in the local shape is what makes a
+# cross-tier misconfiguration fail here rather than in staging.
+#
+# EMPTYDIR, deliberately: no PersistentVolumeClaim anywhere below. A local
+# cluster is a place to verify the topology, and a claim that outlives a
+# `kind delete cluster` is a source of stale schemas, not of safety. Data is
+# gone on pod restart; re-run the migrate Jobs (`make k8s-migrate`).
+#
+# The password comes from the SAME Secret the services read (`datacode-db`,
+# key `password`) rather than a literal here — the failure mode of two sources
+# is a database that rejects the exact clients it was created for.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: datacode
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: datacode
+  labels:
+    app: postgres
+spec:
+  # One replica, and Recreate rather than RollingUpdate: two Postgres pods
+  # sharing nothing would each serve a different empty database, and clients
+  # would be load balanced between them.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: datacode
+            - name: POSTGRES_DB
+              value: datacode
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+            # The data directory must be a SUBDIRECTORY of the mount: an
+            # emptyDir is not empty enough for initdb on every platform (a
+            # lost+found or a mount artefact aborts it with "directory not
+            # empty"), and the failure looks like a crash-looping image.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datacode", "-d", "datacode"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datacode"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: init
+          configMap:
+            name: postgres-init
+---
+# The cell database's bootstrap, mirroring deploy/init-db/init.sql: only what
+# the services cannot create themselves. Platform tables belong to
+# control-service's alembic chain (the migrate Job), never to this file — a
+# second DDL source drifts from the migrations and wins the race against them
+# on a fresh volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: datacode
+data:
+  init.sql: |
+    -- Dagster owns and migrates this schema itself, so it lives in its own
+    -- database and never interleaves with the alembic chain.
+    CREATE DATABASE dagster OWNER datacode;
+
+    \c datacode;
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: datacode
+  labels:
+    # Selected by name from egress-proxy-policy in egress-plane.yaml: the
+    # proxy is allowed to reach `app: redis` in the `datacode` namespace and
+    # nothing else there. A differently-labelled Redis denies every grant
+    # lookup, which the proxy reports as "grant store unreachable".
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: datacode
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # No appendonly here, unlike the compose infra stack: there is
+          # nothing to persist TO (emptyDir), and claiming durability the
+          # storage cannot provide is worse than not claiming it.
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+---
+# ── Global tier ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: global-pg
+  namespace: datacode-global
+  labels:
+    app: global-pg
+spec:
+  selector:
+    app: global-pg
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: global-pg
+  namespace: datacode-global
+  labels:
+    app: global-pg
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: global-pg
+  template:
+    metadata:
+      labels:
+        app: global-pg
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: datacode
+            # `identity`, not `datacode`: conf/platform.k8s-cell.yaml's
+            # database.services.identity names this database, and the cell
+            # services refuse to start when the Global/Cell split is declared
+            # but not performed (cells.expect_global_db).
+            - name: POSTGRES_DB
+              value: identity
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datacode", "-d", "identity"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "datacode"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: datacode-global
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: datacode-global
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }

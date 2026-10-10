@@ -44,6 +44,15 @@ Every deployment's migrate step runs the same entry point: dev's
 `run_db_migrations`, the compose one-shot `migrate` service, the Kubernetes
 `control-migrate` Job. Replicas run with `AUTO_MIGRATE=0`.
 
+Ownership covers writes, not reads. The runtime READS `workspaces`,
+`user_git_credentials` and one `environments` row directly — those reads are on
+its hot path, tolerate a stale row and cannot corrupt anything. For the two
+facts it authors (an apply's watermark, a merge's audit row) it calls
+`/internal/env-registry/*` (`src/api/rest/env_registry.py`,
+`X-Internal-Token`), so this service stays the sole writer. That surface takes
+FACTS, never column names: there is no generic "update this row" endpoint
+through which the registry's own whitelist could be bypassed.
+
 ## What a destroy may take (and what it may not)
 
 Destroying an environment releases only state the PLATFORM created: the SQLMesh

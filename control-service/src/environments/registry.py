@@ -451,6 +451,7 @@ class EnvironmentRegistry:
                 tenant_id=tenant_id,
                 workspace_id=workspace_id,
                 user_id=actor_user_id,
+                environment=name,
                 git_repo_url=workspace.git_repo_url or "",
                 bootstrap_branch=naming.branch_of(production_name),
             )
@@ -698,6 +699,7 @@ class EnvironmentRegistry:
             tenant_id=tenant_id,
             workspace_id=model.workspace_id,
             user_id=user_id,
+            environment=model.name,
             git_repo_url=workspace.git_repo_url or "",
             bootstrap_branch=naming.branch_of(
                 workspace.production_env or naming.PRODUCTION_ENV
@@ -1368,6 +1370,7 @@ class EnvironmentRegistry:
                     tenant_id=tenant_id,
                     workspace_id=workspace_id,
                     user_id=member,
+                    environment=environment,
                     branch=branch,
                 )
             except Exception as exc:  # noqa: BLE001 - keep releasing the rest

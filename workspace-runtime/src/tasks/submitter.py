@@ -15,7 +15,7 @@ Sequence for one submission:
     prevent.
 3.  Build and validate a spec (credential-free by construction).
 4.  Derive the task's egress allow-list from the working copy and publish it, then
-    mint the task's own credentials (P6b). Both are per task and both expire with
+    mint the task's own credentials. Both are per task and both expire with
     it; a task whose network policy could not be published is REFUSED rather than
     launched with no reachable warehouse.
 5.  Record it, run it, record the outcome, revoke the grant.
@@ -252,7 +252,7 @@ class TaskSubmitter:
 
         await self._auditor.record_submitted(spec, backend=backend.name)
 
-        # Network and credentials, both scoped to this one task (P6b). Prepared
+        # Network and credentials, both scoped to this one task. Prepared
         # AFTER the audit record so a failure here still leaves a trace of the
         # attempt, and BEFORE the vehicle starts so a sandbox never exists without
         # its policy having been published.
@@ -325,7 +325,7 @@ class TaskSubmitter:
 
         return await backend.execute(spec, profile, credentials)
 
-    # ── per-task network and credentials (P6b) ─────────────────────────
+    # ── per-task network and credentials ─────────────────────────
 
     async def _prepare_sandbox_access(
         self, spec: TaskSpec, profile: IsolationProfile

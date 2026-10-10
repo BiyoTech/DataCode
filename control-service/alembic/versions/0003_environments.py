@@ -32,9 +32,6 @@ from datetime import datetime, timezone
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
-from sqlalchemy import inspect
-
 from datacode_common.naming import (
     ENV_TYPE_PRODUCTION,
     PRODUCTION_ENV,
@@ -43,6 +40,9 @@ from datacode_common.naming import (
     deployment_name,
     environment_id,
 )
+from sqlalchemy import inspect
+
+from alembic import op
 
 revision: str = "0003_environments"
 down_revision: Union[str, None] = "0002_drop_workspace_members"

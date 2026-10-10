@@ -1,6 +1,6 @@
 """Database models: this service's own tables plus control-owned views.
 
-Ownership (P5): control-service owns ``workspaces`` and ``user_git_credentials``
+Ownership: control-service owns ``workspaces`` and ``user_git_credentials``
 — its migrate step (``control-service/src/db_migrate.py``) is the only thing that
 creates them, and its REST API performs every write to them. The classes for
 those tables below are a READ-ONLY VIEW kept as ORM mappings for the repository
@@ -154,9 +154,9 @@ class FileDraftModel(Base):
     of a replica's disk entirely (design 07 Q6: "editor keystrokes <= 5 s").
 
     A draft is deleted the moment its file is saved to the working copy, so at
-    most one draft exists per (working copy, file). Table ownership: runtime
-    holds it for now; it moves to control-service in P5 together with the rest
-    of the workspace metadata (the same path the lease server took).
+    most one draft exists per (working copy, file). Table ownership: this
+    runtime owns it — drafts are working-copy state, written on the replica
+    that holds the copy, unlike the workspace metadata control-service owns.
     """
 
     __tablename__ = "file_drafts"

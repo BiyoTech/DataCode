@@ -1,4 +1,4 @@
-"""Control service entrypoint (design 02/06, P5).
+"""Control service entrypoint (design 02/06).
 
 The platform's control plane: environment registry + reconciler + TTL reaper,
 workspace metadata, Git credentials and quota bookkeeping. It owns the database
@@ -130,6 +130,12 @@ async def startup() -> None:
     # the mistake becomes invisible (see datacode_common.db_topology).
     _assert_database_topology()
 
+    # The environment lock is shared with workspace-runtime's apply path; an
+    # in-process backend would silently drop that exclusion.
+    from src.core.env_locks import locks as env_locks
+
+    logger.info("environment_lock_backend_validated", mode=env_locks.validate())
+
     await init_db()
 
     from src.config import settings as cfg
@@ -141,7 +147,7 @@ async def startup() -> None:
         )
         app.state.reaper_task = reaper_task
 
-    # Periodic reconciliation (P8): the lease and sandbox drift kinds are leaks
+    # Periodic reconciliation: the lease and sandbox drift kinds are leaks
     # no user action would ever surface, so they need a timer rather than a page
     # view. Detection only until `reconcile.sweep_repair` is enabled.
     if cfg.reconcile_sweep_enabled:
@@ -152,7 +158,7 @@ async def startup() -> None:
         )
         app.state.sweep_task = sweep_task
 
-    # Audit record retention (P8): task_records / lease_history are append-only
+    # Audit record retention: task_records / lease_history are append-only
     # and landed without an expiry; this is the expiry.
     if cfg.retention_enabled:
         from src.records.retention import get_record_retention
@@ -162,7 +168,7 @@ async def startup() -> None:
         )
         app.state.retention_task = retention_task
 
-    # Capacity orchestration (P8): heartbeat-driven replica control + quota
+    # Capacity orchestration: heartbeat-driven replica control + quota
     # snapshot publishing + lease usage accounting. Disabled by default so a
     # single-instance dev topology (one runtime, no scaling surface) starts
     # exactly as before.
@@ -195,7 +201,7 @@ def _cell_id_or_unknown() -> str:
 
 
 async def _register_this_cell() -> None:
-    """Publish this cell's endpoint to the global registry (P7).
+    """Publish this cell's endpoint to the global registry.
 
     Fail-OPEN by design: a cell whose control plane cannot reach the global
     identity service must still serve the tenants already placed on it, or a
@@ -261,6 +267,7 @@ async def shutdown() -> None:
 
 from src.api.rest import (  # noqa: E402
     cell_migration,
+    env_registry,
     environments,
     git_credentials,
     knowledge,
@@ -271,15 +278,18 @@ from src.api.rest import (  # noqa: E402
 app.include_router(environments.router)
 app.include_router(workspace.router)
 app.include_router(git_credentials.router)
-# Tenant quota and usage (P8): the read half of enforcement — a user rejected
+# Tenant quota and usage: the read half of enforcement — a user rejected
 # with 429 must be able to see what their budget actually is.
 app.include_router(quotas.router)
-# Knowledge METADATA only (P8): create/upload/read/delete stay on the runtime,
+# Knowledge METADATA only: create/upload/read/delete stay on the runtime,
 # which owns the working copy's files.
 app.include_router(knowledge.router)
-# Cell migration data plane (P7): internal-only, token-guarded; never routed
+# Cell migration data plane: internal-only, token-guarded; never routed
 # through the gateway's public surface.
 app.include_router(cell_migration.router)
+# Registry writes the runtime asks for: it authors the applied watermark and
+# the merge audit row, but must not write the control plane's tables itself.
+app.include_router(env_registry.router)
 
 from datacode_common.api import LogContextMiddleware  # noqa: E402
 

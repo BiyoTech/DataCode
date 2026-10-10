@@ -1,4 +1,4 @@
-"""Tenant capacity guard for the lease-acquire path (design 06 P8).
+"""Tenant capacity guard for the lease-acquire path (design 06).
 
 The acquire path may not touch a database (see the quota publisher's docstring
 on the control side), so the tenant's lease footprint is measured from the

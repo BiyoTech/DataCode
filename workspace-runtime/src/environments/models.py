@@ -3,7 +3,7 @@
 The registry is the SOURCE OF TRUTH: Git branches, SQLMesh state entries and
 Dagster code locations are reconciled FROM these tables, never the reverse.
 
-Ownership (P5): control-service owns ``environments`` and ``environment_events``
+Ownership: control-service owns ``environments`` and ``environment_events``
 — its migrate step is the only thing that creates them. The classes below are
 this service's ORM mirror view (the environment guard and the apply path read
 and update rows through them); they must stay column-compatible with control's

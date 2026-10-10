@@ -1,6 +1,6 @@
 """Command service - evaluate, test, table_diff operations.
 
-P6 close-out: all three execute user code (model rendering, test files,
+all three execute user code (model rendering, test files,
 macro expansion in diffs) and therefore run in the executor sandbox. This
 module only translates the sandbox's pure-data results into the endpoint
 contracts the REST layer has always served.

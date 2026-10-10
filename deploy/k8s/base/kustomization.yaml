@@ -20,15 +20,24 @@ resources:
   - control-service.yaml
   - agent-service.yaml
   - workspace-runtime.yaml
+  - rbac.yaml
   - frontend.yaml
   - ingress.yaml
   - migrate-job.yaml
   - dagster-container-plane.yaml
+  - dagster-orchestrator.yaml
   - nodepool-user-code.yaml
   - egress-plane.yaml
 
 configMapGenerator:
   - name: datacode-conf
+    # Explicit, like every other resource in this base. A generated object
+    # with no namespace lands in whatever the apply context is — `default` for
+    # a plain `kubectl apply -f -` — while every workload mounting it lives in
+    # `datacode` or `datacode-global`. The pods then stay in
+    # ContainerCreating on a ConfigMap that exists, just not where they are.
+    # The global overlay re-points this to its own namespace.
+    namespace: datacode
     # The neutral base plus the profiles every consumer may select. Service
     # yaml files are included too: they are mounted together and a service
     # reading its own yaml from CONFIG_PATH must find it in the ConfigMap.
@@ -63,4 +72,8 @@ images:
   - name: datacode/frontend
     newTag: latest
   - name: datacode/egress-proxy
+    newTag: latest
+  - name: datacode/dagster-orchestrator
+    newTag: latest
+  - name: datacode/dagster-workspace-sync
     newTag: latest

@@ -1,16 +1,15 @@
-"""LeaseController — capacity orchestration from the heartbeat stream (P8).
+"""LeaseController — capacity orchestration from the heartbeat stream.
 
-The P4a note deferred three things to this module, and the deferred part of
-P8's observability stack fixed its shape: it must decide from the lease
-heartbeats (Redis ``rt:{runtime_id}``), NOT from a metrics stack — the roadmap
-says so explicitly, because the metrics are deferred but capacity must not be.
+It decides from the lease heartbeats (Redis ``rt:{runtime_id}``), NOT from a
+metrics stack: a metrics pipeline is an optional deployment, while capacity
+control is not allowed to be. The heartbeats already carry everything the
+decision needs and exist wherever leases do.
 
 What one tick does, in order
 ----------------------------
 1. **Account**: per-tenant lease counts from the heartbeats are written into
    ``tenant_usage`` (concurrent + peak watermark) — the flows that hold leases
-   live on the runtime, so this loop is the writer the P5 schema was waiting
-   for.
+   live on the runtime, so this loop is that table's only writer.
 2. **Publish**: the lease-relevant quota slice is re-published to Redis with a
    fresh TTL (see ``src.quota.publisher``).
 3. **Decide**: cell-wide utilization = held leases / capacity, with hysteresis
@@ -32,7 +31,7 @@ Honest limits, stated rather than hidden
 * **A drain that never finishes must not wedge scale-down forever.** After
   ``drain_timeout_seconds`` the controller shrinks the count anyway and logs
   loudly; the SIGTERM drain is the backstop for that pod's leases.
-* **This controller is cell-local by design** (P7): the heartbeat keys carry
+* **This controller is cell-local by design**: the heartbeat keys carry
   the cell prefix, so two cells' controllers never see each other's instances.
 """
 
@@ -193,8 +192,32 @@ class LeaseController:
         self._drain_requested_at: dict[str, datetime] = {}
 
     async def run_once(self) -> CapacityOutcome:
-        """One control tick: account, publish, decide, act."""
+        """One control tick: account, publish, decide, act.
+
+        A tick with no heartbeat reading makes NO decision: the whole control
+        loop is a function of the heartbeat stream, and without it every input
+        (utilization, live instances, drain progress) would be indistinguishable
+        from "the fleet is idle and empty".
+        """
         heartbeats = await self._read_heartbeats()
+        if heartbeats is None:
+            current = await self._driver.current_replicas()
+            logger.warning(
+                "lease_controller_tick_skipped",
+                reason="heartbeats unreadable",
+                current_replicas=current,
+                effect="no scaling decision this tick; retried next interval",
+            )
+            return CapacityOutcome(
+                utilization=0.0,
+                current_replicas=current,
+                desired_replicas=current,
+                action="hold",
+                reason="heartbeats unreadable",
+                live_instances=0,
+                held_leases=0,
+            )
+
         await self._account_usage(heartbeats)
         await self._publish_quotas()
 
@@ -387,8 +410,16 @@ class LeaseController:
                 effect="existing snapshot lives on until its TTL",
             )
 
-    async def _read_heartbeats(self) -> list[RuntimeHeartbeat]:
-        """Every decodable heartbeat behind the runtime index."""
+    async def _read_heartbeats(self) -> t.Optional[list[RuntimeHeartbeat]]:
+        """Every decodable heartbeat behind the runtime index, or ``None``.
+
+        ``None`` means UNREADABLE, which is not the same as "no instances are
+        alive" and must never be collapsed into it: an empty list reads as
+        zero utilization and zero live replicas, which drove the controller
+        straight into scale-down — and, with a drain pending, made the victim
+        look like it had finished draining. A Redis blip would then shrink the
+        fleet while every replica was in fact serving leases.
+        """
         try:
             members = await self._client.smembers(runtime_index_redis_key())
             heartbeats: list[RuntimeHeartbeat] = []
@@ -404,7 +435,7 @@ class LeaseController:
             return heartbeats
         except Exception as exc:  # noqa: BLE001
             logger.warning("lease_controller_heartbeats_unreadable", error=str(exc))
-            return []
+            return None
 
     @staticmethod
     async def _request_drain(addr: str) -> bool:

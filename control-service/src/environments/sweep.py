@@ -6,7 +6,7 @@ adequate for the four original parties, because each of them is repaired as a
 side effect of ordinary traffic — an absent branch is recreated the next time
 someone opens the environment.
 
-It is NOT adequate for the two parties added in P8, and that asymmetry is the
+It is NOT adequate for the lease and sandbox parties, and that asymmetry is the
 whole reason this module exists:
 
 * a **stale lease** is only noticed by the request path when someone asks for
@@ -76,6 +76,7 @@ SWEEP_EXCLUSIVE_KINDS = frozenset(
         "lease_split_brain",
         "orphan_codeloc_pod",
         "zombie_task",
+        "stuck_operation",
     }
 )
 
@@ -92,6 +93,8 @@ class SweepOutcome:
     critical_drifts: int = 0
     # kind -> count, across every workspace of this sweep.
     kinds: t.Dict[str, int] = field(default_factory=dict)
+    # Operation resumer summary (see src.operations.resumer).
+    operations: t.Dict[str, int] = field(default_factory=dict)
 
     @property
     def sweep_exclusive_drifts(self) -> int:
@@ -112,6 +115,7 @@ class SweepOutcome:
             "critical_drifts": self.critical_drifts,
             "sweep_exclusive_drifts": self.sweep_exclusive_drifts,
             "kinds": dict(sorted(self.kinds.items())),
+            **self.operations,
         }
 
 
@@ -124,6 +128,7 @@ class ReconcileSweep:
         workspaces: t.Optional[t.Any] = None,
         reconciler: t.Optional[t.Any] = None,
         lock_factory: t.Optional[t.Callable[..., t.Any]] = None,
+        resumer: t.Optional[t.Any] = None,
     ) -> None:
         # Collaborators injected so the sweep's POLICY (what it skips, what it
         # tolerates, what it reports) is testable without Redis, a cluster or a
@@ -131,11 +136,18 @@ class ReconcileSweep:
         self._workspaces = workspaces
         self._reconciler = reconciler
         self._lock_factory = lock_factory or _default_lock
+        self._resumer = resumer
 
     async def run_once(self) -> SweepOutcome:
-        """Reconcile every active workspace once."""
+        """Resume stalled lifecycle operations, then reconcile every workspace.
+
+        Operations first: a half-deleted workspace is still listed as active
+        until its deletion finishes, and reconciling it would report (and with
+        repair on, rebuild) resources the deletion is about to remove.
+        """
         outcome = SweepOutcome()
         repair = bool(settings.reconcile_sweep_repair)
+        await self._resume_operations(outcome, repair=repair)
         workspaces = await self._list_workspaces()
 
         for workspace in workspaces:
@@ -191,6 +203,25 @@ class ReconcileSweep:
                 logger.error("reconcile_sweep_cycle_failed", error=str(exc))
 
     # ── internals ──────────────────────────────────────────────────────
+
+    async def _resume_operations(self, outcome: SweepOutcome, *, repair: bool) -> None:
+        """Drive interrupted create/delete operations to a terminal state.
+
+        Same switch as the rest of the sweep: detection always, action only
+        with ``reconcile_sweep_repair``. Never raises — a broken operations
+        table must not stop lease and Pod leak detection.
+        """
+        resumer = self._resumer or _default_resumer()
+        try:
+            result = await resumer.run_once(repair=repair)
+        except Exception as exc:  # noqa: BLE001 - keep the sweep going
+            logger.error("reconcile_sweep_operation_resume_failed", error=str(exc))
+            return
+        outcome.operations = result.as_dict()
+        if result.stuck:
+            outcome.kinds["stuck_operation"] = result.stuck
+            outcome.drifts_found += result.stuck
+            outcome.drifts_repaired += result.resumed + result.superseded
 
     async def _list_workspaces(self) -> t.List[t.Any]:
         """Active workspaces to sweep, bounded by the configured maximum."""
@@ -254,6 +285,13 @@ def _default_reconciler() -> t.Any:
     from src.environments.reconciler import get_environment_reconciler
 
     return get_environment_reconciler()
+
+
+def _default_resumer() -> t.Any:
+    """Resolve the operation resumer lazily (it imports the workspace manager)."""
+    from src.operations.resumer import get_operation_resumer
+
+    return get_operation_resumer()
 
 
 def _default_lock(workspace_id: str):

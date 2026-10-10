@@ -21,6 +21,19 @@ resources:
 # patches below.
 
 patches:
+  # ── The generated conf ConfigMap follows the tier ────────────────────
+  # The base puts it in `datacode` (where the cell workloads mount it); this
+  # tier's identity Deployment and migrate Job are in `datacode-global` and a
+  # ConfigMap cannot be mounted across namespaces. The name is matched by
+  # regex because configMapGenerator appends a content hash to it.
+  - target:
+      kind: ConfigMap
+      name: datacode-conf.*
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: datacode-global
+
   # ── Identity: the tier's one workload, moved into its own namespace ──
   - target:
       kind: Deployment
@@ -146,6 +159,36 @@ patches:
       kind: Service
       metadata:
         name: workspace-runtime
+  # The runtime's execution-plane RBAC follows the runtime itself. A binding
+  # left here would grant Job/Pod/Secret creation in a namespace the global
+  # tier does not even create, to a ServiceAccount no workload uses.
+  - target:
+      kind: ServiceAccount
+      name: workspace-runtime
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: workspace-runtime
+  - target:
+      kind: Role
+      name: task-vehicle-controller
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: task-vehicle-controller
+  - target:
+      kind: RoleBinding
+      name: workspace-runtime-task-vehicle
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: workspace-runtime-task-vehicle
   - target:
       kind: Deployment
       name: frontend
@@ -349,3 +392,67 @@ patches:
       kind: ConfigMap
       metadata:
         name: codeloc-pod-contract
+  # Dagster orchestration plane (dagster-orchestrator.yaml): per cell.
+  - target:
+      kind: ConfigMap
+      name: dagster-orchestrator-instance
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: dagster-orchestrator-instance
+  - target:
+      kind: Deployment
+      name: dagster-daemon
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: dagster-daemon
+  - target:
+      kind: Deployment
+      name: dagster-webserver
+    patch: |-
+      $patch: delete
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: dagster-webserver
+  - target:
+      kind: Service
+      name: dagster-webserver
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: dagster-webserver
+  - target:
+      kind: ServiceAccount
+      name: dagster-orchestrator
+    patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: dagster-orchestrator
+  - target:
+      kind: Role
+      name: dagster-run-launcher
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: dagster-run-launcher
+  - target:
+      kind: RoleBinding
+      name: dagster-run-launcher
+    patch: |-
+      $patch: delete
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: dagster-run-launcher

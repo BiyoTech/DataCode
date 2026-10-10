@@ -1,0 +1,304 @@
+# Dagster ORCHESTRATION plane for a cell — webserver + daemon + workspace-sync.
+#
+# Why this exists in the base rather than as an external dependency
+# -------------------------------------------------------------------
+# Without it every workspace-runtime replica falls back to `dagster.mode:
+# local` and starts its own daemon and webserver: N schedulers firing every
+# schedule N times, run history in a SQLite file under DAGSTER_HOME (NOT on the
+# working-copy PVC, so a Pod restart erases it), and the K8sRunLauncher in
+# dagster-container-plane.yaml configured for an instance nobody runs.
+# workspace-runtime refuses to start in that shape when task.backend is
+# kubernetes (see Settings.dagster_contract), so this plane is a hard
+# dependency of the cell, deployed with it.
+#
+# Shape (mirrors deploy/docker-compose.dagster.yml):
+#   * dagster-daemon      exactly ONE replica (Recreate). Two daemons fire every
+#                         schedule and sensor twice — not a scaling knob.
+#   * dagster-webserver   stateless UI + GraphQL; scale freely.
+#   * workspace-sync      the single WRITER of workspace.yaml: polls every
+#                         runtime replica's /internal/code-locations, renders
+#                         the file, reloads the webserver.
+#
+# Every Pod carries `app: dagster` — the label the user-code NetworkPolicies
+# (dagster-user-code-egress, code-location-policy) admit as the orchestrator.
+#
+# Storage: run/event/schedule storage is PostgreSQL (`dagster` database on the
+# cell's Postgres, separate from the platform database — Dagster migrates its
+# own schema). workspace.yaml is DERIVED state rendered every sync interval, so
+# the shared home is an emptyDir per Pod group; see the note on workspace-sync.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dagster-orchestrator-instance
+  namespace: datacode
+data:
+  dagster.yaml: |
+    storage:
+      postgres:
+        postgres_db:
+          hostname: { env: DAGSTER_PG_HOST }
+          port: { env: DAGSTER_PG_PORT }
+          db_name: { env: DAGSTER_PG_DB }
+          username: { env: DAGSTER_PG_USER }
+          password: { env: DAGSTER_PG_PASSWORD }
+    # Runs execute as Pods on the user-code pool, inheriting the hardened
+    # template from dagster-container-plane.yaml.
+    run_launcher:
+      module: dagster_k8s
+      class: K8sRunLauncher
+      config:
+        load_incluster_config: true
+        job_namespace: datacode
+    run_coordinator:
+      module: dagster._core.run_coordinator
+      class: QueuedRunCoordinator
+      config:
+        max_concurrent_runs: 10
+    telemetry:
+      enabled: false
+    code_servers:
+      local_startup_timeout: 180
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dagster-webserver
+  namespace: datacode
+  labels:
+    app: dagster
+    component: webserver
+spec:
+  selector:
+    app: dagster
+    component: webserver
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+# Daemon + workspace-sync share ONE Pod: the daemon re-reads workspace.yaml
+# every 60s, so it must see the file the syncer writes, and an emptyDir is
+# only shared within a Pod. Single replica + Recreate: a rolling update would
+# briefly run two daemons.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dagster-daemon
+  namespace: datacode
+  labels:
+    app: dagster
+    component: daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: dagster
+      component: daemon
+  template:
+    metadata:
+      labels:
+        app: dagster
+        component: daemon
+    spec:
+      serviceAccountName: dagster-orchestrator
+      containers:
+        - name: daemon
+          image: datacode/dagster-orchestrator:latest
+          command:
+            ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+          env:
+            - name: DAGSTER_HOME
+              value: /opt/dagster/dagster_home
+            - name: DAGSTER_PG_HOST
+              value: postgres.datacode.svc.cluster.local
+            - name: DAGSTER_PG_PORT
+              value: "5432"
+            - name: DAGSTER_PG_DB
+              value: dagster
+            - name: DAGSTER_PG_USER
+              value: datacode
+            - name: DAGSTER_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/dagster_home
+            - name: instance
+              mountPath: /opt/dagster/dagster_home/dagster.yaml
+              subPath: dagster.yaml
+              readOnly: true
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+        - name: workspace-sync
+          image: datacode/dagster-workspace-sync:latest
+          env:
+            # Replicas must be addressed INDIVIDUALLY (a load-balanced URL would
+            # only ever reveal one replica's locations). These are the stable
+            # StatefulSet Pod DNS names; extend when scaling the runtime.
+            - name: DATACODE_DATA_PLANE_URLS
+              value: >-
+                http://workspace-runtime-0.workspace-runtime.datacode.svc.cluster.local:8002,http://workspace-runtime-1.workspace-runtime.datacode.svc.cluster.local:8002,http://workspace-runtime-2.workspace-runtime.datacode.svc.cluster.local:8002
+            - name: DATACODE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            - name: DATACODE_DAGSTER_GRAPHQL_URL
+              value: http://dagster-webserver.datacode.svc.cluster.local:3000/graphql
+            - name: DATACODE_WORKSPACE_FILE
+              value: /opt/dagster/dagster_home/workspace.yaml
+            - name: DATACODE_SYNC_INTERVAL_SECONDS
+              value: "15"
+            - name: DATACODE_CONTROL_PLANE_ID
+              value: dagster-daemon
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/dagster_home
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: dagster-home
+          emptyDir: {}
+        - name: instance
+          configMap:
+            name: dagster-orchestrator-instance
+---
+# Webserver: its own syncer sidecar for the same reason as the daemon (the
+# rendered file lives in a Pod-local emptyDir). Several syncers render the
+# SAME deterministic file from the same replica snapshots, so one per Pod
+# group is idempotent; each reloads only its own webserver.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dagster-webserver
+  namespace: datacode
+  labels:
+    app: dagster
+    component: webserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dagster
+      component: webserver
+  template:
+    metadata:
+      labels:
+        app: dagster
+        component: webserver
+    spec:
+      serviceAccountName: dagster-orchestrator
+      containers:
+        - name: webserver
+          image: datacode/dagster-orchestrator:latest
+          command:
+            ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000",
+             "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+          ports:
+            - name: http
+              containerPort: 3000
+          # Same instance as the daemon (YAML anchors do not cross documents,
+          # so the block is repeated; a test pins the two as equal).
+          env:
+            - name: DAGSTER_HOME
+              value: /opt/dagster/dagster_home
+            - name: DAGSTER_PG_HOST
+              value: postgres.datacode.svc.cluster.local
+            - name: DAGSTER_PG_PORT
+              value: "5432"
+            - name: DAGSTER_PG_DB
+              value: dagster
+            - name: DAGSTER_PG_USER
+              value: datacode
+            - name: DAGSTER_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/dagster_home
+            - name: instance
+              mountPath: /opt/dagster/dagster_home/dagster.yaml
+              subPath: dagster.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet: { path: /server_info, port: 3000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "1", memory: 2Gi }
+        - name: workspace-sync
+          image: datacode/dagster-workspace-sync:latest
+          env:
+            - name: DATACODE_DATA_PLANE_URLS
+              value: >-
+                http://workspace-runtime-0.workspace-runtime.datacode.svc.cluster.local:8002,http://workspace-runtime-1.workspace-runtime.datacode.svc.cluster.local:8002,http://workspace-runtime-2.workspace-runtime.datacode.svc.cluster.local:8002
+            - name: DATACODE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            # Reload THIS Pod's webserver, not the Service (which may pick a
+            # sibling whose file has not been rewritten yet).
+            - name: DATACODE_DAGSTER_GRAPHQL_URL
+              value: http://127.0.0.1:3000/graphql
+            - name: DATACODE_WORKSPACE_FILE
+              value: /opt/dagster/dagster_home/workspace.yaml
+            - name: DATACODE_SYNC_INTERVAL_SECONDS
+              value: "15"
+            - name: DATACODE_CONTROL_PLANE_ID
+              value: dagster-webserver
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/dagster_home
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: dagster-home
+          emptyDir: {}
+        - name: instance
+          configMap:
+            name: dagster-orchestrator-instance
+---
+# The K8sRunLauncher creates Jobs/Pods for runs in `datacode`; nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dagster-orchestrator
+  namespace: datacode
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dagster-run-launcher
+  namespace: datacode
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dagster-run-launcher
+  namespace: datacode
+subjects:
+  - kind: ServiceAccount
+    name: dagster-orchestrator
+    namespace: datacode
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dagster-run-launcher

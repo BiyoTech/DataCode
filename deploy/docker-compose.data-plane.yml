@@ -56,7 +56,7 @@ x-workspace-runtime: &workspace-runtime
     WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: shared
     WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /workspaces
     WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /workspaces
-    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
     # The DagsterInstance lives in the control plane; this replica only hosts
     # local code locations.
     WORKSPACE_RUNTIME_DAGSTER_MODE: remote

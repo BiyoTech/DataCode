@@ -1,4 +1,4 @@
-"""Quota publisher — pushes lease-relevant limits into Redis (design 06 P8).
+"""Quota publisher — pushes lease-relevant limits into Redis (design 06).
 
 Why a publisher at all
 ----------------------

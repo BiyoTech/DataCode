@@ -9,7 +9,7 @@ The declarative base stays LOCAL on purpose — this service's ``create_all``
 covers everything in its metadata, so a shared base would make it start creating
 the runtime's tables (see the shared module for the full argument).
 
-P5 note: the apply-history and knowledge-document tables are owned by
+Ownership note: the apply-history and knowledge-document tables belong to
 workspace-runtime (the working-copy owner) — they are deliberately absent
 from the control plane's metadata.
 """

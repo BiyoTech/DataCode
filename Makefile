@@ -1,8 +1,8 @@
 .PHONY: help setup doctor dev dev-backend dev-frontend dev-logs stop db-upgrade \
-        pg-set-password \
+        pg-set-password ensure-secrets \
         infra infra-down up build down ps logs dagster-up dagster-down data-plane-up data-plane-down \
-        cell-up global-up images \
-        k8s-render k8s-diff k8s-apply k8s-delete k8s-migrate \
+        cell-up cell-down global-up global-down images \
+        k8s-render k8s-diff k8s-apply k8s-delete k8s-migrate k8s-tag \
         lint test clean
 
 # Default target
@@ -29,19 +29,22 @@ help:
 	@echo "  make down         Stop it (containers + networks; volumes and images kept)"
 	@echo "  make ps           List its containers"
 	@echo "  make logs         Follow its logs"
-	@echo "  make dagster-up   Dagster orchestration plane (stackable on up/cell) -> :3000"
+	@echo "  make dagster-up   Dagster orchestration plane (stackable on up)     -> :3000"
 	@echo "  make dagster-down Stop the Dagster plane"
 	@echo "  make data-plane-up   Lease-verification stack (see scripts/verify/)"
 	@echo "  make data-plane-down Stop it"
 	@echo "  make global-up    P7 global tier (identity + global-pg)"
-	@echo "  make cell-up      P7 cell stack (needs global-up first)"
+	@echo "  make global-down  Stop the global tier"
+	@echo "  make cell-up      P7 cell stack (needs global-up first; CELL=cell-0)"
+	@echo "  make cell-down    Stop one cell (CELL=cell-0)"
 	@echo "  make images       Build all 8 images with a versioned tag (VERSION + git sha)"
 	@echo ""
 	@echo "Kubernetes (kustomize; OVERLAY=global|cell|kind):"
 	@echo "  make k8s-render      Render the overlay to stdout (no cluster needed)"
 	@echo "  make k8s-diff        Diff the cluster against the overlay"
 	@echo "  make k8s-apply       Apply the overlay"
-	@echo "  make k8s-migrate     Run the migration Jobs and wait for them"
+	@echo "  make k8s-migrate     Apply + run the migration Jobs and wait for them"
+	@echo "  make k8s-tag TAG=... Point the manifests at an image tag (make images)"
 	@echo "  make k8s-delete      Delete the overlay's resources"
 	@echo ""
 	@echo "Quality:"
@@ -75,8 +78,48 @@ PG_PW = DB_PASSWORD="$$(cat $(PG_PW_FILE))"
 JWT_SECRET_FILE := .data/gateway_jwt_secret
 JWT_SECRET = GW_JWT_SECRET="$$(cat $(JWT_SECRET_FILE))"
 
+# The same truth-file contract for the two remaining shared secrets. They are
+# what let the compose files REQUIRE them (`${VAR:?}`) rather than default to a
+# literal published in this repository: `${DATACODE_INTERNAL_TOKEN:-dev-internal-token}`
+# is convenient locally and an authentication bypass for every /internal/*
+# surface anywhere else. Prefixed onto read-only targets too — compose rejects
+# a required variable that is empty exactly as it rejects a missing one.
+INTERNAL_TOKEN_FILE := .data/runtime_internal_token
+TASK_TOKEN_FILE := .data/task_token_secret
+STACK_SECRETS = DATACODE_INTERNAL_TOKEN="$$(cat $(INTERNAL_TOKEN_FILE))" \
+                DATACODE_TASK_TOKEN_SECRET="$$(cat $(TASK_TOKEN_FILE))"
+
+# Every secret a container stack needs, ensured in one place so no target can
+# ensure a subset (and then fail on the one it forgot).
+COMPOSE_ENV = $(PG_PW) $(JWT_SECRET) $(STACK_SECRETS)
+ensure-secrets:
+	@bash scripts/pg-password.sh ensure
+	@bash scripts/jwt-secret.sh ensure
+	@bash scripts/stack-secrets.sh ensure
+
 # The k8s overlay to operate on (global | cell | kind)
 OVERLAY ?= cell
+
+# Compose file sets, named once. The same `-f a -f b` string repeated across
+# up/build/down/ps/logs is how one target ends up merging a different set than
+# the others — and a `down` that merges fewer files than the `up` did leaves
+# containers behind without saying so.
+INFRA_FILE   := -f deploy/docker-compose.infra.yml
+STACK_FILES  := $(INFRA_FILE) -f deploy/docker-compose.stack.yml
+DAGSTER_FILES := $(STACK_FILES) -f deploy/docker-compose.dagster.yml
+DATA_PLANE_FILES := $(INFRA_FILE) -f deploy/docker-compose.data-plane.yml
+
+# Env files passed to compose, in order (compose applies them left to right;
+# the LAST definition of a key wins). A second cell on one host overrides only
+# its published ports:
+#   make cell-up CELL=cell-1 ENV_FILES="deploy/.env deploy/.env.cell-1"
+ENV_FILES ?= deploy/.env
+ENV_FILE_ARGS = $(foreach f,$(ENV_FILES),--env-file $(f))
+
+# Which cell the cell-* targets operate on. It is both the compose PROJECT name
+# suffix (what actually separates two cells on one host) and the id every
+# service in the stack reports, so it must not be guessed per invocation.
+CELL ?= cell-0
 
 # ── Local (host) ───────────────────────────────────────────────────────────
 
@@ -137,10 +180,10 @@ pg-set-password:
 # exist first — the postgres container bind-mounts it as POSTGRES_PASSWORD_FILE.
 infra:
 	@bash scripts/pg-password.sh ensure
-	$(PG_PW) $(DOCKER_COMPOSE) -f deploy/docker-compose.infra.yml --profile gitea up -d
+	$(PG_PW) $(DOCKER_COMPOSE) $(INFRA_FILE) --profile gitea up -d
 
 infra-down:
-	$(PG_PW) $(DOCKER_COMPOSE) -f deploy/docker-compose.infra.yml --profile gitea down
+	$(PG_PW) $(DOCKER_COMPOSE) $(INFRA_FILE) --profile gitea down
 
 # ── Docker: single-machine all-container stack ────────────────────────────
 
@@ -149,8 +192,8 @@ infra-down:
 deploy/.env:
 	@cp deploy/.env.example deploy/.env
 	@echo "==> Created deploy/.env from deploy/.env.example"
-	@echo "    Secrets need no edits: DB_PASSWORD and GW_JWT_SECRET are injected"
-	@echo "    from .data/ truth files (created on demand)."
+	@echo "    Secrets need no edits: they are injected from .data/ truth"
+	@echo "    files (created on demand)."
 
 # Single-machine, every service in a container, profile `docker`. Migrations
 # run in the one-shot migrate service BEFORE the deployments start.
@@ -160,78 +203,74 @@ deploy/.env:
 # seconds instead of a full rebuild. The trade-off is that `make up` alone will
 # keep running a stale image after a code change — run `make build` first (or
 # `make build up`) in that case.
-up: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml up -d
+up: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(STACK_FILES) up -d
 
 # Rebuild the stack images after a code/dependency change. `make up` picks the
 # new images up on the next run and recreates only the affected containers.
-build: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml build
+build: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(STACK_FILES) build
 
-down: deploy/.env
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml down
+down: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(STACK_FILES) down
 
-ps: deploy/.env
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml ps
+ps: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(STACK_FILES) ps
 
-logs: deploy/.env
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml logs -f --tail=100
+logs: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(STACK_FILES) logs -f --tail=100
 
 # ── Docker: Dagster orchestration plane (stackable) ───────────────────────
 
 # Merged with infra + stack so postgres/redis and the runtime replicas
 # resolve; starting the merged project is idempotent for running services.
-dagster-up: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml \
-		-f deploy/docker-compose.dagster.yml up -d
+# Only stackable on THIS stack: a cell's postgres has no `dagster` database
+# (see the header of docker-compose.dagster.yml).
+dagster-up: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(DAGSTER_FILES) up -d
 
-dagster-down: deploy/.env
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env \
-		-f deploy/docker-compose.infra.yml -f deploy/docker-compose.stack.yml \
-		-f deploy/docker-compose.dagster.yml rm --stop --force dagster-webserver dagster-daemon workspace-sync
+dagster-down: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(DAGSTER_FILES) \
+		rm --stop --force dagster-webserver dagster-daemon workspace-sync
 
 # ── Docker: lease-verification stack ──────────────────────────────────────
 
 # The P4a transitional shape (shared bind mount + leases + redis env lock)
 # that test_deploy_manifests.py pins and verify-lease-routing.py checks.
-data-plane-up: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	$(PG_PW) $(DOCKER_COMPOSE) --env-file deploy/.env -f deploy/docker-compose.infra.yml \
-		-f deploy/docker-compose.data-plane.yml up -d --build
+data-plane-up: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(DATA_PLANE_FILES) up -d --build
 
-data-plane-down: deploy/.env
-	$(PG_PW) $(DOCKER_COMPOSE) --env-file deploy/.env -f deploy/docker-compose.infra.yml \
-		-f deploy/docker-compose.data-plane.yml rm --stop --force workspace-runtime-1 workspace-runtime-2
+data-plane-down: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) $(DATA_PLANE_FILES) \
+		rm --stop --force workspace-runtime-1 workspace-runtime-2
 
 # ── Docker: the P7 cell topology ──────────────────────────────────────────
 
-global-up: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	@bash scripts/jwt-secret.sh ensure
-	$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env -f deploy/docker-compose.global.yml up -d --build
+# The global tier is a SINGLE stack for the whole installation, so it needs no
+# CELL parameter; its compose project name comes from the file itself.
+global-up: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) \
+		-f deploy/docker-compose.global.yml up -d --build
 
-cell-up: deploy/.env
-	@bash scripts/pg-password.sh ensure
-	@bash scripts/jwt-secret.sh ensure
-	DATACODE_CELL_ID=$${DATACODE_CELL_ID:-cell-0} \
-		$(PG_PW) $(JWT_SECRET) $(DOCKER_COMPOSE) --env-file deploy/.env -f deploy/docker-compose.cell.yml \
-		-p datacode-$${DATACODE_CELL_ID:-cell-0} up -d --build
+# Brought down LAST: a cell's gateway verifies tokens this tier signs, and the
+# cell compose file declares `datacode-global` as an EXTERNAL network, so
+# removing this stack while a cell still runs leaves that cell unable to start.
+global-down: deploy/.env ensure-secrets
+	$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) \
+		-f deploy/docker-compose.global.yml down
+
+# One cell, selected by CELL (default cell-0). The compose PROJECT name is what
+# separates two cells on one host, so it is derived from the same variable that
+# every service in the stack reports as its id — they cannot drift apart.
+cell-up: deploy/.env ensure-secrets
+	DATACODE_CELL_ID=$(CELL) \
+		$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) \
+		-f deploy/docker-compose.cell.yml -p datacode-$(CELL) up -d --build
+
+cell-down: deploy/.env ensure-secrets
+	DATACODE_CELL_ID=$(CELL) \
+		$(COMPOSE_ENV) $(DOCKER_COMPOSE) $(ENV_FILE_ARGS) \
+		-f deploy/docker-compose.cell.yml -p datacode-$(CELL) down
 
 # ── Images ────────────────────────────────────────────────────────────────
 
@@ -256,15 +295,50 @@ k8s-apply:
 k8s-delete:
 	kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/$(OVERLAY) | kubectl delete -f - --ignore-not-found
 
-# Run the migration Jobs (control alembic + identity SQL) and wait for both.
-# Run this BEFORE k8s-apply when the image carries schema changes; the
-# Deployments boot with AUTO_MIGRATE=0 and refuse to serve on a stale schema.
-k8s-migrate:
-	kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/k8s/overlays/$(OVERLAY) | kubectl apply -f - --selector=batch.kubernetes.io/job-name || true
-	@# apply is filtered above to avoid touching deployments; run jobs directly:
-	@echo "==> waiting for control-migrate and identity-migrate"
-	kubectl -n datacode wait --for=condition=complete job/control-migrate --timeout=300s || true
-	kubectl -n datacode-global wait --for=condition=complete job/identity-migrate --timeout=300s || true
+# Apply the overlay and then WAIT for the migration Jobs. The previous
+# implementation filtered the apply with `--selector=batch.kubernetes.io/
+# job-name`, which selects nothing: that label is added by the Job controller
+# to the PODS it creates, never to the Job object. The filtered apply created
+# zero resources and the failing wait was swallowed by `|| true`, so the step
+# reported success having done nothing.
+#
+# Applying everything is correct rather than merely convenient: the Deployments
+# boot with AUTO_MIGRATE=0 and refuse to serve on a stale schema, so a replica
+# that starts before its Job completes exits and is restarted — the Job is
+# still the only migrator. The final rollout restart clears those backoffs at
+# once instead of waiting out the CrashLoopBackOff timer.
+#
+# The waits are namespace-specific because the tiers live in different
+# namespaces, and each is skipped silently when its overlay does not ship that
+# Job (the cell overlay deletes identity-migrate; global deletes control-migrate).
+k8s-migrate: k8s-apply
+	@echo "==> waiting for the migration Jobs"
+	@if kubectl -n datacode get job control-migrate >/dev/null 2>&1; then \
+		kubectl -n datacode wait --for=condition=complete job/control-migrate --timeout=300s; \
+	else echo "    control-migrate not present in overlay $(OVERLAY)"; fi
+	@if kubectl -n datacode-global get job identity-migrate >/dev/null 2>&1; then \
+		kubectl -n datacode-global wait --for=condition=complete job/identity-migrate --timeout=300s; \
+	else echo "    identity-migrate not present in overlay $(OVERLAY)"; fi
+	@echo "==> clearing any replica that crash-looped on the pre-migration schema"
+	@kubectl -n datacode rollout restart deploy,statefulset 2>/dev/null || true
+	@kubectl -n datacode-global rollout restart deploy 2>/dev/null || true
+
+# Point every manifest at one image tag. `make images` builds with
+# VERSION-g<sha> by default while the base kustomization pins `latest`, so
+# without this the cluster silently keeps running whatever `latest` happens to
+# be. Writes base/kustomization.yaml, which is committed on purpose: the tag a
+# cluster runs is a reviewable fact, not a shell variable someone remembered.
+#
+# Rewritten in-place rather than with `kustomize edit set image`: that
+# subcommand only exists in the standalone kustomize binary, and the rest of
+# these targets deliberately need nothing but kubectl. Every `newTag:` in that
+# file is an image tag, so the substitution needs no YAML parser.
+k8s-tag:
+	@test -n "$(TAG)" || { echo "usage: make k8s-tag TAG=<image tag>"; exit 1; }
+	@python3 -c "import pathlib, re, sys; \
+p = pathlib.Path('deploy/k8s/base/kustomization.yaml'); \
+p.write_text(re.sub(r'(?m)^(\s*newTag:\s*).*$$', r'\g<1>' + sys.argv[1], p.read_text()))" "$(TAG)"
+	@echo "==> deploy/k8s/base/kustomization.yaml now pins :$(TAG)"
 
 # ── Quality ───────────────────────────────────────────────────────────────
 

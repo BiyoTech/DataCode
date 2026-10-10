@@ -518,15 +518,17 @@ async def _record_merge_event(
 
     Best-effort by design: the merge already happened in Git, so failing the
     response because the audit write failed would only hide a completed action.
+    The row belongs to the control plane, so it is SENT there rather than
+    written here (see src/environments/registry_client.py).
     """
     try:
         from datacode_common.naming import ACTION_MERGE, environment_id
 
-        from src.environments.repository import EnvironmentRepository
+        from src.environments.registry_client import get_registry_client
         from src.workspace.identity import resolve_workspace_identity
 
         identity = resolve_workspace_identity(workspace_path)
-        await EnvironmentRepository().record_event(
+        await get_registry_client().record_event(
             environment_id=environment_id(identity.workspace_id, environment),
             action=ACTION_MERGE,
             actor_user_id=actor_user_id,

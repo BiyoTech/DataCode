@@ -19,6 +19,13 @@ Three distinguishable outcomes, never collapsed into two:
 
 Collapsing the first into the second is the mistake that would make a routine
 runtime restart delete every code-location Pod in the cell.
+
+Addressing
+----------
+Both endpoints read the CLUSTER, which every replica sees identically, so they
+carry no routing target: the Service address is the correct recipient (see
+:mod:`src.runtime.routing`). They are also the only env-control family for
+which that is true of a stateful read.
 """
 
 from __future__ import annotations

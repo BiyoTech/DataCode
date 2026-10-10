@@ -6,6 +6,7 @@ these live here rather than being copied per service.
 
 from datacode_common.locks.env_locks import (
     EnvironmentLockConfig,
+    EnvironmentLockConfigError,
     EnvironmentLockRegistry,
     EnvironmentLocks,
     environment_lock_key,
@@ -13,6 +14,7 @@ from datacode_common.locks.env_locks import (
 
 __all__ = [
     "EnvironmentLockConfig",
+    "EnvironmentLockConfigError",
     "EnvironmentLockRegistry",
     "EnvironmentLocks",
     "environment_lock_key",

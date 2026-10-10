@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir \
     # NOTE: dagster-postgres follows its own 0.x line (0.29.x pairs with
     # dagster 1.13.x) — it has no 1.x versions.
     "dagster-postgres>=0.29" \
+    # The Kubernetes run launcher the cell's instance config selects
+    # (deploy/k8s/base/dagster-orchestrator.yaml). Same 0.x line as postgres.
+    "dagster-k8s>=0.29" \
     "psycopg2-binary>=2.9"
 
 # dagster.yaml (storage/run_launcher/...) is mounted into DAGSTER_HOME by the

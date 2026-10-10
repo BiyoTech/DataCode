@@ -31,6 +31,8 @@ CONTROL_TABLES = {
     "environments",
     "environment_events",
     "user_git_credentials",
+    # 0006: resumable lifecycle operations (src/operations).
+    "workspace_operations",
     "alembic_version",
 }
 RUNTIME_OWNED = {"plan_apply_history", "knowledge_documents", "file_drafts"}

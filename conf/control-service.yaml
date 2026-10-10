@@ -66,6 +66,14 @@ reconcile:
   # every healthy task looks like this briefly; the window must cover image pull
   # and scheduling on a cold node.
   zombie_task_grace_seconds: 900
+  # Interrupted workspace create/delete (workspace_operations). A record with no
+  # progress for this long is treated as abandoned by its process and resumed
+  # by the sweep (acting only with sweep_repair). Must exceed the slowest
+  # legitimate step — a first clone of a large repository.
+  operation_resume_grace_seconds: 900
+  # Resume attempts before a record becomes 'abandoned' (needs a human).
+  operation_resume_max_attempts: 5
+  operation_resume_batch: 50
 
 retention:
   # Audit tables are append-only (task_records / lease_history); this is their

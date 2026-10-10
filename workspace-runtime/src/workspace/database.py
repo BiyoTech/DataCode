@@ -69,7 +69,7 @@ def reset_engine() -> None:
 async def init_db() -> None:
     """Create ONLY the tables this service owns.
 
-    Ownership (P5): control-service owns the platform metadata tables
+    Ownership: control-service owns the platform metadata tables
     (``workspaces``, ``environments``, ``user_git_credentials``,
     ``environment_events``) — its ORM metadata is their single source of truth
     and its migrate step is the only thing that creates them. This service owns

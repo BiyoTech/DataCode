@@ -41,14 +41,14 @@ class Settings(BaseSettings):
     rest_port: int = 8004
     host: str = "0.0.0.0"
 
-    # Runtime command channel (P5): control-service has NO filesystem access,
+    # Runtime command channel: control-service has NO filesystem access,
     # every Git/SQLMesh-engine side effect is dispatched to workspace-runtime
     # over the internal env-control API, authenticated by this shared token.
     runtime_internal_token: str = ""  # guards calls to /internal/env-control/*, env-only
     # Generous default: scaffold/ensure-worktree run `sqlmesh init` and git.
     runtime_request_timeout: float = 120.0
 
-    # Cell migration channel (P7): guards /internal/cell-migration/* — the
+    # Cell migration channel: guards /internal/cell-migration/* — the
     # export/import/verify/purge surface scripts/cell-migrate.py drives.
     # Fail closed when unset, like every internal surface.
     cell_migration_token: str = ""
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # it is the recovery bound after a crashed holder stops renewing.
     env_lock_ttl_seconds: int = 120
 
-    # ── Cell capacity (P7) ─────────────────────────────────────────────
+    # ── Cell capacity ─────────────────────────────────────────────
     # How many tenants this cell accepts. Published to the global registry at
     # startup and used there to pick the emptiest cell for a new tenant; 0 means
     # "do not place new tenants here", which is how a cell is drained without
@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     environment_reaper_interval: int = 3600  # hourly scan
     sandbox_expiry_grace_hours: int = 24
 
-    # ── Reconciliation: lease & sandbox parties (P8, design 05 §5.1) ────
+    # ── Reconciliation: lease & sandbox parties (design 05 §5.1) ────
     # How long a task may be recorded as pending/running with no sandbox Pod
     # before reconciliation calls it a zombie. The audit row is written BEFORE
     # the vehicle exists (so a crashed submission is visible), so every healthy
@@ -113,7 +113,18 @@ class Settings(BaseSettings):
     # workspaces least likely to be repaired by ordinary traffic. 0 = no bound.
     reconcile_sweep_max_workspaces: int = 200
 
-    # ── Audit record retention (P8) ─────────────────────────────────────
+    # ── Interrupted lifecycle operations (workspace_operations) ─────────
+    # A create/delete with no recorded progress for this long is treated as
+    # abandoned by its process and resumed by the sweep. Must exceed the
+    # slowest legitimate step (a first clone of a large repository); the
+    # create path's runtime timeout is 120s, so 15 minutes is generous.
+    operation_resume_grace_seconds: int = 900
+    # Resume attempts before an operation is marked abandoned (needs a human).
+    operation_resume_max_attempts: int = 5
+    # Upper bound per sweep tick.
+    operation_resume_batch: int = 50
+
+    # ── Audit record retention ─────────────────────────────────────
     # task_records / lease_history are append-only; without expiry both grow
     # monotonically and the reconciler's zombie scan (non-terminal task rows)
     # is the query an unbounded table eventually makes slow. 0 disables one
@@ -127,7 +138,7 @@ class Settings(BaseSettings):
     # would lock the table and block the writers it serves.
     retention_batch_size: int = 5000
 
-    # ── Tenant quotas (P8) ─────────────────────────────────────────────
+    # ── Tenant quotas ─────────────────────────────────────────────
     # Platform-wide DEFAULTS applied when a tenant has no tenant_quotas row
     # (the enforcement layer resolves defaults; the schema only stores
     # overrides — see the 0005 migration). Zero is an explicit ban, not "use
@@ -148,10 +159,10 @@ class Settings(BaseSettings):
     # (spread-only placement, the pre-fairness behaviour).
     quota_default_tenant_lease_share: int = 0
 
-    # ── Capacity orchestration (P8 LeaseController) ────────────────────
+    # ── Capacity orchestration (LeaseController) ────────────────────
     # The controller decides from the lease HEARTBEATS (Redis rt:{id}), never
-    # from a metrics stack — the observability half of P8 is deferred, and
-    # capacity must not depend on it (see the roadmap's P8 scope note).
+    # from a metrics stack: a metrics pipeline is an optional deployment and
+    # capacity control must not depend on one.
     capacity_controller_enabled: bool = False
     capacity_controller_interval: int = 30  # seconds between ticks
     # Hysteresis: scale up at/above, consider scaling down at/below. The gap
@@ -288,8 +299,8 @@ class Settings(BaseSettings):
         """Base URL of workspace-runtime, the owner of every working copy.
 
         The binders dispatch Git materialization, SQLMesh virtual environments,
-        workspace provisioning AND the Dagster data plane here (design 06 P5;
-        P3 merged the data plane into the runtime).
+        workspace provisioning AND the Dagster data plane here: the runtime is
+        the single owner of everything that touches a working copy.
         """
         env_val = os.getenv("CONTROL_SERVICE_RUNTIME_REST_URL")
         if env_val:
@@ -300,7 +311,7 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
-        """Redis coordination backend URL (environment locks, P5 shared state)."""
+        """Redis coordination backend URL (environment locks)."""
         env_val = os.getenv("CONTROL_SERVICE_REDIS_URL")
         if env_val:
             return env_val
@@ -316,56 +327,64 @@ class Settings(BaseSettings):
         return self.platform.log_level.upper()
 
 
+# Every YAML key below must map to a Settings field, and every key in
+# conf/<service>.yaml must appear here (or in a nested block handled in
+# _flatten_yaml) — tests/test_config_yaml_coverage.py enforces both, so a
+# new key cannot ship silently ignored the way `task.backend` once was.
+_YAML_FIELD_MAPPING = {
+    "server.rest_port": "rest_port",
+    "server.host": "host",
+    "runtime.internal_token": "runtime_internal_token",
+    "runtime.request_timeout": "runtime_request_timeout",
+    "concurrency.workspace_write_lock_ttl": "workspace_write_lock_ttl",
+    "concurrency.env_lock_backend": "env_lock_backend",
+    "concurrency.env_lock_ttl_seconds": "env_lock_ttl_seconds",
+    "cell.capacity_tenants": "cell_capacity_tenants",
+    "environments.max_per_workspace": "max_environments_per_workspace",
+    "environments.sandbox_default_ttl_hours": "sandbox_default_ttl_hours",
+    "environments.reaper_enabled": "environment_reaper_enabled",
+    "environments.reaper_interval": "environment_reaper_interval",
+    "environments.sandbox_expiry_grace_hours": "sandbox_expiry_grace_hours",
+    "reconcile.zombie_task_grace_seconds": "zombie_task_grace_seconds",
+    "reconcile.sweep_enabled": "reconcile_sweep_enabled",
+    "reconcile.sweep_interval": "reconcile_sweep_interval",
+    "reconcile.sweep_repair": "reconcile_sweep_repair",
+    "reconcile.sweep_max_workspaces": "reconcile_sweep_max_workspaces",
+    "reconcile.operation_resume_grace_seconds": "operation_resume_grace_seconds",
+    "reconcile.operation_resume_max_attempts": "operation_resume_max_attempts",
+    "reconcile.operation_resume_batch": "operation_resume_batch",
+    "retention.enabled": "retention_enabled",
+    "retention.interval": "retention_interval",
+    "retention.task_record_days": "task_record_retention_days",
+    "retention.lease_history_days": "lease_history_retention_days",
+    "retention.batch_size": "retention_batch_size",
+    "dagster.request_timeout": "dagster_request_timeout",
+    "quota.defaults.max_workspaces": "quota_default_max_workspaces",
+    "quota.defaults.max_environments": "quota_default_max_environments",
+    "quota.defaults.max_concurrent_leases": "quota_default_max_concurrent_leases",
+    "quota.defaults.max_runtime_replicas": "quota_default_max_runtime_replicas",
+    "quota.retry_after_seconds": "quota_retry_after_seconds",
+    "quota.publish_ttl_seconds": "quota_publish_ttl_seconds",
+    "quota.defaults.tenant_lease_share": "quota_default_tenant_lease_share",
+    "capacity.controller_enabled": "capacity_controller_enabled",
+    "capacity.controller_interval": "capacity_controller_interval",
+    "capacity.scale_up_threshold": "capacity_scale_up_threshold",
+    "capacity.scale_down_threshold": "capacity_scale_down_threshold",
+    "capacity.min_replicas": "capacity_min_replicas",
+    "capacity.max_replicas": "capacity_max_replicas",
+    "capacity.driver": "capacity_driver",
+    "capacity.k8s_namespace": "capacity_k8s_namespace",
+    "capacity.k8s_statefulset": "capacity_k8s_statefulset",
+    "capacity.drain_timeout_seconds": "capacity_drain_timeout_seconds",
+}
+
 def _flatten_yaml(data: dict) -> dict:
     """Flatten service-specific YAML keys to pydantic field names.
 
     Only control-service-specific fields are mapped here. Database, workspace,
     and logging are sourced from platform.yaml (see :class:`Settings` properties).
     """
-    mapping = {
-        "server.rest_port": "rest_port",
-        "server.host": "host",
-        "runtime.internal_token": "runtime_internal_token",
-        "runtime.request_timeout": "runtime_request_timeout",
-        "concurrency.workspace_write_lock_ttl": "workspace_write_lock_ttl",
-        "concurrency.env_lock_backend": "env_lock_backend",
-        "concurrency.env_lock_ttl_seconds": "env_lock_ttl_seconds",
-        "cell.capacity_tenants": "cell_capacity_tenants",
-        "environments.max_per_workspace": "max_environments_per_workspace",
-        "environments.sandbox_default_ttl_hours": "sandbox_default_ttl_hours",
-        "environments.reaper_enabled": "environment_reaper_enabled",
-        "environments.reaper_interval": "environment_reaper_interval",
-        "environments.sandbox_expiry_grace_hours": "sandbox_expiry_grace_hours",
-        "reconcile.zombie_task_grace_seconds": "zombie_task_grace_seconds",
-        "reconcile.sweep_enabled": "reconcile_sweep_enabled",
-        "reconcile.sweep_interval": "reconcile_sweep_interval",
-        "reconcile.sweep_repair": "reconcile_sweep_repair",
-        "reconcile.sweep_max_workspaces": "reconcile_sweep_max_workspaces",
-        "retention.enabled": "retention_enabled",
-        "retention.interval": "retention_interval",
-        "retention.task_record_days": "task_record_retention_days",
-        "retention.lease_history_days": "lease_history_retention_days",
-        "retention.batch_size": "retention_batch_size",
-        "dagster.request_timeout": "dagster_request_timeout",
-        "quota.defaults.max_workspaces": "quota_default_max_workspaces",
-        "quota.defaults.max_environments": "quota_default_max_environments",
-        "quota.defaults.max_concurrent_leases": "quota_default_max_concurrent_leases",
-        "quota.defaults.max_runtime_replicas": "quota_default_max_runtime_replicas",
-        "quota.retry_after_seconds": "quota_retry_after_seconds",
-        "quota.publish_ttl_seconds": "quota_publish_ttl_seconds",
-        "quota.defaults.tenant_lease_share": "quota_default_tenant_lease_share",
-        "capacity.controller_enabled": "capacity_controller_enabled",
-        "capacity.controller_interval": "capacity_controller_interval",
-        "capacity.scale_up_threshold": "capacity_scale_up_threshold",
-        "capacity.scale_down_threshold": "capacity_scale_down_threshold",
-        "capacity.min_replicas": "capacity_min_replicas",
-        "capacity.max_replicas": "capacity_max_replicas",
-        "capacity.driver": "capacity_driver",
-        "capacity.k8s_namespace": "capacity_k8s_namespace",
-        "capacity.k8s_statefulset": "capacity_k8s_statefulset",
-        "capacity.drain_timeout_seconds": "capacity_drain_timeout_seconds",
-    }
-    return flatten_yaml_mapping(data, mapping)
+    return flatten_yaml_mapping(data, _YAML_FIELD_MAPPING)
 
 
 settings = Settings()

@@ -1,4 +1,4 @@
-"""Egress destinations of one working copy (design 04 §3.4, P6b).
+"""Egress destinations of one working copy (design 04 §3.4).
 
 A sandbox's allow-list is derived from what the WORKING COPY already declares, not
 from a separate table an operator must maintain in parallel:

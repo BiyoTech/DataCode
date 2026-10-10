@@ -37,10 +37,41 @@ src/
 │                MOVES its three tables across cells (api/rest/cell_migration.py):
 │                whoever creates a table owns its migration, so no table ever
 │                has a second creator or a mirrored definition free to drift.
-├── environments/ environment guard + ORM mirrors of control's registry
+├── environments/ environment guard (READ-ONLY view of control's registry) +
+│                registry_client.py — the facts this service authors about
+│                control-owned tables, SENT rather than written
 ├── logs/        workspace log reader
 └── utils/       errors, logging, error archive
 ```
+
+## What this service may and may not own
+
+Two boundaries, both enforced by tests rather than by convention.
+
+**Control-owned tables: read directly, never write.** `workspaces`,
+`user_git_credentials`, `environments` and `environment_events` belong to
+control-service. Reads stay direct — they are on the plan/apply hot path,
+tolerate a row that is a moment stale, and cannot corrupt anything. The two
+facts this service *authors* (the watermark a successful apply leaves, the
+audit row a merge produces) go to control's `/internal/env-registry/*` through
+`src/environments/registry_client.py`. Two services writing one table is where
+this platform's ownership bugs have come from: the `create_all` race on boot,
+and a reclaim routine fixed on one side while its verbatim copy here kept the
+bug. Guarded by `tests/test_control_owned_tables_readonly.py`.
+
+Those writes are bookkeeping about something that already happened, so the
+client never raises: an unreachable control plane costs a record, never an
+apply.
+
+**Background loops: only this replica's own state.** The heartbeat, the lease
+watchdog, the WIP snapshotter, the disk reclaimer, the port-segment renewal and
+the Dagster supervisor all maintain something only this process can see or
+defend. Anything that reconciles the *platform* — expiring sandboxes, sweeping
+drift, retention, replica counts — belongs to control-service: a runtime
+replica can be killed, drained or scaled at any moment, so a platform-wide loop
+here would either stop when the fleet shrinks or run N times over. Guarded by
+`tests/test_no_control_plane_loops.py`, which also keeps an explicit inventory
+of every named loop.
 
 ## The executor (design 04 §2.3, Q1 decision)
 

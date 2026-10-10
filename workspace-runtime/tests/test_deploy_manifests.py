@@ -8,7 +8,8 @@ the contract exists to prevent. These tests pin the manifests to the shapes
 the design published:
 
 * K8s: StatefulSet + per-replica RWO volumeClaimTemplates + headless service,
-  instance_local + leases + in-process env lock (the 4b target);
+  instance_local + leases + the Redis env lock (shared with control-service,
+  which is a different process no in-process lock can exclude);
 * compose: the P4a transitional shape — shared bind mount + leases + the
   Redis env lock that combination REQUIRES.
 
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S_MANIFEST = _REPO_ROOT / "deploy" / "k8s" / "base" / "workspace-runtime.yaml"
+_K8S_CONTROL_MANIFEST = _REPO_ROOT / "deploy" / "k8s" / "base" / "control-service.yaml"
 _COMPOSE_FILE = _REPO_ROOT / "deploy" / "docker-compose.data-plane.yml"
 _RUNTIME_DOCKERFILE = _REPO_ROOT / "workspace-runtime" / "Dockerfile"
 
@@ -59,6 +61,14 @@ def _k8s_docs() -> dict:
         for doc in yaml.safe_load_all(handle):
             docs[doc["kind"]] = doc
     return docs
+
+
+def _load_control_deployment() -> dict:
+    with open(_K8S_CONTROL_MANIFEST) as handle:
+        for doc in yaml.safe_load_all(handle):
+            if doc and doc.get("kind") == "Deployment":
+                return doc
+    raise AssertionError("control-service manifest has no Deployment")
 
 
 def _container_env(statefulset: dict) -> dict[str, str]:
@@ -122,8 +132,6 @@ class TestK8sTargetShape:
         env = _container_env(docs["StatefulSet"])
         assert env["WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND"] == "instance_local"
         assert env["WORKSPACE_RUNTIME_LEASE_ENABLED"] == "true"
-        # 4b: private media + leases make the in-process env lock sufficient.
-        assert env["WORKSPACE_RUNTIME_ENV_LOCK_BACKEND"] == "in_memory"
 
         # And that combination must actually validate — the manifest and the
         # contract must never drift apart.
@@ -138,6 +146,32 @@ class TestK8sTargetShape:
             ),
         )
         assert contract.warnings == ()
+
+    def test_env_lock_backend_matches_control_service(self, docs):
+        """Both contenders for one environment lock must use the same backend.
+
+        The runtime used to ship ``in_memory`` on the grounds that the lease
+        makes it the single writer of a copy. That is true of the copy and
+        irrelevant to the lock: its other contender is control-service, a
+        different process, so an in-process lock let a destroy run straight
+        through a live apply. Pinned as a cross-manifest equality rather than
+        a literal so neither side can drift alone.
+        """
+        runtime_env = _container_env(docs["StatefulSet"])
+        control_env = _container_env(_load_control_deployment())
+        runtime_backend = runtime_env["WORKSPACE_RUNTIME_ENV_LOCK_BACKEND"]
+        control_backend = control_env["CONTROL_SERVICE_ENV_LOCK_BACKEND"]
+
+        assert runtime_backend == control_backend
+        assert runtime_backend == "redis"
+
+    def test_manifest_backend_passes_the_startup_validation(self, docs, monkeypatch):
+        """The value the manifest ships must be one the service accepts."""
+        from src.sqlmesh.env_locks import locks
+
+        env = _container_env(docs["StatefulSet"])
+        monkeypatch.setenv(locks.backend_env_var, env[locks.backend_env_var])
+        assert locks.validate() == "redis"
 
     def test_stable_runtime_identity_from_pod_name(self, docs):
         sts = docs["StatefulSet"]

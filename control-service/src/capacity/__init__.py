@@ -1,4 +1,4 @@
-"""Capacity governance (design 06 P8): lease-driven replica orchestration."""
+"""Capacity governance (design 06): lease-driven replica orchestration."""
 
 from src.capacity.lease_controller import (
     CapacityOutcome,

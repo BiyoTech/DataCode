@@ -34,7 +34,7 @@ from datacode_common import naming
 from alembic import command
 from src.workspace.models import Base
 
-HEAD = "0005_control_plane_tables"
+HEAD = "0006_workspace_operations"
 
 # The pre-environment ``workspaces`` shape: ``git_branch`` instead of the
 # production/default environment columns, no registry tables at all.

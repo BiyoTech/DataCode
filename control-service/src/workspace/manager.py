@@ -5,7 +5,7 @@ A workspace is a TENANT-level shared development unit:
 - **Database** (this service) is the single source of truth for its existence
   and metadata.
 - **Git** is the only durable carrier of workspace code.
-- **Disk** (workspace-runtime, P5) holds disposable per-user material:
+- **Disk** (workspace-runtime) holds disposable per-user material:
   ``{base}/{tenant_id}/{workspace_id}/{user_id}/.repo`` and
   ``.../{user_id}/envs/{environment}``. The control plane never touches it —
   every materialization, scaffold, sync and purge is dispatched over the
@@ -32,7 +32,14 @@ from datacode_common import naming
 from datacode_common import workspace_paths as ws_paths
 
 from src.environments.registry import get_environment_registry
-from src.runtime.client import get_runtime_client
+from src.operations import (
+    KIND_CREATE,
+    KIND_DELETE,
+    OperationHandle,
+    get_operation_recorder,
+    steps,
+)
+from src.runtime.client import RuntimeTarget, get_runtime_client
 from src.utils.errors import (
     ConflictError,
     EnvironmentNotFoundError,
@@ -128,21 +135,6 @@ class _LeaseRelease:
     addrs: tuple
 
 
-def _runtime_url_of(addr: str) -> str:
-    """Turn a lease holder's address into a base URL, or ``""``.
-
-    Heartbeat addresses are stored as ``host:port`` (the form the gateway routes
-    with). A scheme is added when absent; anything unusable yields ``""`` so the
-    caller skips it rather than dispatching to a malformed URL.
-    """
-    candidate = (addr or "").strip().rstrip("/")
-    if not candidate:
-        return ""
-    if candidate.startswith(("http://", "https://")):
-        return candidate
-    return f"http://{candidate}"
-
-
 class WorkspaceManager:
     """Manages workspace lifecycle across DB (local) and Git/disk (runtime)."""
 
@@ -178,6 +170,12 @@ class WorkspaceManager:
         was only touched after the scaffold had been committed, so a
         non-existent repository surfaced as a failed fetch and then as an
         unexplained "add worktree" error.
+
+        Durability: every step is recorded in ``workspace_operations``. The
+        in-process rollback below is the fast path; if this process dies
+        mid-way, :class:`src.operations.resumer.OperationResumer` finds the
+        stalled record and finishes the rollback (or marks the operation done
+        when only the final bookkeeping was lost).
         """
         ws_paths.validate_segment(tenant_id, field="tenant_id")
         ws_paths.validate_segment(owner_user_id, field="user_id")
@@ -200,12 +198,34 @@ class WorkspaceManager:
                 "git_repo_url must be an HTTP(S) or SSH Git remote URL"
             )
 
+        recorder = get_operation_recorder()
+        op = await recorder.begin(
+            kind=KIND_CREATE,
+            workspace_id=workspace_id,
+            tenant_id=tenant_id,
+            actor_user_id=owner_user_id,
+        )
+
         # Resolve the remote before the row is written: a rejected URL (no
         # credential, an organization the token may not create in, an
         # unreadable repository) must leave no workspace behind at all.
-        provision = await self._provision_remote(
-            client, git_repo_url=git_repo_url, user_id=owner_user_id
+        try:
+            provision = await self._provision_remote(
+                client, git_repo_url=git_repo_url, user_id=owner_user_id
+            )
+        except Exception:
+            await recorder.rolled_back(op, reason="remote_rejected")
+            raise
+
+        needs_push = bool(provision.normalized_url and provision.needs_scaffold)
+        final_step = (
+            steps.PUSHED
+            if needs_push
+            else steps.SCAFFOLDED if provision.needs_scaffold else steps.OPENED
         )
+        # Recorded BEFORE the insert: a crash between the insert and the next
+        # record must still leave a trace naming the row.
+        await recorder.advance(op, steps.WRITING_ROW, final_step=final_step)
 
         model = WorkspaceModel(
             id=workspace_id,
@@ -218,10 +238,22 @@ class WorkspaceManager:
             default_env=naming.PRODUCTION_ENV,
             status="active",
         )
-        await repo.create(model)
+        try:
+            await repo.create(model)
+        except Exception:
+            # A concurrent creation won the primary key; the row is not ours,
+            # so there is nothing of ours to undo.
+            await recorder.rolled_back(op, reason="row_not_written")
+            raise
+        await recorder.advance(op, steps.ROW_WRITTEN)
 
         registry = get_environment_registry()
         try:
+            # ``open`` runs ``git/ensure-repository`` first, and that is the
+            # step that PLACES the owner's production lease. Every call below
+            # is addressed at the same copy, so the scaffold, its first commit
+            # and the push all land on the replica that will serve the
+            # workspace afterwards — not on whichever one DNS picked.
             production = await registry.ensure_production(model, owner_user_id)
             opened = await registry.open(
                 environment_id=production.environment_id,
@@ -230,6 +262,13 @@ class WorkspaceManager:
                 # An empty remote (or none at all) has no commit to check out,
                 # and git cannot attach a worktree to an unborn branch.
                 allow_bootstrap_commit=provision.needs_bootstrap_commit,
+            )
+            await recorder.advance(op, steps.OPENED)
+            owner_copy = RuntimeTarget(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                user_id=owner_user_id,
+                environment=opened.environment,
             )
             if provision.needs_scaffold:
                 # Scaffold + initial commit run on the runtime (filesystem
@@ -242,22 +281,32 @@ class WorkspaceManager:
                         "dialect": dialect,
                         "workspace_id": workspace_id,
                     },
+                    target=owner_copy,
                 )
-        except Exception:
+                await recorder.advance(op, steps.SCAFFOLDED)
+        except Exception as exc:
             # The DB is authoritative; drop the half-built workspace so a retry
             # starts from a clean slate. The remote is never deleted — it may be
             # a repository the user already owned, and even one we just created
             # is safer kept (the retry reuses it) than removed.
-            await self._rollback_creation(workspace_id, tenant_id, owner_user_id)
+            complete = await self._rollback_creation(
+                workspace_id, tenant_id, owner_user_id
+            )
+            if complete:
+                await recorder.rolled_back(op, reason="creation_failed")
+            else:
+                # The resumer finishes what this rollback could not.
+                await recorder.fail(op, error=f"rollback incomplete after: {exc}")
             logger.error(
                 "workspace_create_rolled_back",
                 workspace_id=workspace_id,
                 tenant_id=tenant_id,
                 remote_repository_created=provision.created,
+                rollback_complete=complete,
             )
             raise
 
-        if provision.normalized_url and provision.needs_scaffold:
+        if needs_push:
             # Only freshly scaffolded code is pushed. A reused repository is
             # already published, and pushing an unrelated first commit onto it
             # would either be rejected as non-fast-forward or, worse, land a
@@ -270,7 +319,9 @@ class WorkspaceManager:
                     "branch": opened.branch,
                     "user_id": owner_user_id,
                 },
+                target=owner_copy,
             )
+            await recorder.advance(op, steps.PUSHED, push_ok=bool(push.get("ok")))
             if not push.get("ok"):
                 # Non-fatal: the workspace exists and the owner keeps a local
                 # copy, but members cannot clone until the push succeeds.
@@ -280,6 +331,8 @@ class WorkspaceManager:
                     tenant_id=tenant_id,
                     reason=push.get("reason"),
                 )
+
+        await recorder.succeed(op)
 
         logger.info(
             "workspace_created",
@@ -348,21 +401,28 @@ class WorkspaceManager:
         models = await repo.list_by_ids(tenant_id, workspace_ids)
 
         # One membership probe per workspace answers "has this caller ever
-        # opened it" for the bootstrap-openable computation below.
+        # opened it" for the bootstrap-openable computation below. It is a
+        # union over replicas: the owner's copy lives on ONE volume, and asking
+        # any other would report the owner as never having opened it.
         client = get_runtime_client()
         member_sets: t.Dict[str, t.Set[str]] = {}
         for model in models:
             if model.git_repo_url:
                 continue  # bound remote -> openable regardless of a local copy
             try:
-                body = await client.get(
+                replies = await client.get_all(
                     "/internal/env-control/git/members",
                     params={"tenant_id": tenant_id, "workspace_id": model.id},
+                    target=RuntimeTarget(tenant_id=tenant_id, workspace_id=model.id),
                 )
-                member_sets[model.id] = set(body.get("members", []))
             except RuntimeUnavailableError:
                 # Degraded listing beats a failed one; the UI re-derives on open.
-                member_sets[model.id] = set()
+                replies = []
+            members: t.Set[str] = set()
+            for reply in replies:
+                if reply.body is not None:
+                    members.update(str(m) for m in reply.body.get("members", []))
+            member_sets[model.id] = members
 
         views: t.List[WorkspaceView] = []
         for model in models:
@@ -484,6 +544,14 @@ class WorkspaceManager:
                 "git_repo_url": git_repo_url,
                 "production_branch": production_branch,
             },
+            # The push reads the caller's production copy, so it must reach
+            # the replica that holds it.
+            target=RuntimeTarget(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                environment=model.production_env,
+            ),
         )
         normalized_url = str(body.get("normalized_url", git_repo_url))
 
@@ -534,6 +602,12 @@ class WorkspaceManager:
                 "user_id": user_id,
                 "git_repo_url": model.git_repo_url,
             },
+            target=RuntimeTarget(
+                tenant_id=tenant_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                environment=environment_model.name,
+            ),
         )
 
         logger.info(
@@ -585,36 +659,71 @@ class WorkspaceManager:
         Audit rows (``environment_events``, ``lease_history``, ``task_records``)
         are kept on purpose: they now point at objects that no longer exist,
         which is what an audit trail is for.
+
+        Every step is idempotent and recorded in ``workspace_operations``, so an
+        interrupted deletion is driven to completion by the operation resumer
+        (re-running :meth:`run_deletion`) rather than left half-done.
         """
         model = await self._require_workspace(workspace_id, tenant_id)
-        registry = get_environment_registry()
-
-        leases = await self._release_leases(tenant_id, workspace_id)
-        released = await registry.release_all_for_workspace(
+        op = await get_operation_recorder().begin(
+            kind=KIND_DELETE,
             workspace_id=workspace_id,
             tenant_id=tenant_id,
             actor_user_id=user_id,
         )
-        purged_replicas = await self._broadcast_hard_purge(
-            tenant_id=tenant_id, workspace_id=workspace_id, lease_addrs=leases.addrs
+        result = await self.run_deletion(
+            workspace_id=workspace_id, tenant_id=tenant_id, user_id=user_id, op=op
         )
-        environments_removed = await registry.purge_all_for_workspace(
-            workspace_id=workspace_id
-        )
-        await self._repository().purge(workspace_id)
-
         logger.info(
             "workspace_deleted",
             workspace_id=workspace_id,
             tenant_id=tenant_id,
             user_id=user_id,
-            leases_released=leases.released,
-            leases_unknown=leases.unknown,
-            environments_released=released.get("released", 0),
-            environments_removed=environments_removed,
-            replicas_purged=purged_replicas,
-            git_remote_preserved=bool(model.git_repo_url),
+            had_git_remote=bool(model.git_repo_url),
+            **{k: v for k, v in result.items() if k != "deleted"},
         )
+        return result
+
+    async def run_deletion(
+        self,
+        *,
+        workspace_id: str,
+        tenant_id: str,
+        user_id: str,
+        op: t.Optional[OperationHandle],
+    ) -> t.Dict[str, t.Any]:
+        """The deletion steps, in dependency order; safe to re-run from the top.
+
+        Needs no workspace row: the resumer calls this after a crash that may
+        have happened after the row was already deleted. Every step converges
+        on "absent" — releasing a released lease, purging a purged replica and
+        deleting a deleted row are all no-ops.
+        """
+        recorder = get_operation_recorder()
+        registry = get_environment_registry()
+        try:
+            leases = await self._release_leases(tenant_id, workspace_id)
+            await recorder.advance(op, steps.LEASES_RELEASED)
+            released = await registry.release_all_for_workspace(
+                workspace_id=workspace_id,
+                tenant_id=tenant_id,
+                actor_user_id=user_id,
+            )
+            await recorder.advance(op, steps.RESOURCES_RELEASED)
+            purged_replicas = await self._broadcast_hard_purge(
+                tenant_id=tenant_id, workspace_id=workspace_id, lease_addrs=leases.addrs
+            )
+            await recorder.advance(op, steps.REPLICAS_PURGED)
+            environments_removed = await registry.purge_all_for_workspace(
+                workspace_id=workspace_id
+            )
+            await self._repository().purge(workspace_id)
+            await recorder.advance(op, steps.ROWS_DELETED)
+        except Exception as exc:
+            await recorder.fail(op, error=str(exc))
+            raise
+
+        await recorder.succeed(op)
         return {
             "deleted": True,
             "leases_released": leases.released,
@@ -681,42 +790,62 @@ class WorkspaceManager:
     ) -> int:
         """Purge on every replica that could hold a copy of this workspace.
 
-        The env-control channel is a single-URL client and does not follow lease
-        routing, while a multi-replica deployment gives each replica its OWN
-        volume. A purge sent to whichever replica answered therefore removed
-        nothing on the replica that actually held the files — the deletion looked
-        successful and the working copy stayed on disk.
+        Each replica has its OWN volume and none is authoritative for the
+        others, so the purge fans out to every live replica (see
+        :mod:`src.runtime.routing`). The holders observed before the leases
+        were released are added explicitly: a draining replica is excluded
+        from the live fleet yet still holds files. The endpoint is idempotent,
+        so overlapping recipients cost nothing.
 
-        So the request goes to the address of every observed lease holder AND to
-        the default service URL (which covers a single-replica deployment and any
-        replica no lease pointed at). The endpoint is idempotent, so overlapping
-        recipients cost nothing.
+        Returns the number of replicas that confirmed the purge.
         """
-        from src.runtime.client import RuntimeClient
-
-        default = get_runtime_client()
-        payload = {"tenant_id": tenant_id, "workspace_id": workspace_id}
-        targets: dict[str, t.Any] = {default.base_url: default}
-        for addr in lease_addrs:
-            url = _runtime_url_of(addr)
-            if url and url not in targets:
-                targets[url] = RuntimeClient(base_url=url)
-
-        purged = 0
-        for url, client in targets.items():
-            try:
-                await client.post(
-                    "/internal/env-control/workspace/hard-purge", payload
-                )
-                purged += 1
-            except Exception as exc:  # noqa: BLE001 - one replica must not block
+        replies = await get_runtime_client().post_all(
+            "/internal/env-control/workspace/hard-purge",
+            {"tenant_id": tenant_id, "workspace_id": workspace_id},
+            target=RuntimeTarget(tenant_id=tenant_id, workspace_id=workspace_id),
+            also=lease_addrs,
+        )
+        for reply in replies:
+            if not reply.ok:
                 logger.warning(
                     "workspace_hard_purge_failed",
                     workspace_id=workspace_id,
-                    target=url,
-                    error=str(exc),
+                    target=reply.addr,
+                    error=str(reply.error),
                 )
-        return purged
+        return sum(1 for reply in replies if reply.ok)
+
+    @staticmethod
+    async def _purge_member_everywhere(
+        *, tenant_id: str, workspace_id: str, user_id: str
+    ) -> bool:
+        """Remove one member's local root on every replica; True if any had one.
+
+        A member's environments may be spread over several volumes, and a root
+        left on one of them keeps the code readable after access was revoked.
+        """
+        replies = await get_runtime_client().post_all(
+            "/internal/env-control/workspace/purge-member",
+            {
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+            },
+            target=RuntimeTarget(tenant_id=tenant_id, workspace_id=workspace_id),
+        )
+        failed = [reply.addr for reply in replies if not reply.ok]
+        if failed:
+            logger.warning(
+                "workspace_member_purge_incomplete",
+                workspace_id=workspace_id,
+                member_user_id=user_id,
+                unreachable_replicas=failed,
+            )
+        return any(
+            bool(reply.body.get("purged", False))
+            for reply in replies
+            if reply.body is not None
+        )
 
     # ---- Public API: working-copy housekeeping ----
 
@@ -735,20 +864,15 @@ class WorkspaceManager:
         if target_user_id == model.owner_user_id:
             raise ConflictError("The workspace owner's working copy cannot be removed")
 
-        purged = await get_runtime_client().post(
-            "/internal/env-control/workspace/purge-member",
-            {
-                "tenant_id": tenant_id,
-                "workspace_id": workspace_id,
-                "user_id": target_user_id,
-            },
+        purged = await self._purge_member_everywhere(
+            tenant_id=tenant_id, workspace_id=workspace_id, user_id=target_user_id
         )
         logger.info(
             "workspace_member_copy_removed",
             workspace_id=workspace_id,
             member_user_id=target_user_id,
         )
-        return bool(purged.get("purged", False))
+        return purged
 
     # ---- Public API: path derivation (pure computation for the wire) ----
 
@@ -877,8 +1001,13 @@ class WorkspaceManager:
 
     async def _rollback_creation(
         self, workspace_id: str, tenant_id: str, owner_user_id: str
-    ) -> None:
-        """Undo a failed workspace creation (DB row + runtime material).
+    ) -> bool:
+        """Undo a failed workspace creation; True when every step completed.
+
+        Order: the owner's material on every replica, the lease, the
+        environment rows, and the workspace row LAST — the row is what lets
+        the operation resumer (and a human) still find the leftovers if this
+        rollback is interrupted.
 
         The row is PHYSICALLY removed, not marked deleted. A tombstone would be
         invisible to the duplicate check (which ignores deleted rows) while still
@@ -886,32 +1015,51 @@ class WorkspaceManager:
         so every retry of the very same creation would fail on a key conflict
         instead of starting clean.
 
-        Best-effort by design: each step is attempted independently, because the
-        goal is that a retry finds nothing left over, not that the cleanup itself
-        succeeds atomically. The remote repository is never touched.
+        Each step is attempted independently: the goal is that a retry finds
+        nothing left over. A step that fails is reported (False) so the caller
+        can hand the remainder to the resumer. The remote is never touched.
         """
-        try:
-            await self._repository().purge(workspace_id)
-        except Exception as e:
-            logger.warning(
-                "workspace_rollback_db_failed", workspace_id=workspace_id, error=str(e)
-            )
+        complete = True
 
         try:
-            await get_runtime_client().post(
-                "/internal/env-control/workspace/purge-member",
-                {
-                    "tenant_id": tenant_id,
-                    "workspace_id": workspace_id,
-                    "user_id": owner_user_id,
-                },
+            await self._purge_member_everywhere(
+                tenant_id=tenant_id, workspace_id=workspace_id, user_id=owner_user_id
             )
         except Exception as e:  # noqa: BLE001 - rollback must not raise
+            complete = False
             logger.warning(
                 "workspace_rollback_runtime_failed",
                 workspace_id=workspace_id,
                 error=str(e),
             )
+
+        try:
+            leases = await self._release_leases(tenant_id, workspace_id)
+            complete = complete and not leases.unknown
+        except Exception as e:  # noqa: BLE001
+            complete = False
+            logger.warning(
+                "workspace_rollback_lease_failed", workspace_id=workspace_id, error=str(e)
+            )
+
+        try:
+            await get_environment_registry().purge_all_for_workspace(
+                workspace_id=workspace_id
+            )
+            await self._repository().purge(workspace_id)
+        except Exception as e:  # noqa: BLE001
+            complete = False
+            logger.warning(
+                "workspace_rollback_db_failed", workspace_id=workspace_id, error=str(e)
+            )
+
+        return complete
+
+    async def rollback_creation(
+        self, *, workspace_id: str, tenant_id: str, owner_user_id: str
+    ) -> bool:
+        """Public entry for the operation resumer (same semantics)."""
+        return await self._rollback_creation(workspace_id, tenant_id, owner_user_id)
 
 
 # Global singleton

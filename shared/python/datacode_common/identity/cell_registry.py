@@ -1,4 +1,4 @@
-"""Cell self-registration — a cell publishes its own address (design 03 §2.4, P7).
+"""Cell self-registration — a cell publishes its own address (design 03 §2.4).
 
 The global edge routes a request by reading ``cell_id`` from the token and
 looking up that cell's ``endpoint``. Somebody has to put a dialable address in

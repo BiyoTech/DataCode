@@ -1,6 +1,6 @@
 """Schema discovery service - catalog/schema/table introspection.
 
-P6 close-out: discovery builds ONE gateway's engine adapter from the parsed
+discovery builds ONE gateway's engine adapter from the parsed
 ``config.yaml`` (:mod:`src.sqlmesh.config_access`) instead of loading a
 Context. The old path — ``Context(load=True)`` — execs the user's Python
 models/macros in the platform process (threat T2) just to reach an

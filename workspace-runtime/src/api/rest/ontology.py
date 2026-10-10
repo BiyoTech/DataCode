@@ -80,7 +80,7 @@ def _build_services(workspace_path: str) -> tuple[ModelRegistry, SemanticSearchS
 async def _fetch_sqlmesh_metadata(
     workspace_path: str,
 ) -> tuple[Optional[set[str]], Optional[set[str]], Optional[dict[str, str]]]:
-    """Fetch SQLMesh model / metric metadata IN-PROCESS (P3).
+    """Fetch SQLMesh model / metric metadata IN-PROCESS.
 
     The model list is fetched once and used to derive both the identifier set
     (name + fqn) and the model -> gateway map, avoiding a redundant call.

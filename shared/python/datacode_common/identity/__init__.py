@@ -3,7 +3,7 @@
 The gateway answers authorization inline (identity headers it writes itself),
 so what remains here is the one identity interaction a NON-gateway process
 needs: a control plane registering its cell with the global identity service at
-startup (design 03 §2.4, P7).
+startup (design 03 §2.4).
 """
 
 from datacode_common.identity.cell_registry import (

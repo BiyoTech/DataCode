@@ -40,9 +40,14 @@ x-service-defaults: &service-defaults
     CONFIG_PATH: /app/conf
     DATACODE_ENV: docker
     DB_PASSWORD: ${DB_PASSWORD}
-    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
-    CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
-    IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+    # No inline defaults: a well-known literal like "dev-internal-token" that
+    # survives into a non-local deployment is an authentication bypass for
+    # every /internal/* surface. deploy/.env (bootstrapped from the committed
+    # example by `make up`) supplies them, so `:?` fails LOUDLY when the
+    # env-file was forgotten instead of quietly shipping a public secret.
+    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+    CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+    IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
   restart: unless-stopped
 
 services:
@@ -125,6 +130,12 @@ services:
   # Two replicas: the lease router's single-writer property only gets
   # exercised with more than one — a single replica would make every routing
   # bug invisible until production.
+  #
+  # The replicas differ in EXACTLY three things: their runtime id, their
+  # private volume and their published port. Everything else comes from the
+  # anchors below — a hand-copied environment block is how one replica ends up
+  # with a setting the other lacks, and lease bugs caused that way surface as
+  # "this workspace behaves differently", which is very hard to attribute.
   workspace-runtime-1: &workspace-runtime
     <<: *service-defaults
     build:
@@ -137,7 +148,7 @@ services:
       # to, so the ordinary build is byte-identical.
       args:
         RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
-    environment:
+    environment: &workspace-runtime-env
       <<: *service-env
       WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
       # Named volume per replica: the lease guarantees one writer per working
@@ -148,34 +159,36 @@ services:
       WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
       DATACODE_RUNTIME_ID: workspace-runtime-1
       DATACODE_REPLICA_ID: workspace-runtime-1
-      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
+      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:?injected from deploy/.env}
     volumes:
       - ../conf:/app/conf:ro
       - workspaces_1:/data/workspaces
     ports:
       - "8002:8002"
-    depends_on:
+    # The runtime owns three tables of its own, and the migrate step creates
+    # them. Without this dependency this service is the ONE replica that races
+    # the migration — the ordering contract in deploy/README.md holds for every
+    # replica or for none.
+    depends_on: &workspace-runtime-deps
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   workspace-runtime-2:
     <<: *workspace-runtime
     environment:
-      <<: *service-env
-      WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
-      WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: instance_local
-      WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /data/workspaces
-      WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
+      <<: *workspace-runtime-env
       DATACODE_RUNTIME_ID: workspace-runtime-2
       DATACODE_REPLICA_ID: workspace-runtime-2
-      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
     volumes:
       - ../conf:/app/conf:ro
       - workspaces_2:/data/workspaces
     ports:
       - "8012:8002"
+    depends_on: *workspace-runtime-deps
 
   # ── Edge ───────────────────────────────────────────────────────────────
   gateway:

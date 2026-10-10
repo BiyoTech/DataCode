@@ -1,4 +1,4 @@
-"""Scoped task tokens — one task's proof of identity (design 04 §3.5, P6b).
+"""Scoped task tokens — one task's proof of identity (design 04 §3.5).
 
 A sandbox needs to prove who it is to the egress proxy (and, later, to the
 warehouse proxy sidecar) without holding a platform credential. This module mints

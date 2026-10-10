@@ -1,4 +1,4 @@
-"""Record retention — the cleanup half of the audit tables (design 06 P8).
+"""Record retention — the cleanup half of the audit tables (design 06).
 
 ``task_records`` and ``lease_history`` are APPEND-ONLY by contract: nothing in
 this module ever rewrites a row, it only deletes whole rows older than the

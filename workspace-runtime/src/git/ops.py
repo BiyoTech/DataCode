@@ -598,7 +598,7 @@ class GitOperations:
     ) -> GitCommandResult:
         """Clone a remote into the shared BARE object database (``.repo``).
 
-        This is the first half of materialization (design 06 P4): one bare clone
+        This is the first half of materialization (design 06): one bare clone
         per user holds the objects that every one of that user's environment
         worktrees then shares, which keeps disk usage O(1) in the number of
         environments instead of O(envs).

@@ -170,6 +170,7 @@ class ResolvedConfig:
     service_urls: dict[str, str]
     workspace_base_path: str
     egress_proxy_url: str
+    egress_dns: dict[str, str]
     log_level: str
 
 
@@ -246,6 +247,7 @@ def resolve(profile: str) -> ResolvedConfig:
             },
             workspace_base_path=cfg.workspace_base_path,
             egress_proxy_url=cfg.services.url("egress_proxy", "url"),
+            egress_dns=dict(cfg.services.egress_dns),
             log_level=cfg.log_level,
         )
     finally:
@@ -427,7 +429,48 @@ def check_egress_honesty(cfg: ResolvedConfig) -> list[Finding]:
             "among many rather than a sandbox's only outbound path",
             f"conf/platform.{cfg.profile}.yaml",
         )]
-    return []
+    return check_egress_dns(cfg)
+
+
+def check_egress_dns(cfg: ResolvedConfig) -> list[Finding]:
+    """The sandbox resolver is named by Service host, never by ClusterIP.
+
+    A ClusterIP is assigned by the cluster: a literal in a profile is right on
+    the cluster it was copied from and silently wrong everywhere else (every
+    sandbox with ``dns_policy: None`` then has a dead resolver). The runtime
+    resolves ``host`` per Pod; ``address`` is not read by anything.
+    """
+    import ipaddress
+
+    findings: list[Finding] = []
+    where = f"conf/platform.{cfg.profile}.yaml"
+    if "address" in cfg.egress_dns:
+        findings.append(Finding(
+            "error", "EGRESS_DNS_UNREAD_KEY",
+            "services.egress_dns.address has no reader; declare the egress-dns "
+            "Service name as services.egress_dns.host",
+            where,
+        ))
+    host = cfg.egress_dns.get("host", "")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        findings.append(Finding(
+            "error", "EGRESS_DNS_LITERAL_IP",
+            f"services.egress_dns.host is a literal IP ({host!r}); a ClusterIP is "
+            "cluster-assigned — use the Service name",
+            where,
+        ))
+    if cfg.egress_proxy_url and not host:
+        findings.append(Finding(
+            "error", "EGRESS_DNS_MISSING",
+            "services.egress_proxy is set but services.egress_dns.host is not: "
+            "sandboxes with dns_policy None would fall back to the cluster resolver",
+            where,
+        ))
+    return findings
 
 
 def _secret_present(var: str) -> bool:
@@ -479,6 +522,89 @@ def check_port_conflicts() -> list[Finding]:
                 "scripts/config-doctor.py:PLATFORM_PORTS",
             ))
         seen[port] = service
+    return findings
+
+
+# Where each deployment shape declares the environment lock backend of the two
+# services that contend for it. ``None`` means "not declared": the service
+# then uses its YAML default (``auto``), which is distributed when Redis is up.
+_ENV_LOCK_MANIFESTS: tuple[tuple[str, str, str], ...] = (
+    # (file, service selector, env var)
+    ("deploy/k8s/base/workspace-runtime.yaml", "StatefulSet", "WORKSPACE_RUNTIME_ENV_LOCK_BACKEND"),
+    ("deploy/k8s/base/control-service.yaml", "Deployment", "CONTROL_SERVICE_ENV_LOCK_BACKEND"),
+)
+_COMPOSE_FILES_WITH_BOTH = (
+    "deploy/docker-compose.stack.yml",
+    "deploy/docker-compose.cell.yml",
+)
+
+
+def _k8s_env_value(path: Path, kind: str, var: str) -> Optional[str]:
+    import yaml
+
+    for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+        if not doc or doc.get("kind") != kind:
+            continue
+        for container in doc["spec"]["template"]["spec"]["containers"]:
+            for entry in container.get("env", []):
+                if entry.get("name") == var and "value" in entry:
+                    return str(entry["value"]).strip().lower()
+    return None
+
+
+def _compose_env_values(path: Path, var: str) -> list[str]:
+    import yaml
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    values: list[str] = []
+    for service in (data.get("services") or {}).values():
+        env = (service or {}).get("environment") or {}
+        if isinstance(env, dict) and var in env:
+            values.append(str(env[var]).strip().lower())
+    return values
+
+
+def check_env_lock_backends() -> list[Finding]:
+    """Both contenders for one environment lock must be distributed.
+
+    control-service's lifecycle operations and workspace-runtime's apply hold
+    the same key. Either side declaring ``in_memory`` drops the exclusion
+    between them — and the runtime refuses to start on it anyway, so a
+    manifest saying so would ship a crash loop.
+    """
+    findings: list[Finding] = []
+    k8s_values: dict[str, Optional[str]] = {}
+    for rel, kind, var in _ENV_LOCK_MANIFESTS:
+        path = REPO_ROOT / rel
+        if not path.exists():
+            continue
+        value = _k8s_env_value(path, kind, var)
+        k8s_values[var] = value
+        if value == "in_memory":
+            findings.append(Finding(
+                "error", "ENV_LOCK_IN_PROCESS",
+                f"{var}=in_memory: the environment lock is shared with another "
+                "service, which no in-process lock can exclude",
+                rel,
+            ))
+    if len(set(k8s_values.values())) > 1:
+        findings.append(Finding(
+            "error", "ENV_LOCK_BACKEND_MISMATCH",
+            f"control and runtime declare different env lock backends: {k8s_values}",
+            "deploy/k8s/base/",
+        ))
+
+    for rel in _COMPOSE_FILES_WITH_BOTH:
+        path = REPO_ROOT / rel
+        if not path.exists():
+            continue
+        for var in ("WORKSPACE_RUNTIME_ENV_LOCK_BACKEND", "CONTROL_SERVICE_ENV_LOCK_BACKEND"):
+            if "in_memory" in _compose_env_values(path, var):
+                findings.append(Finding(
+                    "error", "ENV_LOCK_IN_PROCESS",
+                    f"{var}=in_memory in a multi-service stack",
+                    rel,
+                ))
     return findings
 
 
@@ -534,6 +660,7 @@ def run(profiles: Iterable[str], *, show: bool, want_secrets: bool) -> Report:
     report.findings += check_profile_files()
     report.findings += check_base_is_address_free()
     report.findings += check_port_conflicts()
+    report.findings += check_env_lock_backends()
 
     for profile in profiles:
         if not (CONF_DIR / f"platform.{profile}.yaml").exists():

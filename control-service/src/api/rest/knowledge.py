@@ -1,4 +1,4 @@
-"""Knowledge document METADATA endpoints (design 06 P8 — route repatriation).
+"""Knowledge document METADATA endpoints (design 06 — route repatriation).
 
 The knowledge surface split in two, along the line P5 drew for everything
 else: ``list`` is pure metadata over the shared database, so it belongs to the

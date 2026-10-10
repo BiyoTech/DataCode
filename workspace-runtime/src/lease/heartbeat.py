@@ -1,4 +1,4 @@
-"""Runtime heartbeat — how this instance becomes placeable (design 03 §3.3, P4a).
+"""Runtime heartbeat — how this instance becomes placeable (design 03 §3.3).
 
 The controller places a new lease on the emptiest instance, so it needs each
 instance's current load. That report comes from the instance itself rather than

@@ -49,6 +49,7 @@ locks = EnvironmentLocks(
     env_prefix="CONTROL_SERVICE",
     config=_config,
     busy_error=EnvironmentBusyError,
+    cross_service=True,
 )
 
 

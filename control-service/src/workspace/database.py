@@ -82,6 +82,7 @@ async def init_db() -> None:
     # The environment registry lives in another package, so it must be imported
     # explicitly or ``create_all`` would silently skip its tables.
     from src.environments import models as environment_models  # noqa: F401
+    from src.operations import models as operation_models  # noqa: F401
     from src.quota import models as quota_models  # noqa: F401
     from src.records import models as record_models  # noqa: F401
     from src.workspace.models import Base

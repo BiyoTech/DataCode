@@ -1,4 +1,4 @@
-"""Git credential endpoints (P5 ownership move).
+"""Git credential endpoints .
 
 Credentials are CONTROL-PLANE data: they are user account material, not
 working-copy state. The runtime keeps a READ path for remote operations

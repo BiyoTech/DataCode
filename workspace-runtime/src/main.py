@@ -130,14 +130,25 @@ async def lifespan(app: FastAPI):
         # Allowed but weaker than the target shape; never silently swallowed.
         logger.warning("storage_contract_degraded", reason=warning)
 
+    # The environment lock is shared with control-service's lifecycle
+    # operations; an in-process backend would silently drop that exclusion.
+    from src.sqlmesh.env_locks import locks as env_locks
+
+    logger.info("environment_lock_backend_validated", mode=env_locks.validate())
+
+    # Dagster shape vs execution plane: a cluster (kubernetes task backend)
+    # must not run one scheduler per replica on a Pod-local SQLite instance.
+    logger.info("dagster_contract_validated", **settings.dagster_contract())
+
     # Read-side metadata: the MetadataContextStore (in-memory cache over the
     # executor sandbox's serialized payloads) initializes lazily on first use;
     # the EXECUTABLE context lives in executor children per design 04 §3.7.
     # The former ContextPool is gone — no Context is constructed in this
     # process any more (P6 close-out).
 
-    # Metadata DB: same database as the legacy sqlmesh-service; runtime holds
-    # read mappings only (ownership moves to control-service in P5).
+    # Metadata DB: shared with the control plane; this runtime creates only
+    # the three tables it owns and reads the control-owned ones (see
+    # src/workspace/database.py).
     try:
         from src.workspace.database import init_db
 
@@ -149,14 +160,14 @@ async def lifespan(app: FastAPI):
 
     await get_task_tracker().start_registry()
 
-    # Workspace leases (design 06 P4a). No-op while `lease.enabled` is false;
+    # Workspace leases (design 06). No-op while `lease.enabled` is false;
     # started after the storage contract has been validated, because a lease
     # only makes sense on a medium the contract accepted.
     from src.lease.wiring import init_lease_manager
 
     lease_manager = await init_lease_manager()
 
-    # Resolve the isolation policy at startup (design 06 P6a). Loading it here
+    # Resolve the isolation policy at startup (design 06). Loading it here
     # rather than on the first task means a configuration mistake — a profile
     # naming an unavailable level, or a sandbox plane that is switched off —
     # appears in the startup log instead of inside a user's first plan.
@@ -320,14 +331,14 @@ app.include_router(deps.router)
 # WIP durability contract (design 07 Q6): the user-facing status/recover/
 # discard surface of the lease subsystem's snapshot machinery.
 app.include_router(wip.router)
-# Lease placement channel (design 06 P4a): the gateway's acquire path.
+# Lease placement channel (design 06): the gateway's acquire path.
 # Internal-token guarded, fail closed — see api/dagster/internal_auth.py.
 app.include_router(leases.router)
-# Environment-control channel (design 06 P5): control-service's command path
+# Environment-control channel (design 06): control-service's command path
 # for Git materialization, SQLMesh virtual environments and workspace
 # provisioning. Internal-token guarded like every /internal/* surface.
 app.include_router(env_control.router)
-# Cross-cell migration for the tables THIS service owns (design 06 P7). The
+# Cross-cell migration for the tables THIS service owns (design 06). The
 # control plane orchestrates and moves its own tables; each service moves what it
 # creates, so no table ever has a second creator or a mirrored definition to
 # drift. Internal-token guarded like every /internal/* surface.

@@ -1,4 +1,4 @@
-"""Egress grants — how a task's allow-list reaches the proxy (P6b).
+"""Egress grants — how a task's allow-list reaches the proxy.
 
 The proxy must know which destinations a given task may reach. Three ways to tell
 it, and the choice matters:

@@ -1,6 +1,6 @@
 """Lineage service - model and column dependency DAG operations.
 
-P6 close-out: a thin caller of the executor sandbox. Model-level lineage is
+a thin caller of the executor sandbox. Model-level lineage is
 served from the runtime's cached metadata (ms-level); column-level lineage
 renders the traced column's expression — which executes the user's macros —
 so it is an execute-class sandbox op. The graph builders and column-lineage

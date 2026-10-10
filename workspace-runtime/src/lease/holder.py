@@ -1,4 +1,4 @@
-"""Lease holder — this instance's side of workspace ownership (design 03 §3.3, P4a).
+"""Lease holder — this instance's side of workspace ownership (design 03 §3.3).
 
 Responsibilities, in the order they matter:
 
@@ -280,7 +280,7 @@ class LeaseHolder:
         logger.info("lease_released", lease_key=lease_key)
 
     async def release_all(self) -> None:
-        """Release every lease — the drain path (design 06 P4a)."""
+        """Release every lease — the drain path."""
         for lease_key in self.held_keys():
             await self.release(lease_key)
 

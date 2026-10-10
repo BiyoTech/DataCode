@@ -6,10 +6,20 @@ The lease's guarantee is that exactly ONE workspace-runtime replica owns a
 working copy, and it is worthless unless every caller honours it. The edge
 gateway does (``gateway/internal/leaserouter``), but the gateway is not the only
 caller: agent-service issues tool calls, queries and metadata reads carrying a
-``workspace_path``, and in Kubernetes ``services.runtime`` resolves to a
-HEADLESS Service — its DNS returns every pod, so dialing it lands on an
+``workspace_path``, control-service dispatches every Git / engine side effect
+over the env-control channel, and in Kubernetes ``services.runtime`` resolves to
+a HEADLESS Service — its DNS returns every pod, so dialing it lands on an
 arbitrary replica. With N replicas, N-1 of N such calls reach a replica that
 does not hold the lease.
+
+Two entry points, because callers hold different things
+-------------------------------------------------------
+:meth:`LeaseRouter.resolve` takes a ``workspace_path`` (what a tool call or a
+file read carries) and :meth:`LeaseRouter.resolve_lease_key` takes the key
+itself (what the control plane holds: it addresses working copies by logical
+identifiers and owns no filesystem). Both run the SAME resolution — the path
+form only derives the key first — so a caller cannot pick a different routing
+policy by picking a different overload.
 
 That failure is invisible in development (one replica always holds everything)
 and near-total in production, which is why the resolution logic belongs here
@@ -281,6 +291,28 @@ class LeaseRouter:
         except LeaseKeyError:
             return self.fallback_url
 
+        return await self.resolve_lease_key(key)
+
+    async def resolve_lease_key(self, key: str, *, allow_placement: bool = True) -> str:
+        """Resolve a lease key that the caller already holds.
+
+        The control plane addresses working copies by logical identifiers
+        (tenant / workspace / user / environment) and has no filesystem to
+        derive a path from, so it builds the key itself. Everything after the
+        derivation is shared with :meth:`resolve` on purpose: two resolution
+        policies would eventually disagree about who may write.
+
+        ``allow_placement=False`` resolves without ever asking the fleet to
+        place a lease. Placement makes the winner CLONE the repository, which
+        is right before writing to a copy and wrong for reading about one: a
+        probe would otherwise materialize files in order to report that they
+        were not there, and the answer it returns would be a fact it created
+        itself.
+
+        Raises:
+            LeaseCapacityRefused: the fleet refused to place a lease.
+            LeaseUnavailable: nothing could be resolved and no fallback exists.
+        """
         cached = self._cached(key)
         if cached:
             return cached
@@ -297,7 +329,12 @@ class LeaseRouter:
             self._store(key, addr)
             return addr
 
-        if not outage and self.placement is not None and self.placement.enabled:
+        if (
+            allow_placement
+            and not outage
+            and self.placement is not None
+            and self.placement.enabled
+        ):
             # Clean miss: nobody holds this copy yet.
             try:
                 placed = await self.placement.acquire(key)
@@ -335,6 +372,10 @@ class LeaseRouter:
             key = lease_key_from_working_copy_path(workspace_path)
         except LeaseKeyError:
             return
+        self._cache.pop(key, None)
+
+    def invalidate_lease_key(self, key: str) -> None:
+        """Drop a cached decision addressed by lease key (see :meth:`invalidate`)."""
         self._cache.pop(key, None)
 
     # ── internals ──────────────────────────────────────────────────────

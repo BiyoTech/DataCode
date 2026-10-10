@@ -13,10 +13,12 @@ bootstrapped through ``create_all`` already carries the tables, so each one is
 inspected before it is created. All timestamps are stored in UTC.
 """
 
-import sqlalchemy as sa
-from alembic import op
-from sqlalchemy import inspect
 from typing import Sequence, Union
+
+import sqlalchemy as sa
+from sqlalchemy import inspect
+
+from alembic import op
 
 revision: str = "0005_control_plane_tables"
 down_revision: Union[str, None] = "0004_environment_applied_dirty"

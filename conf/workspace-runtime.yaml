@@ -25,12 +25,12 @@ concurrency:
   env_lock_backend: "auto"
   env_lock_ttl_seconds: 120
 
-environments:
-  max_per_workspace: 20
-  sandbox_default_ttl_hours: 168
-  reaper_enabled: true
-  reaper_interval: 3600
-  sandbox_expiry_grace_hours: 24
+# NOTE: there is deliberately no `environments:` block here. Environment
+# lifecycle (the per-workspace ceiling, sandbox TTLs, the expiry reaper) is
+# CONTROL-SERVICE's job and is configured in conf/control-service.yaml. This
+# file used to carry a verbatim copy of those five keys with no reader on this
+# side — a second declaration that could only ever drift from the one that
+# actually takes effect.
 
 task:
   timeout_seconds: 600
@@ -138,7 +138,12 @@ error_archive:
 
 # Dagster data plane (from the legacy dagster-service.yaml).
 dagster:
-  mode: "local"                    # "local" | "remote" (production forces remote)
+  # "local" | "remote". local = this process starts its own daemon + webserver
+  # (single node only). remote = the instance is an orchestration plane
+  # (deploy/k8s/base/dagster-orchestrator.yaml, deploy/docker-compose.dagster.yml).
+  # Enforced at startup by Settings.dagster_contract(): with task.backend
+  # "kubernetes" anything but remote + pod refuses to boot.
+  mode: "local"
   # Vehicle that runs a code location's user code:
   #   process — a child of this process (dev / single-node). Shares its
   #             filesystem view and network namespace.

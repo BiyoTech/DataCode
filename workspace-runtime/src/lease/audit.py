@@ -1,4 +1,4 @@
-"""Lease audit — the durable record of who held which working copy (P8).
+"""Lease audit — the durable record of who held which working copy.
 
 ``lease_history`` was landed by control-service's 0005 migration as an
 append-only archive of lease placement decisions: one row per acquire, release

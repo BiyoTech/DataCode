@@ -1,4 +1,4 @@
-"""Lease placement endpoints — the gateway's acquire channel (design 06 P4a).
+"""Lease placement endpoints — the gateway's acquire channel (design 06).
 
 These are INTERNAL endpoints (shared-secret guarded, never user traffic): they
 exist so the gateway can turn "no lease found" into "lease held, route here".

@@ -72,8 +72,10 @@ services:
       # cell-1 unverifiable by cell-1's own gateway.
       GW_JWT_SECRET: ${GW_JWT_SECRET:?injected by make from .data/gateway_jwt_secret}
       # Guards /internal/* — the placement and cell-registry endpoints each
-      # cell's control plane calls at startup.
-      IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+      # cell's control plane calls at startup. No inline default: a well-known
+      # literal surviving into a non-local deployment would be an
+      # authentication bypass, so `:?` fails loudly without deploy/.env.
+      IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
       # Single replica: migrations at boot are race-free. Multi-replica installs
       # must move this to a one-shot job, exactly like the cell tier does.
       IDENTITY_SERVICE_AUTO_MIGRATE: "1"

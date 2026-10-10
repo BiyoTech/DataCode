@@ -22,14 +22,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.environments.git_binder import GitBinder, GitCommandResult  # noqa: E402
 from src.environments.sqlmesh_binder import SqlMeshBinder  # noqa: E402
+from src.runtime.client import RuntimeReply, RuntimeTarget  # noqa: E402
 from src.utils.errors import RuntimeUnavailableError, WorkspaceNotFoundError  # noqa: E402
 
 
 class FakeRuntime:
-    """In-memory double of the env-control surface, recording every call."""
+    """In-memory double of the env-control surface, recording every call.
+
+    Records the routing target as well: which replica a call reaches is part
+    of the binder's contract, not an implementation detail of the client.
+    """
 
     def __init__(self):
         self.calls: list[tuple[str, str, dict]] = []
+        self.targets: list[RuntimeTarget | None] = []
         self.responses: dict[str, object] = {}
 
     def _answer(self, method: str, path: str):
@@ -39,13 +45,21 @@ class FakeRuntime:
             raise answer
         return answer if answer is not None else {}
 
-    async def post(self, path: str, payload: dict) -> dict:
+    async def post(self, path: str, payload: dict, *, target=None) -> dict:
         self.calls.append(("POST", path, payload))
+        self.targets.append(target)
         return self._answer("POST", path)
 
-    async def get(self, path: str, params: dict | None = None) -> dict:
+    async def get(self, path: str, params: dict | None = None, *, target=None) -> dict:
         self.calls.append(("GET", path, dict(params or {})))
+        self.targets.append(target)
         return self._answer("GET", path)
+
+    async def post_all(self, path: str, payload: dict, *, target, also=()):
+        return [RuntimeReply(addr="r1", body=await self.post(path, payload, target=target))]
+
+    async def get_all(self, path: str, params: dict | None = None, *, target):
+        return [RuntimeReply(addr="r1", body=await self.get(path, params, target=target))]
 
 
 @pytest.fixture()
@@ -85,6 +99,31 @@ async def test_ensure_worktree_returns_runtime_materialization(fake):
     assert (method, path) == ("POST", "/internal/env-control/git/ensure-worktree")
     assert payload["tenant_id"] == "t1"
     assert payload["environment"] == "dev"
+    # Addressed at the member's own copy: this call places the lease.
+    assert fake.targets[-1] == RuntimeTarget(
+        tenant_id="t1", workspace_id="ws", user_id="u1", environment="dev"
+    )
+
+
+async def test_push_branch_is_addressed_by_the_copy_it_reads(fake):
+    """The credential's user and the copy's owner are distinct identities."""
+    import os
+
+    from src.config import settings
+
+    base = os.path.expanduser(settings.workspace_base_path)
+    binder = GitBinder(client=fake)
+
+    await binder.push_branch(
+        worktree_path=f"{base}/t1/ws-t1-shop/owner/envs/dev",
+        branch="env/dev",
+        user_id="someone-else",
+        git_repo_url="https://github.com/org/repo",
+    )
+
+    assert fake.targets[-1] == RuntimeTarget(
+        tenant_id="t1", workspace_id="ws-t1-shop", user_id="owner", environment="dev"
+    )
 
 
 async def test_pending_work_returns_both_counts(fake):
@@ -162,9 +201,13 @@ async def test_push_branch_mirrors_command_result(fake):
         "detail": "no credential configured",
     }
     binder = GitBinder(client=fake)
+    import os
 
+    from src.config import settings
+
+    base = os.path.expanduser(settings.workspace_base_path)
     result = await binder.push_branch(
-        worktree_path="/base/t1/ws/u1/envs/dev",
+        worktree_path=f"{base}/t1/ws-t1-shop/u1/envs/dev",
         branch="env/dev",
         user_id="u1",
         git_repo_url="https://github.com/org/repo",

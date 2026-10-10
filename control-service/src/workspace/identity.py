@@ -10,7 +10,7 @@ and stays pure. This module is the thin, settings-aware adapter on top of it,
 so no caller has to know the configured base path or re-implement the
 derivation.
 
-NOTE (P5): the control plane derives identities to ADDRESS the runtime's
+NOTE: the control plane derives identities to ADDRESS the runtime's
 env-control API; it never inspects the directory the path points at.
 """
 

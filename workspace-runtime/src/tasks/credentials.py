@@ -1,4 +1,4 @@
-"""Per-task credentials for a sandbox (design 04 §3.5, P6b).
+"""Per-task credentials for a sandbox (design 04 §3.5).
 
 What a sandbox is handed, and what it is not:
 

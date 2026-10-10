@@ -122,12 +122,78 @@ def repair_on(monkeypatch):
     monkeypatch.setattr(settings, "reconcile_sweep_repair", True)
 
 
-def _sweep(workspaces, reconciler, lock=None) -> ReconcileSweep:
+def _sweep(workspaces, reconciler, lock=None, resumer=None) -> ReconcileSweep:
     return ReconcileSweep(
         workspaces=workspaces,
         reconciler=reconciler,
         lock_factory=lock or _LockRecorder(),
+        resumer=resumer or _FakeResumer(),
     )
+
+
+class _FakeResumer:
+    """Records calls; optionally reports stuck operations or raises."""
+
+    def __init__(self, outcome=None, error: t.Optional[Exception] = None, log=None):
+        from src.operations.resumer import ResumeOutcome
+
+        self.outcome = outcome or ResumeOutcome()
+        self.error = error
+        self.calls: list = []
+        self.log = log
+
+    async def run_once(self, *, repair: bool):
+        self.calls.append(repair)
+        if self.log is not None:
+            self.log.append("resume")
+        if self.error is not None:
+            raise self.error
+        return self.outcome
+
+
+class TestOperationResume:
+    async def test_operations_are_resumed_before_workspaces_are_reconciled(self):
+        """A half-deleted workspace is still listed until its deletion finishes."""
+        order: list = []
+
+        class _OrderedReconciler(_FakeReconciler):
+            async def reconcile_workspace(self, workspace, **kwargs):
+                order.append("reconcile")
+                return await _FakeReconciler.reconcile_workspace(self, workspace, **kwargs)
+
+        resumer = _FakeResumer(log=order)
+        sweep = _sweep(
+            _FakeWorkspaces([_Workspace("ws-1")]), _OrderedReconciler(), resumer=resumer
+        )
+
+        await sweep.run_once()
+
+        assert order[0] == "resume"
+        assert resumer.calls == [settings.reconcile_sweep_repair]
+
+    async def test_stuck_operations_are_reported_as_drift(self):
+        from src.operations.resumer import ResumeOutcome
+
+        resumer = _FakeResumer(ResumeOutcome(stuck=2, resumed=1, superseded=1))
+        sweep = _sweep(_FakeWorkspaces([]), _FakeReconciler(), resumer=resumer)
+
+        outcome = await sweep.run_once()
+
+        assert outcome.kinds["stuck_operation"] == 2
+        assert outcome.drifts_repaired == 2
+        assert outcome.as_dict()["operations_stuck"] == 2
+
+    async def test_a_broken_operations_table_does_not_stop_the_sweep(self):
+        reconciler = _FakeReconciler()
+        sweep = _sweep(
+            _FakeWorkspaces([_Workspace("ws-1")]),
+            reconciler,
+            resumer=_FakeResumer(error=RuntimeError("table missing")),
+        )
+
+        await sweep.run_once()
+
+        assert [call[0] for call in reconciler.calls] == ["ws-1"]
 
 
 class TestRepairPolicy:

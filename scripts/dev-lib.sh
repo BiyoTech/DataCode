@@ -139,6 +139,30 @@ load_dotenv() {
   done < "$file"
 }
 
+# ensure_secret_file VAR FILE BYTES — guarantee the truth FILE exists, without
+# exporting anything. On first creation an already-exported $VAR is adopted
+# rather than replaced, so a value the caller already decided on wins exactly
+# once and is then fixed. Idempotent and cheap (one -f test), which is what
+# lets every Makefile target call it.
+#
+# Separate from ensure_secret below because the two consumers differ: host dev
+# needs the variable in its environment, while the Makefile needs only the file
+# (it reads it into each compose invocation). One value, two delivery paths.
+ensure_secret_file() {
+  local var="$1" file="$2" bytes="$3"
+  if [ ! -f "$file" ]; then
+    mkdir -p "$(dirname "$file")"
+    if [ -n "${!var:-}" ]; then
+      printf '%s\n' "${!var}" > "$file"
+      dev_info "adopted $var from the environment into ${file#"$ROOT_DIR"/}"
+    else
+      openssl rand -base64 "$bytes" > "$file"
+      dev_info "generated $var (${file#"$ROOT_DIR"/})"
+    fi
+    chmod 600 "$file"
+  fi
+}
+
 # ensure_secret VAR FILE BYTES — guarantee $VAR holds a secret. When unset,
 # generate one (openssl) and persist it under .data/ with 0600 so the value
 # survives restarts; later runs reload instead of regenerating.
@@ -147,13 +171,22 @@ ensure_secret() {
   if [ -n "${!var:-}" ]; then
     return 0
   fi
-  if [ ! -f "$file" ]; then
-    mkdir -p "$(dirname "$file")"
-    openssl rand -base64 "$bytes" > "$file"
-    chmod 600 "$file"
-    dev_info "generated $var (${file#"$ROOT_DIR"/})"
-  fi
+  ensure_secret_file "$var" "$file" "$bytes"
   export "$var=$(cat "$file")"
+}
+
+# The truth files the CONTAINER stacks share with host dev. Same contract as
+# the postgres password and the JWT secret: one file per secret, so a token
+# minted by a host-run service is accepted by a containerized one and the
+# compose files can require the variable (`:?`) instead of shipping a
+# well-known default that would survive into a real deployment.
+INTERNAL_TOKEN_FILE="$ROOT_DIR/.data/runtime_internal_token"
+TASK_TOKEN_SECRET_FILE="$ROOT_DIR/.data/task_token_secret"
+
+# ensure_stack_secrets — the two truth files every container stack needs.
+ensure_stack_secrets() {
+  ensure_secret_file DATACODE_INTERNAL_TOKEN "$INTERNAL_TOKEN_FILE" 32
+  ensure_secret_file DATACODE_TASK_TOKEN_SECRET "$TASK_TOKEN_SECRET_FILE" 32
 }
 
 # ── PostgreSQL password: one truth file ───────────────────────────────────

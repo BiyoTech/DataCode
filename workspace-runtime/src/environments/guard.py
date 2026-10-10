@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import typing as t
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from datacode_common import naming as naming
 
+from src.environments.registry_client import get_registry_client
 from src.environments.repository import EnvironmentRepository
 from src.utils.errors import (
     EnvironmentNotFoundError,
@@ -146,17 +147,14 @@ async def mark_applied(
     would forge the "code and data share one source" invariant. Applying from a
     dirty tree stays allowed (a sandbox exists to iterate before committing);
     the UI turns this flag into drift that a commit + re-apply clears.
+
+    Sent to the control plane rather than written here: ``environments`` is its
+    table (see :mod:`src.environments.registry_client`). The client never
+    raises, so this stays as best-effort as it reads.
     """
-    try:
-        await EnvironmentRepository().update(
-            environment_id,
-            last_applied_commit=commit_hash or None,
-            last_applied_at=applied_at or datetime.now(timezone.utc),
-            last_applied_dirty=1 if dirty else 0,
-        )
-    except Exception as exc:  # noqa: BLE001 - bookkeeping must not break apply
-        logger.warning(
-            "environment_apply_marker_failed",
-            environment_id=environment_id,
-            error=str(exc),
-        )
+    await get_registry_client().mark_applied(
+        environment_id,
+        commit_hash=commit_hash,
+        dirty=dirty,
+        applied_at=applied_at,
+    )

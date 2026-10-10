@@ -1,4 +1,4 @@
-"""Tenant quota bookkeeping and enforcement (design 06, P5 schema + P8 rules)."""
+"""Tenant quota bookkeeping and enforcement (design 06)."""
 
 from src.quota.models import TenantQuotaModel, TenantUsageModel
 from src.quota.publisher import publish_quotas

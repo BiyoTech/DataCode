@@ -10,7 +10,7 @@ auto-discovery.
 Inside modules, use importable absolute imports (``from defs.jobs.example_job
 import ...``); never import the ``asset-dag`` directory.
 
-Ported from the legacy sqlmesh-service (P5). NOTE: keep this skeleton in sync
+Ported from the legacy sqlmesh-service. NOTE: keep this skeleton in sync
 with ``src/templates/``, which re-renders any missing file when a code location
 is ensured. The inline constants below MUST match those templates verbatim.
 """

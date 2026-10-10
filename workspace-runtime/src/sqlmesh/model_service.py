@@ -1,6 +1,6 @@
 """Model service - SQLMesh model operations.
 
-P6 close-out: this is a thin caller of the executor sandbox. NOTHING here
+this is a thin caller of the executor sandbox. NOTHING here
 touches a SQLMesh Context — listing, detail (with rendered SQL), metrics,
 render and validation all execute where the user's Python models and macros
 have already been exec'd: the sandbox. See :mod:`src.sqlmesh.metadata_context`

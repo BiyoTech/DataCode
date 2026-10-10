@@ -1,10 +1,10 @@
 """Lease placement — choosing which instance serves a new working copy.
 
-Placement is a STATELESS decision over shared data (design 03 §3.3): any runtime
-instance (and, in P5, control-service) can execute it, because the inputs — the
-runtime index and the heartbeats — live in Redis and the output is just a
-choice. That is why this module takes a client and returns a decision rather
-than owning a scheduler: it will move to control-service in P5 unchanged.
+Placement is a STATELESS decision over shared data (design 03 §3.3): any
+process reading the same Redis — a runtime instance, or control-service — can
+execute it, because the inputs (the runtime index and the heartbeats) live
+there and the output is just a choice. That is why this module takes a client
+and returns a decision rather than owning a scheduler.
 
 Why the runtime is still the enforcement point
 ----------------------------------------------

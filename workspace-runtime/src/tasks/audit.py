@@ -1,4 +1,4 @@
-"""Task audit — the durable record of what ran in a sandbox (design 06 P6a).
+"""Task audit — the durable record of what ran in a sandbox (design 06).
 
 ``task_records`` is described by its migration as a cross-service archive: the
 runtime's in-memory tracker is per-process by design, so a task that outlived a

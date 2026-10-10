@@ -8,7 +8,7 @@ the Git branch, the worktree and the Dagster deployment. Invalidating a virtual
 environment on its own would leave exactly those orphans behind, which is why
 the corresponding delete operation lives in the registry's SQLMesh binder.
 
-P6 close-out: the state read runs in the executor sandbox; this side only
+the state read runs in the executor sandbox; this side only
 caches and forwards the serialized view.
 """
 

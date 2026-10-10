@@ -67,6 +67,12 @@ spec:
       labels:
         app: workspace-runtime
     spec:
+      # With task.backend=kubernetes this pod is a CONTROLLER: it creates the
+      # Jobs/Pods/Secrets/ConfigMaps of the execution plane in datacode-tasks
+      # and reads task results from Pod logs. The namespace `default` account
+      # can do none of that, and the 403 surfaces as "could not start a
+      # sandbox" three layers away — see rbac.yaml.
+      serviceAccountName: workspace-runtime
       # Graceful drain is the zero-loss shutdown path (design 07 Q6): the pod
       # takes a final WIP snapshot of every held working copy on SIGTERM.
       # 2 minutes covers a snapshot round; a faster kill trades the last
@@ -114,18 +120,41 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             # Shared secret guarding /internal/* (lease accept channel).
+            #
+            # The SAME Secret and key the senders read (gateway, control and
+            # agent all mount datacode-secrets/runtime-internal-token). This
+            # used to name a separate `datacode-internal` Secret, which meant
+            # the receiver and the senders could hold different values while
+            # both looked correctly configured — and the symptom, 401 on every
+            # env-control call, names neither of them.
             - name: WORKSPACE_RUNTIME_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: datacode-internal
-                  key: internal-token
-            # 4b target shape: per-replica private storage + leases means the
-            # env lock degrades to IN-PROCESS (the lease is the single-writer
-            # guarantee, and competing writers would be on this pod only).
-            # The Redis backend stays available as a config choice for the P4a
-            # transitional shape (shared volume + leases).
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            # Redis, always. The lease makes this replica the single writer of
+            # a working copy, but the environment lock's other contender is
+            # control-service (destroy / reconcile repair) — a different
+            # process, which no in-process lock can exclude. The service
+            # refuses to start on in_memory. Must equal control-service's value.
             - name: WORKSPACE_RUNTIME_ENV_LOCK_BACKEND
-              value: in_memory
+              value: redis
+            # Dagster: the instance (daemon, webserver, run storage) is the
+            # cell's orchestration plane (dagster-orchestrator.yaml), and code
+            # locations run as Pods on the user-code pool. Enforced at startup
+            # by Settings.dagster_contract(): with the kubernetes task backend
+            # any other shape refuses to boot rather than run one scheduler
+            # per replica on a SQLite file that dies with the Pod.
+            - name: WORKSPACE_RUNTIME_DAGSTER_MODE
+              value: remote
+            - name: WORKSPACE_RUNTIME_CODE_LOCATION_MODE
+              value: pod
+            - name: WORKSPACE_RUNTIME_DAGSTER_DAEMON_ENABLED
+              value: "false"
+            - name: WORKSPACE_RUNTIME_DAGSTER_WEBSERVER_ENABLED
+              value: "false"
+            - name: WORKSPACE_RUNTIME_DAGSTER_REMOTE_GRAPHQL_URL
+              value: http://dagster-webserver.datacode.svc.cluster.local:3000/graphql
             # Execution plane (design 04 §3): one Job per task. The ONLY backend
             # that can serve L2/L3-base, because those levels ARE the container.
             # Overrides conf/workspace-runtime.yaml's single-node default.
@@ -149,6 +178,19 @@ spec:
             # volume-aware value is derived by the pod's own name at startup.
             - name: WORKSPACE_RUNTIME_TASK_WORKCOPY_PVC
               value: workcopies-$(DATACODE_RUNTIME_ID)
+            # Signs the per-task egress tokens the egress-proxy verifies. This
+            # is the MINTING side; the proxy mounts the same key from a Secret
+            # of the same name in datacode-tasks (a Secret cannot be referenced
+            # across namespaces, so the value must be created in BOTH — see
+            # secrets.example.yaml). Optional: without the egress plane the
+            # runtime mints nothing, and a hard requirement here would make
+            # every cluster carry a secret it has no consumer for.
+            - name: DATACODE_TASK_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-task-token
+                  key: signing-secret
+                  optional: true
             # Database password: the ONLY db-related env this process reads.
             # Host/port/name/type come from the mounted platform config.
             - name: DB_PASSWORD

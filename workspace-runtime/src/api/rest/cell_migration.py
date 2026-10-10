@@ -1,4 +1,4 @@
-"""Cross-cell migration for the tables THIS service owns (design 06 P7).
+"""Cross-cell migration for the tables THIS service owns (design 06).
 
 A tenant moving between cells is orchestrated by the control plane, but the data
 is moved by whoever owns it. This module is the runtime's half: ``file_drafts``,

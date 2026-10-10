@@ -46,9 +46,12 @@ x-cell-env: &cell-env
   CONFIG_PATH: /app/conf
   DATACODE_ENV: cell
   DB_PASSWORD: ${DB_PASSWORD}
-  WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
-  CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
-  IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:-dev-internal-token}
+  # No inline defaults: a well-known literal that survives into a non-local
+  # deployment is an authentication bypass for every /internal/* surface.
+  # deploy/.env supplies them; `:?` fails loudly when it was forgotten.
+  WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+  CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+  IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
 
 services:
   cell-pg:
@@ -182,6 +185,11 @@ services:
   # Data plane. Two replicas because the lease router's single-writer property
   # is only exercised with more than one — a single replica would make every
   # routing bug invisible until production.
+  #
+  # The replicas differ in EXACTLY three things: runtime id, private volume and
+  # published port. Everything else comes from the anchors — a hand-copied
+  # environment block is how one replica ends up with a setting the other
+  # lacks, and the resulting lease bugs are very hard to attribute.
   workspace-runtime-1: &workspace-runtime
     build:
       context: ..
@@ -190,7 +198,7 @@ services:
       # Unset passes "", the Dockerfile's own default.
       args:
         RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
-    environment:
+    environment: &workspace-runtime-env
       <<: *cell-env
       # Leases ON with per-replica volumes: the lease is the single-writer
       # guarantee, and a volume per replica makes a lease violation a visible
@@ -201,13 +209,13 @@ services:
       WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
       DATACODE_RUNTIME_ID: workspace-runtime-1
       DATACODE_REPLICA_ID: workspace-runtime-1
-      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
+      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:?injected from deploy/.env}
     volumes:
       - ../conf:/app/conf:ro
       - cell_workspaces_1:/data/workspaces
     ports:
       - "${CELL_RUNTIME_PORT:-8002}:8002"
-    depends_on:
+    depends_on: &workspace-runtime-deps
       cell-pg:
         condition: service_healthy
       cell-redis:
@@ -219,19 +227,15 @@ services:
   workspace-runtime-2:
     <<: *workspace-runtime
     environment:
-      <<: *cell-env
-      WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
-      WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: instance_local
-      WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /data/workspaces
-      WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
+      <<: *workspace-runtime-env
       DATACODE_RUNTIME_ID: workspace-runtime-2
       DATACODE_REPLICA_ID: workspace-runtime-2
-      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:-dev-task-token-secret}
     volumes:
       - ../conf:/app/conf:ro
       - cell_workspaces_2:/data/workspaces
     ports:
       - "${CELL_RUNTIME2_PORT:-8012}:8002"
+    depends_on: *workspace-runtime-deps
 
 volumes:
   cell_pg_data:

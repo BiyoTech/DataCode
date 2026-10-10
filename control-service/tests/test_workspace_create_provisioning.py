@@ -22,6 +22,7 @@ import typing as t
 from dataclasses import dataclass, field
 
 import pytest
+from _operation_fakes import MemoryRecorder
 from datacode_common import naming
 
 from src.utils.errors import ConflictError, GitRemoteAccessError
@@ -35,15 +36,22 @@ _URL = "https://github.com/BiyoTech/loganhu-test.git"
 
 @dataclass
 class _FakeRuntimeClient:
-    """Records every env-control call so the scaffold decision is observable."""
+    """Records every env-control call so the scaffold decision is observable.
+
+    The routing target is recorded too: the scaffold and the push must be
+    addressed at the owner's production copy, which is where ``open`` placed
+    the lease.
+    """
 
     provision: dict = field(default_factory=dict)
     provision_error: t.Optional[Exception] = None
     push_ok: bool = True
     calls: list = field(default_factory=list)
+    targets: dict = field(default_factory=dict)
 
-    async def post(self, path: str, payload: dict) -> dict:
+    async def post(self, path: str, payload: dict, *, target=None) -> dict:
         self.calls.append((path, payload))
+        self.targets[path] = target
         if path.endswith("/workspace/provision-remote"):
             if self.provision_error is not None:
                 raise self.provision_error
@@ -52,7 +60,12 @@ class _FakeRuntimeClient:
             return {"ok": self.push_ok, "reason": "" if self.push_ok else "repo_not_found"}
         return {}
 
-    async def get(self, path: str, params: dict | None = None) -> dict:
+    async def post_all(self, path: str, payload: dict, *, target, also=()):
+        from src.runtime.client import RuntimeReply
+
+        return [RuntimeReply(addr="r1", body=await self.post(path, payload, target=target))]
+
+    async def get(self, path: str, params: dict | None = None, *, target=None) -> dict:
         self.calls.append((path, params or {}))
         return {"members": []}
 
@@ -89,6 +102,11 @@ class _FakeRegistry:
     workspace_path: str = "/base/t1/ws-t1-loganhu-test/u1/envs/prod"
     open_error: t.Optional[Exception] = None
     opens: list = field(default_factory=list)
+    purged: list = field(default_factory=list)
+
+    async def purge_all_for_workspace(self, *, workspace_id: str) -> int:
+        self.purged.append(workspace_id)
+        return 1
 
     async def ensure_production(self, model, owner_user_id: str):
         @dataclass
@@ -141,7 +159,19 @@ def wired(monkeypatch):
             return None
 
     monkeypatch.setattr("src.quota.get_quota_service", lambda: _Quota())
-    return WorkspaceManager(), client, repository, registry
+
+    class _NoLeases:
+        async def list_for_workspace(self, *, tenant_id, workspace_id):
+            return []
+
+    monkeypatch.setattr(
+        "src.environments.lease_binder.get_lease_binder", lambda: _NoLeases()
+    )
+    recorder = MemoryRecorder()
+    monkeypatch.setattr("src.workspace.manager.get_operation_recorder", lambda: recorder)
+    manager = WorkspaceManager()
+    manager.recorder = recorder  # exposed for the operation-record assertions
+    return manager, client, repository, registry
 
 
 def _provision(state: str, *, scaffold: bool, bootstrap: bool, created: bool = False):
@@ -206,6 +236,20 @@ async def test_created_remote_is_scaffolded_and_pushed(wired):
     # The push targets the URL the provisioner settled on, not the raw input.
     push = next(p for path, p in client.calls if path.endswith("push-initial"))
     assert push["git_repo_url"] == _URL
+    # Scaffold and push are addressed at the owner's production copy — the one
+    # ``open`` placed the lease for — so they land on the replica that serves
+    # the workspace afterwards. Provisioning a remote touches no copy at all.
+    from src.runtime.client import RuntimeTarget
+
+    owner_copy = RuntimeTarget(
+        tenant_id=_TENANT,
+        workspace_id=f"ws-{_TENANT}-{_NAME}",
+        user_id=_OWNER,
+        environment=naming.PRODUCTION_ENV,
+    )
+    assert client.targets["/internal/env-control/workspace/scaffold"] == owner_copy
+    assert client.targets["/internal/env-control/workspace/push-initial"] == owner_copy
+    assert client.targets["/internal/env-control/workspace/provision-remote"] is None
 
 
 async def test_workspace_without_a_remote_keeps_the_bootstrap_behaviour(wired):
@@ -252,6 +296,9 @@ async def test_remote_is_resolved_before_the_workspace_row_exists(wired):
 
     assert repository.created == []
     assert registry.opens == []
+    # The record is closed (nothing was built), so the resumer never sees it.
+    assert manager.recorder.steps() == []
+    assert manager.recorder.terminal() == "rolled_back"
 
 
 async def test_existing_workspace_is_rejected_before_touching_the_remote(wired):
@@ -291,7 +338,34 @@ async def test_rollback_after_creation_does_not_touch_the_remote(wired):
 
     # The workspace is rolled back...
     assert repository.existing is None
+    assert registry.purged == [f"ws-{_TENANT}-{_NAME}"]
     # ...and nothing resembling a remote deletion was attempted.
     assert not any("delete-remote" in path for path in client.paths())
     assert not any("provision-remote" == path.rsplit("/", 1)[-1]
                    for path in client.paths()[1:])
+    # A complete in-process rollback closes the record: nothing to resume.
+    assert manager.recorder.terminal() == "rolled_back"
+    assert manager.recorder.steps() == ["writing_row", "row_written"]
+
+
+async def test_successful_creation_records_every_step(wired):
+    """The record is what lets the resumer tell 'done' from 'interrupted'."""
+    manager, client, _repository, _registry = wired
+    client.provision = _provision(
+        "created_empty", scaffold=True, bootstrap=True, created=True
+    )
+
+    await manager.create(_TENANT, _OWNER, _NAME, git_repo_url=_URL)
+
+    assert manager.recorder.steps() == [
+        "writing_row",
+        "row_written",
+        "opened",
+        "scaffolded",
+        "pushed",
+    ]
+    assert manager.recorder.terminal() == "succeeded"
+    # The planned final step is recorded up front, so a crash after the push
+    # but before ``succeed`` is recognised as finished.
+    first_advance = next(p for _, e, p in manager.recorder.events if e == "advance")
+    assert first_advance["final_step"] == "pushed"

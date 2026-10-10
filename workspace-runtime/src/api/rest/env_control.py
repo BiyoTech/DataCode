@@ -1,4 +1,4 @@
-"""Environment-control endpoints — control-service's command channel (design 06 P5).
+"""Environment-control endpoints — control-service's command channel (design 06).
 
 These are INTERNAL endpoints (shared-secret guarded, never user traffic). The
 control plane owns the registry and the state machine, but it must have NO
@@ -11,7 +11,7 @@ Endpoint families
 ``/internal/env-control/git/*``      branch & worktree lifecycle (GitBinder)
 ``/internal/env-control/sqlmesh/*``  virtual environments (SqlMeshBinder)
 ``/internal/env-control/workspace/*`` workspace provisioning & teardown
-``/internal/env-control/sandbox/*``  user-code Pod inventory & reclaim (P8)
+``/internal/env-control/sandbox/*``  user-code Pod inventory & reclaim
 
 Mapping to the legacy binder semantics (control-service's HTTP clients):
 - binder methods that took a filesystem-derived path (``repo_path``,

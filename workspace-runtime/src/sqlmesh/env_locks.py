@@ -10,6 +10,14 @@ in, which makes that class of drift unrepresentable.
 
 What stays here is what is genuinely local: this service's settings, its busy
 error, and how it derives a lock key from a working-copy path.
+
+Why this is never in-process in a multi-replica deployment
+----------------------------------------------------------
+The lease makes this replica the only WRITER of a working copy, but the lock
+below is not about writers of a copy: it is about an ENVIRONMENT, and the other
+contender is control-service's destroy / reconcile repair — a different process
+that holds no copy. ``cross_service=True`` makes the shared protocol refuse an
+``in_memory`` backend at startup (see ``EnvironmentLocks.validate``).
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ locks = EnvironmentLocks(
     env_prefix="WORKSPACE_RUNTIME",
     config=_config,
     busy_error=EnvironmentBusyError,
+    cross_service=True,
 )
 
 

@@ -1,4 +1,4 @@
-"""Cell migration data plane (design 06 P7 — ``scripts/ops/cell-migrate.py`` server side).
+"""Cell migration data plane (design 06 — ``scripts/ops/cell-migrate.py`` server side).
 
 A tenant moving between cells is a staged hand-over (see the placement package's
 state machine): identity flips ``migration_state`` while THIS service answers

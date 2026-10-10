@@ -11,12 +11,16 @@ that is easy to lose:
 * ``test_leases_are_released_before_anything_touches_the_files`` — while a lease
   is held, a runtime replica considers itself the single writer of that working
   copy, so every later step would operate on files it may still be writing;
-* ``test_purge_is_broadcast_to_every_lease_holder`` — env-control is a
-  single-URL client while each replica has its OWN volume, so a purge sent to
-  whichever replica answered removed nothing on the replica that held the files;
+* ``test_purge_is_broadcast_to_every_lease_holder`` — each replica has its OWN
+  volume, so a purge sent to whichever replica answered removed nothing on the
+  replica that held the files;
 * ``test_remote_repository_is_never_deleted`` — the repository may predate the
   workspace or be shared, so removing it is not a side effect the platform may
   have.
+
+The runtime side is the REAL :class:`RuntimeClient` over an ``httpx`` mock
+transport: the fan-out (which replicas are visited, how failures are counted)
+is the behaviour under test, so it must not be stubbed away.
 """
 
 from __future__ import annotations
@@ -24,10 +28,14 @@ from __future__ import annotations
 import typing as t
 from dataclasses import dataclass, field
 
+import httpx
 import pytest
+from _operation_fakes import MemoryRecorder
 
+from src.runtime.client import RuntimeClient
+from src.runtime.fleet import FleetView
 from src.utils.errors import WorkspaceNotFoundError
-from src.workspace.manager import WorkspaceManager, _runtime_url_of
+from src.workspace.manager import WorkspaceManager
 
 _TENANT = "t1"
 _WORKSPACE = "ws-t1-shop"
@@ -75,16 +83,33 @@ class _FakeRegistry:
 
 
 @dataclass
-class _FakeRuntimeClient:
-    base_url: str = _DEFAULT_RUNTIME
-    calls: list = field(default_factory=list)
-    fail_urls: tuple = ()
+class _Replicas:
+    """Records every request per replica base URL; ``dead`` ones fail."""
 
-    async def post(self, path: str, payload: dict) -> dict:
-        self.calls.append((self.base_url, path, payload))
-        if self.base_url in self.fail_urls:
-            raise RuntimeError("replica unreachable")
-        return {"purged": True}
+    calls: dict = field(default_factory=dict)
+    dead: set = field(default_factory=set)
+    on_request: t.Optional[t.Callable[[], None]] = None
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        base = f"{request.url.scheme}://{request.url.host}:{request.url.port}"
+        self.calls.setdefault(base, []).append(
+            (request.url.path, request.read().decode())
+        )
+        if self.on_request is not None:
+            self.on_request()
+        if base in self.dead:
+            raise httpx.ConnectError("replica unreachable", request=request)
+        return httpx.Response(200, json={"purged": True})
+
+
+class _UnknownFleet:
+    """Coordination unreadable: candidates degrade to the Service address."""
+
+    async def view(self) -> FleetView:
+        return FleetView(known=False)
+
+    def invalidate(self) -> None:
+        pass
 
 
 @dataclass
@@ -113,17 +138,8 @@ class _Model:
 def wired(monkeypatch):
     """Wire the manager against fakes, tracking the order of every step."""
     order: list = []
-    lease_binder = _FakeLeaseBinder()
-    registry = _FakeRegistry()
+    replicas = _Replicas(on_request=lambda: order.append("purge"))
     repository = _FakeWorkspaceRepository(model=_Model())
-    clients: dict = {}
-
-    def _client_for(base_url: str = _DEFAULT_RUNTIME, **_: t.Any):
-        client = clients.get(base_url)
-        if client is None:
-            client = _FakeRuntimeClient(base_url=base_url)
-            clients[base_url] = client
-        return client
 
     class _TrackingLeaseBinder(_FakeLeaseBinder):
         async def release(self, record):
@@ -142,18 +158,11 @@ def wired(monkeypatch):
             return await _FakeRegistry.purge_all_for_workspace(self, **kwargs)
 
     registry = _TrackingRegistry()
-
-    class _TrackingClient(_FakeRuntimeClient):
-        async def post(self, path: str, payload: dict) -> dict:
-            order.append("purge")
-            return await _FakeRuntimeClient.post(self, path, payload)
-
-    def _tracking_client_for(base_url: str = _DEFAULT_RUNTIME, **_: t.Any):
-        client = clients.get(base_url)
-        if client is None:
-            client = _TrackingClient(base_url=base_url)
-            clients[base_url] = client
-        return client
+    client = RuntimeClient(
+        base_url=_DEFAULT_RUNTIME,
+        transport=httpx.MockTransport(replicas.handler),
+        fleet=_UnknownFleet(),
+    )
 
     monkeypatch.setattr(
         "src.environments.lease_binder.get_lease_binder", lambda: lease_binder
@@ -161,16 +170,14 @@ def wired(monkeypatch):
     monkeypatch.setattr(
         "src.workspace.manager.get_environment_registry", lambda: registry
     )
+    monkeypatch.setattr("src.workspace.manager.get_runtime_client", lambda: client)
     monkeypatch.setattr(
-        "src.workspace.manager.get_runtime_client",
-        lambda: _tracking_client_for(_DEFAULT_RUNTIME),
+        "src.workspace.manager.get_operation_recorder", lambda: MemoryRecorder()
     )
-    monkeypatch.setattr("src.runtime.client.RuntimeClient", _tracking_client_for)
     monkeypatch.setattr(
         WorkspaceManager, "_repository", staticmethod(lambda: repository)
     )
-    _ = _client_for  # kept for symmetry; the tracking variant is what is wired
-    return WorkspaceManager(), lease_binder, registry, repository, clients, order
+    return WorkspaceManager(), lease_binder, registry, repository, replicas, order
 
 
 # ── Ordering ───────────────────────────────────────────────────────────────
@@ -191,7 +198,7 @@ async def test_leases_are_released_before_anything_touches_the_files(wired):
 
 
 async def test_every_step_is_reported(wired):
-    manager, lease_binder, _registry, repository, _clients, _order = wired
+    manager, lease_binder, _registry, repository, _replicas, _order = wired
     lease_binder.records = [
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/prod"),
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/dev"),
@@ -216,7 +223,7 @@ async def test_purge_is_broadcast_to_every_lease_holder(wired):
     Sending the purge only to whichever replica answered is why deletion could
     "succeed" while the working copy stayed on disk somewhere else.
     """
-    manager, lease_binder, _registry, _repo, clients, _order = wired
+    manager, lease_binder, _registry, _repo, replicas, _order = wired
     lease_binder.records = [
         _Record(
             lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/prod", runtime_addr="replica-a:8002"
@@ -228,20 +235,43 @@ async def test_purge_is_broadcast_to_every_lease_holder(wired):
 
     result = await manager.delete(_WORKSPACE, _TENANT, _USER)
 
-    assert set(clients) == {
+    assert set(replicas.calls) == {
         _DEFAULT_RUNTIME,
         "http://replica-a:8002",
         "http://replica-b:8002",
     }
     assert result["replicas_purged"] == 3
-    for client in clients.values():
-        assert client.calls
-        assert client.calls[0][1] == "/internal/env-control/workspace/hard-purge"
+    for calls in replicas.calls.values():
+        assert calls[0][0] == "/internal/env-control/workspace/hard-purge"
+
+
+async def test_purge_reaches_every_live_replica_not_just_holders(wired, monkeypatch):
+    """A copy can outlive its lease, so live replicas holding no lease count too."""
+    manager, lease_binder, _registry, _repo, replicas, _order = wired
+
+    class _KnownFleet(_UnknownFleet):
+        async def view(self) -> FleetView:
+            return FleetView(
+                known=True,
+                addrs=("http://replica-a:8002", "http://replica-c:8002"),
+                leases_by_addr={},
+            )
+
+    from src.workspace import manager as manager_module
+
+    client = manager_module.get_runtime_client()
+    monkeypatch.setattr(client, "_fleet", _KnownFleet())
+    lease_binder.records = []
+
+    result = await manager.delete(_WORKSPACE, _TENANT, _USER)
+
+    assert set(replicas.calls) == {"http://replica-a:8002", "http://replica-c:8002"}
+    assert result["replicas_purged"] == 2
 
 
 async def test_duplicate_holder_addresses_are_dispatched_once(wired):
     """Several leases on one replica are still one purge."""
-    manager, lease_binder, _registry, _repo, clients, _order = wired
+    manager, lease_binder, _registry, _repo, replicas, _order = wired
     lease_binder.records = [
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/prod", runtime_addr="a:8002"),
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/dev", runtime_addr="a:8002"),
@@ -249,19 +279,17 @@ async def test_duplicate_holder_addresses_are_dispatched_once(wired):
 
     await manager.delete(_WORKSPACE, _TENANT, _USER)
 
-    assert set(clients) == {_DEFAULT_RUNTIME, "http://a:8002"}
+    assert set(replicas.calls) == {_DEFAULT_RUNTIME, "http://a:8002"}
+    assert len(replicas.calls["http://a:8002"]) == 1
 
 
 async def test_one_unreachable_replica_does_not_block_the_deletion(wired):
     """Otherwise a single dead replica would make a workspace undeletable."""
-    manager, lease_binder, _registry, repository, clients, _order = wired
+    manager, lease_binder, _registry, repository, replicas, _order = wired
     lease_binder.records = [
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/prod", runtime_addr="dead:8002")
     ]
-
-    # Pre-create the failing client so the manager reuses it.
-    failing = _FakeRuntimeClient(base_url="http://dead:8002", fail_urls=("http://dead:8002",))
-    clients["http://dead:8002"] = failing
+    replicas.dead.add("http://dead:8002")
 
     result = await manager.delete(_WORKSPACE, _TENANT, _USER)
 
@@ -280,7 +308,7 @@ async def test_unreadable_redis_does_not_report_zero_leases(wired):
     The deletion still proceeds — a workspace nobody can delete while Redis is
     down is worse — but the ambiguity is surfaced instead of hidden.
     """
-    manager, lease_binder, _registry, repository, clients, _order = wired
+    manager, lease_binder, _registry, repository, replicas, _order = wired
     lease_binder.records = None  # no verdict
 
     result = await manager.delete(_WORKSPACE, _TENANT, _USER)
@@ -289,12 +317,12 @@ async def test_unreadable_redis_does_not_report_zero_leases(wired):
     assert lease_binder.released == []
     # Deletion completed, and the default replica was still purged.
     assert repository.purged == [_WORKSPACE]
-    assert set(clients) == {_DEFAULT_RUNTIME}
+    assert set(replicas.calls) == {_DEFAULT_RUNTIME}
 
 
 async def test_lease_release_failure_is_counted_honestly(wired):
     """A lost compare-and-swap means somebody else holds it now."""
-    manager, lease_binder, _registry, _repo, _clients, _order = wired
+    manager, lease_binder, _registry, _repo, _replicas, _order = wired
     lease_binder.records = [
         _Record(lease_key=f"{_TENANT}/{_WORKSPACE}/{_USER}/prod")
     ]
@@ -309,13 +337,13 @@ async def test_lease_release_failure_is_counted_honestly(wired):
 
 async def test_remote_repository_is_never_deleted(wired):
     """The requirement, asserted on the wire: no payload may ask for it."""
-    manager, _lease_binder, _registry, _repo, clients, _order = wired
+    manager, _lease_binder, _registry, _repo, replicas, _order = wired
 
     result = await manager.delete(_WORKSPACE, _TENANT, _USER)
 
     assert result["git_remote_preserved"] is True
-    for client in clients.values():
-        for _url, path, payload in client.calls:
+    for calls in replicas.calls.values():
+        for path, payload in calls:
             assert "delete_remote" not in payload
             assert "delete-remote" not in path
             assert "git_repo_url" not in payload
@@ -333,7 +361,7 @@ async def test_delete_signature_has_no_remote_switch():
 
 
 async def test_unknown_workspace_is_a_404_before_any_teardown(wired):
-    manager, lease_binder, registry, repository, clients, _order = wired
+    manager, lease_binder, registry, repository, replicas, _order = wired
     repository.model = None
 
     with pytest.raises(WorkspaceNotFoundError):
@@ -341,16 +369,4 @@ async def test_unknown_workspace_is_a_404_before_any_teardown(wired):
 
     assert lease_binder.released == []
     assert registry.calls == []
-    assert clients == {}
-
-
-# ── Address parsing ──────────────────────────────────────────────────────
-
-
-def test_runtime_url_of_handles_every_heartbeat_form():
-    assert _runtime_url_of("replica-a:8002") == "http://replica-a:8002"
-    assert _runtime_url_of("http://replica-a:8002") == "http://replica-a:8002"
-    assert _runtime_url_of("https://replica-a:8002/") == "https://replica-a:8002"
-    # Unusable addresses are skipped rather than dispatched to.
-    assert _runtime_url_of("") == ""
-    assert _runtime_url_of("   ") == ""
+    assert replicas.calls == {}

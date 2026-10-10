@@ -392,7 +392,11 @@ class SessionManager:
             user_id=user_id,
             title=title or f"Chat {session_id[:8]}",
             mode=InteractionMode(mode),
-            execution_style=ExecutionStyle.from_value(execution_style),
+            # Empty means the client did not choose; the configured default
+            # applies (agent.default_execution_style), not a hard-coded one.
+            execution_style=ExecutionStyle.from_value(
+                execution_style or settings.default_execution_style
+            ),
             scenario=scenario,
         )
         self._cache_session(session)

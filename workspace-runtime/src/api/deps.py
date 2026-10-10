@@ -120,7 +120,7 @@ def _check_lease_state(
     user_id: str,
     environment: str,
 ) -> None:
-    """The lease-aware gate on every working-copy request (P4a).
+    """The lease-aware gate on every working-copy request.
 
     With the lease subsystem enabled, exactly ONE runtime holds each working
     copy, and the gateway routes to that holder. Two situations need a verdict

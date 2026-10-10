@@ -177,13 +177,13 @@ class ServiceTopology(BaseModel):
 
     gateway: dict[str, str] = {}
     agent: dict[str, str] = {}
-    # runtime: workspace-runtime, the merged owner of working copies (P3).
+    # runtime: workspace-runtime, the merged owner of working copies.
     runtime: dict[str, str] = {}
-    # control: control-service, the control plane (P5).
+    # control: control-service, the control plane.
     control: dict[str, str] = {}
-    # identity: identity-service, the global identity/authz source (P2).
+    # identity: identity-service, the global identity/authz source.
     identity: dict[str, str] = {}
-    # egress_proxy / egress_dns: the sandbox egress plane (P6b). Only populated
+    # egress_proxy / egress_dns: the sandbox egress plane. Only populated
     # by profiles that also deploy the NetworkPolicies making the proxy a
     # sandbox's ONLY outbound path.
     egress_proxy: dict[str, str] = {}
@@ -228,7 +228,7 @@ class LoggingConfig(BaseModel):
 
 
 class CellsConfig(BaseModel):
-    """Cell topology declarations (design 03 §2, P7).
+    """Cell topology declarations (design 03 §2).
 
     These describe the SHAPE of the installation, not this instance's identity —
     that comes from ``DATACODE_CELL_ID`` (see :mod:`datacode_common.cell`), so a

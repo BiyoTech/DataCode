@@ -1,4 +1,4 @@
-"""Workspace lease client (design 03 §3.3, design 06 P4a).
+"""Workspace lease client (design 03 §3.3).
 
 The holder side of the lease: it proves and defends this instance's exclusive
 ownership of a working copy, and publishes the capacity that lets the

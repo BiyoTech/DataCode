@@ -31,12 +31,12 @@ path in the platform does (see ``registry.destroy``). An archived row whose
 branch still exists is therefore in its expected state, not an unfinished
 cleanup.
 
-P5: the four "parties" are reached through the HTTP binders — Git and the
+The four "parties" are reached through the HTTP binders — Git and the
 SQLMesh engine live inside workspace-runtime, deployments inside the runtime's
 Dagster data plane. The reconciler itself stays free of filesystem access,
 exactly like the rest of the control plane.
 
-P8: two more parties, completing the design's five-way reconciliation (§05.5.1).
+Two further parties complete the design's five-way reconciliation (§05.5.1).
 
 * the LEASE party (``src.environments.lease_binder``) is read straight from
   Redis, which the control plane already speaks for its environment locks;
@@ -90,7 +90,7 @@ DRIFT_STALE_RESOURCES = "stale_resources"
 DRIFT_PRESERVED_REMOTE_BRANCH = "preserved_remote_branch"
 DRIFT_MISSING_DEPLOYMENT = "missing_deployment"
 DRIFT_STALE_DEPLOYMENT = "stale_deployment"
-# Lease and sandbox parties (design 05 §5.1, landed in P8).
+# Lease and sandbox parties (design 05 §5.1).
 DRIFT_ORPHAN_LEASE = "orphan_lease"
 DRIFT_STALE_LEASE = "stale_lease"
 DRIFT_LEASE_SPLIT_BRAIN = "lease_split_brain"
@@ -158,7 +158,7 @@ class ReconcileReport:
     # as "no environments exist".
     sqlmesh_reachable: t.Optional[bool] = None
     dagster_reachable: t.Optional[bool] = None
-    # Same contract for the two parties added in P8: None = no verdict drawn.
+    # Same contract for the lease and sandbox parties: None = no verdict drawn.
     lease_readable: t.Optional[bool] = None
     sandbox_readable: t.Optional[bool] = None
     environments_checked: int = 0

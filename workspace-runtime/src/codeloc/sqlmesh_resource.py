@@ -9,9 +9,8 @@ It intentionally holds no SQLMesh state itself — the runtime owns the Context
 Pool. This keeps the code location process lightweight and avoids loading a
 second SQLMesh engine.
 
-P3/P5 NOTE: the upstream used to be the standalone sqlmesh-service. That
-service is gone; the engine now lives in workspace-runtime (port 8002), which
-the code-location launcher injects as ``WORKSPACE_RUNTIME_URL``.
+The upstream address is injected by the code-location launcher as
+``WORKSPACE_RUNTIME_URL`` (port 8002).
 """
 
 from __future__ import annotations

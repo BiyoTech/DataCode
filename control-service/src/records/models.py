@@ -1,9 +1,9 @@
-"""Operational record tables landed with P5 (design 06).
+"""Operational record tables (design 06).
 
 * ``task_records`` — the cross-service registry of long-running operations
-  (plan/apply/promote). P4b kept the runtime-side tracker process-local; this
-  table is where the CONTROL plane archives the outcome so any replica can
-  answer "what happened to task X" after the one that ran it is gone.
+  (plan/apply/promote). The runtime-side tracker is process-local; this table
+  is where the CONTROL plane archives the outcome so any replica can answer
+  "what happened to task X" after the one that ran it is gone.
 * ``lease_history`` — append-only audit of lease placement decisions. The live
   lease table lives in Redis (the runtime's placement channel); history lives
   here because it outlives every lease and feeds capacity analytics.

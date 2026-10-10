@@ -3,11 +3,11 @@
 Why a module rather than an inline ``alembic upgrade head``: the platform's
 base tables (workspaces, environments, credentials, events) are owned by the
 ORM metadata — alembic's 0001 is an empty baseline on purpose — so ``alembic
-upgrade head`` alone creates NOTHING. Before P5's ownership split both
-control-service and workspace-runtime ran ``create_all`` against the shared
-database, and the tables appeared whichever service won the race; runtime no
-longer creates them (see its ``src/workspace/database.py``), so this entry
-point is what every deployment's migrate step runs BEFORE any service starts:
+upgrade head`` alone creates NOTHING. Table ownership is exclusive —
+workspace-runtime does not create the control tables (see its
+``src/workspace/database.py``), precisely so two services cannot race to
+create them — so this entry point is what every deployment's migrate step runs
+BEFORE any service starts:
 
 * dev:           scripts/dev-lib.sh ``run_db_migrations``
 * compose:       the one-shot ``migrate`` service (stack and cell stacks)

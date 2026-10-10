@@ -259,7 +259,7 @@ def try_uid_separation(target_uid: int) -> bool:
 def platform_secret_names(env: Optional[Mapping[str, str]] = None) -> list[str]:
     """List variables in ``env`` that must never reach a child.
 
-    Used by tests and by the security verification script (design 06 P6): the
+    Used by tests and by the security verification script (design 06): the
     assertion "no platform credential is visible in the sandbox" needs a
     concrete list to check against, and deriving it here keeps that list from
     diverging from what the platform actually sets.

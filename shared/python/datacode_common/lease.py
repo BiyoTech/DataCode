@@ -401,7 +401,7 @@ def decode_runtime_heartbeat(raw: str) -> RuntimeHeartbeat | None:
         return None
 
 
-# ── Tenant lease quota snapshot (P8) ──────────────────────────────────────
+# ── Tenant lease quota snapshot ──────────────────────────────────────
 # control-service is the quota authority (it owns tenant_quotas) but the
 # lease-acquire path runs on workspace-runtime and must not call a database on
 # it. The control plane therefore PUBLISHES the lease-relevant limits to Redis
@@ -544,7 +544,7 @@ def runtime_index_redis_key() -> str:
 
 
 def tenant_quota_redis_key(tenant_id: str) -> str:
-    """Redis key holding one tenant's lease-quota overrides (P8).
+    """Redis key holding one tenant's lease-quota overrides.
 
     Written by control-service (the quota authority), read by the runtime's
     acquire path. Carries a TTL so a dead control plane degrades to
@@ -558,7 +558,7 @@ def tenant_quota_redis_key(tenant_id: str) -> str:
 
 
 def quota_defaults_redis_key() -> str:
-    """Redis key holding the platform-wide default lease quotas (P8).
+    """Redis key holding the platform-wide default lease quotas.
 
     Applied to tenants that have no ``tenant_quotas`` row — the enforcement
     layer resolves defaults, not the schema.

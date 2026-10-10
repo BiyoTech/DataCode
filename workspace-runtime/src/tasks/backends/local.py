@@ -1,4 +1,4 @@
-"""Local task backend — one hardened child process per task (design 06 P6a).
+"""Local task backend — one hardened child process per task (design 06).
 
 The development and single-node vehicle. It provides the SAME contract as the
 Kubernetes backend (spec file in, structured result on stdout) so both dev and

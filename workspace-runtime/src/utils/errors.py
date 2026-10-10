@@ -63,7 +63,7 @@ class ErrorCode(str, Enum):
     # A dependency or subsystem this request needs is not running. Distinguished
     # from INTERNAL_ERROR so callers (gateway) can degrade rather than retry.
     SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
-    # Tenant-level resource quota exhausted (P8): 429 + Retry-After.
+    # Tenant-level resource quota exhausted: 429 + Retry-After.
     QUOTA_EXCEEDED = PlatformErrorCode.QUOTA_EXCEEDED.value
     # ── Platform contract codes (design 08 §7) ──────────────────────────
     # Literals are aliased from the shared contract module rather than
@@ -468,7 +468,7 @@ class TimeoutError(ServiceError):
 
 
 class QuotaExceededError(ServiceError):
-    """A tenant-level resource quota was reached (design 06 P8).
+    """A tenant-level resource quota was reached (design 06).
 
     Raised on the lease-acquire path when the tenant holds its ceiling of
     concurrent leases (or occupies its ceiling of runtime replicas). 429 rather

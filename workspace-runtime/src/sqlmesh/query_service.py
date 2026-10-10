@@ -1,6 +1,6 @@
 """Query service - safe ad-hoc SQL execution.
 
-P6 close-out: execution runs in the executor sandbox. The LIMIT is applied
+execution runs in the executor sandbox. The LIMIT is applied
 with sqlglot INSIDE the sandbox (no string concatenation), bounded by the
 platform's max row limit, and the sandbox's warehouse connection is the
 working copy's own gateway — never a platform credential.

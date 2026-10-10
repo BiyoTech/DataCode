@@ -1,8 +1,8 @@
-"""Tenant quota enforcement (design 06 P8 — the implementation half).
+"""Tenant quota enforcement (design 06 — the implementation half).
 
-The schema for ``tenant_quotas`` / ``tenant_usage`` landed with P5; this module
-is the enforcement that compares live usage against the limits and rejects the
-request with 429 + ``Retry-After`` when a tenant has exhausted one.
+Over the schema in :mod:`src.quota.models`, this module is the enforcement
+that compares live usage against the limits and rejects the request with
+429 + ``Retry-After`` when a tenant has exhausted one.
 
 Design decisions worth pinning
 ------------------------------

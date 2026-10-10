@@ -233,7 +233,7 @@ class WorkingCopy:
 
     @property
     def lease_key(self) -> str:
-        """The unit of single-writer ownership (design 03 §3.3, P4).
+        """The unit of single-writer ownership (design 03 §3.3).
 
         One lease per working copy, so the key is exactly the working-copy
         identity minus the base path — see :func:`lease_key` for why it is
@@ -296,7 +296,7 @@ def _safe(value: str) -> str:
     return re.sub(r"[^0-9a-zA-Z_]", "_", value or "").lower()
 
 
-# ── workspace lease identity (design 03 §3.3, P4) ─────────────────────────
+# ── workspace lease identity (design 03 §3.3) ─────────────────────────
 
 # Segments of a lease key. ``/`` is used because no segment may contain it
 # (tenant/workspace/user are path segments and environment names are

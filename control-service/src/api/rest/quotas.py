@@ -1,9 +1,9 @@
 """Quota endpoint — "what am I allowed, and what am I using?" (contract 08 §2).
 
-P8 landed quota ENFORCEMENT: a tenant at its ceiling is rejected with 429 and a
-structured payload. What was missing is the other half — a user who hit that
-rejection had no way to see their budget, and neither did whoever they asked for
-help. This endpoint is that view.
+Enforcement (:mod:`src.quota.service`) rejects a tenant at its ceiling with 429
+and a structured payload. This endpoint is the other half: without it a user
+who hit that rejection had no way to see their budget, and neither did whoever
+they asked for help.
 
 Scope is the caller's own tenant, always
 ----------------------------------------

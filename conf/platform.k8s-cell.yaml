@@ -53,8 +53,11 @@ redis:
 workspace:
   # The per-replica ReadWriteOnce PVC mounted by the workspace-runtime
   # StatefulSet (design 07 ADR-003: persisted local disk, never a shared RWX
-  # volume). Must match WORKSPACE_RUNTIME_MATERIALIZE_ROOT in that manifest.
-  base_path: "/var/lib/datacode/workcopies"
+  # volume). Must match WORKSPACE_RUNTIME_MATERIALIZE_ROOT in that manifest —
+  # which sets the same path via env, so this value never actually reached the
+  # process while the two disagreed (`workcopies` here, `workspaces` there).
+  # A dead value that looks authoritative is worse than no value.
+  base_path: "/var/lib/datacode/workspaces"
 
 services:
   gateway:
@@ -82,9 +85,9 @@ services:
   egress_proxy:
     url: "http://egress-proxy.datacode-tasks.svc.cluster.local:3128"
   # The controlled resolver for Pods whose isolation profile declares
-  # `dns_policy: None` — without it such a Pod has NO resolver at all. This is
-  # the ClusterIP of the egress-dns Service; read it from the applied Service
-  # (`kubectl -n datacode-tasks get svc egress-dns`) and set it here, because a
-  # ClusterIP is assigned by the cluster and cannot be predicted.
+  # `dns_policy: None` — without it such a Pod has NO resolver at all. A Service
+  # NAME, not an IP: a ClusterIP is assigned by the cluster and cannot be
+  # predicted, so workspace-runtime resolves this name to the ClusterIP when it
+  # builds a sandbox Pod (Pod dnsConfig only accepts IPs).
   egress_dns:
-    address: "10.96.0.53"
+    host: "egress-dns.datacode-tasks.svc.cluster.local"

@@ -1,4 +1,4 @@
-"""Workspace provisioning — the filesystem side of workspace lifecycle (P5).
+"""Workspace provisioning — the filesystem side of workspace lifecycle.
 
 The control plane (control-service) owns the database rows and the environment
 state machine; every operation that touches the filesystem or Git runs HERE, in
@@ -6,7 +6,7 @@ the runtime, reached through the ``/internal/env-control/workspace/*`` API. This
 split is what makes control-service free of filesystem access and freely
 horizontally scalable.
 
-Ported from the legacy sqlmesh-service WorkspaceManager (P5): the DB logic
+Ported from the legacy sqlmesh-service WorkspaceManager: the DB logic
 stayed in control-service, the disk/Git logic lives in this module.
 """
 

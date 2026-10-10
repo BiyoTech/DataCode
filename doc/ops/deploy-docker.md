@@ -8,10 +8,16 @@ profile with `DATACODE_ENV` — the same mechanism as host dev and Kubernetes.
 |---|---|---|
 | Infrastructure | `make infra` | PostgreSQL + Redis (+ Gitea) only |
 | Single-machine | `make up` | ALL eight services in containers |
-| + Dagster | `make dagster-up` | Webserver + daemon + sync, stackable on the above |
-| Lease verification | `make data-plane-up` | The P4a shape; for `scripts/verify/verify-lease-routing.py` |
+| + Dagster | `make dagster-up` | Webserver + daemon + sync, stackable on `make up` only |
+| Lease verification | `make data-plane-up` | The P4a shape; for `scripts/verify/verify-lease-routing.py` — not a deployment target |
 | Global tier | `make global-up` | Identity + global-pg (P7) |
-| Cell | `make cell-up` | A complete cell (P7; needs `global-up` first) |
+| Cell | `make cell-up CELL=cell-0` | A complete cell (P7; needs `global-up` first) |
+
+Every stack takes its secrets from the truth files under `.data/`, which
+`make` injects (see `deploy/README.md`). The compose files REQUIRE those
+variables rather than defaulting them, so a bare `docker compose` run must
+export them itself — `scripts/stack-secrets.sh print` emits the two that are
+not the password or the JWT secret.
 
 ## Single-machine all-container stack
 
@@ -45,6 +51,14 @@ webserver + daemon + workspace-sync, in the same compose project. The sync
 polls the runtime replicas' `/internal/code-locations` every 15s, so
 workspaces appear in the UI a few seconds after they register.
 
+Merging this file also stands the runtime replicas down to Dagster's `remote`
+mode: without that each replica keeps the per-replica daemon it runs when no
+orchestration plane exists, and every schedule fires once per daemon.
+
+It stacks on `make up` only. A cell's `cell-pg` is created with `POSTGRES_DB`
+alone, and Dagster's storage lives in a separate `dagster` database that only
+`deploy/init-db/init.sql` (the infra/stack postgres) creates.
+
 ## The P7 topology: global tier + cells
 
 Cells are the unit of blast-radius isolation: each owns its database, Redis
@@ -53,19 +67,24 @@ and services; the global tier owns identity alone.
 ```bash
 make global-up                        # global-pg + identity-service (datacode-global network)
 make cell-up                          # cell-0: its own pg/redis + all services, joined to the global network
+make cell-down                        # stop cell-0
+make global-down                      # LAST: cells declare the global network as external
 ```
 
 A second cell on the same host shifts every published port — compose cannot
-do arithmetic, so each port is an explicit variable:
+do arithmetic, so each port is an explicit variable. Env files are layered,
+last definition wins, so the second file overrides only the ports:
 
 ```bash
 cp deploy/.env.cell-1.example deploy/.env.cell-1
-DATACODE_CELL_ID=cell-1 docker compose --env-file deploy/.env.cell-1 \
-  -f deploy/docker-compose.cell.yml -p datacode-cell-1 up -d
+make cell-up CELL=cell-1 ENV_FILES="deploy/.env deploy/.env.cell-1"
+make cell-down CELL=cell-1 ENV_FILES="deploy/.env deploy/.env.cell-1"
 ```
 
-Cell identity arrives via `DATACODE_CELL_ID`; the cell's services share
-`conf/platform.cell.yaml` unchanged.
+Cell identity arrives via `CELL` → `DATACODE_CELL_ID`, which is also the
+compose project name suffix, so the id a service reports and the project it
+runs in cannot disagree. The cell's services share `conf/platform.cell.yaml`
+unchanged.
 
 ## Images
 

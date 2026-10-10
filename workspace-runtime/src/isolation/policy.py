@@ -1,4 +1,4 @@
-"""The runtime's effective isolation policy (design 04 §5, design 06 P6a).
+"""The runtime's effective isolation policy (design 04 §5).
 
 ``conf/isolation-profiles.yaml`` says which profiles the DEPLOYMENT wants;
 this module says which ones THIS PROCESS can execute, and hands the intersection

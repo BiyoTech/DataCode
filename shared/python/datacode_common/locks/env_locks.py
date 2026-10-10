@@ -12,7 +12,7 @@ This module closes that gap: the lock key is ``env:{workspace_id}:{environment}`
 so all members, all gateways and ALL REPLICAS of one environment contend for the
 same lock.
 
-**Cross-service mutual exclusion (P5):** control-service's lifecycle operations
+**Cross-service mutual exclusion:** control-service's lifecycle operations
 and workspace-runtime's apply path hold the SAME key in the SAME Redis namespace
 (``sm:env_lock:...``), so a destroy/create/reconcile cannot rip resources out
 from under a running apply, and vice versa. That is why this implementation is
@@ -56,6 +56,16 @@ When the Redis backend cannot reach the server, acquisitions fall back to the
 in-process registry for that call. That protects callers within one replica
 but NOT across replicas — the situation is logged (rate-limited) as a degraded
 mode rather than silently accepted.
+
+Cross-service participants never choose in-process
+---------------------------------------------------
+"The lease guarantees one writer per working copy, so the lock can be
+in-process" is true of WRITES TO ONE COPY and false of this lock: the other
+contender is control-service, a different process that holds no copy at all.
+A service that declares ``cross_service=True`` therefore refuses an explicit
+``in_memory`` configuration at startup (:meth:`EnvironmentLocks.validate`),
+and logs a degradation to in-process at ERROR rather than INFO — it means
+destroy and apply are no longer mutually exclusive.
 """
 
 from __future__ import annotations
@@ -502,6 +512,10 @@ def environment_lock_key(workspace_id: str, environment: str) -> str:
     return f"env:{workspace_id}:{environment}"
 
 
+class EnvironmentLockConfigError(RuntimeError):
+    """The configured backend cannot provide the exclusion this service needs."""
+
+
 _UNRESOLVED = object()
 
 
@@ -519,6 +533,7 @@ class EnvironmentLocks:
         env_prefix: str,
         config: t.Callable[[], EnvironmentLockConfig],
         busy_error: BusyErrorFactory,
+        cross_service: bool = False,
     ) -> None:
         """
         Args:
@@ -532,6 +547,10 @@ class EnvironmentLocks:
                 import cannot freeze a value the deployment overrides later.
             busy_error: builds the 409 raised on contention, given the
                 environment name and the operation holding the lock.
+            cross_service: this service contends with ANOTHER service for the
+                same keys (control's lifecycle vs the runtime's apply). Such a
+                participant may never be configured in-process: see the module
+                docstring.
         """
         if not env_prefix or not env_prefix.isupper():
             raise ValueError(
@@ -540,6 +559,7 @@ class EnvironmentLocks:
         self._env_var = f"{env_prefix}_ENV_LOCK_BACKEND"
         self._config = config
         self._busy_error = busy_error
+        self._cross_service = cross_service
         self.registry = EnvironmentLockRegistry(busy_error)
         self._backend: object = _UNRESOLVED
         self._backend_init_lock = asyncio.Lock()
@@ -548,6 +568,32 @@ class EnvironmentLocks:
     def backend_env_var(self) -> str:
         """The environment variable that overrides the configured backend."""
         return self._env_var
+
+    @property
+    def cross_service(self) -> bool:
+        """Whether another service contends for the same keys."""
+        return self._cross_service
+
+    def validate(self) -> str:
+        """Check the configured backend at startup; return the effective mode.
+
+        Raises:
+            EnvironmentLockConfigError: a cross-service participant is
+                configured ``in_memory``. Refusing to boot is the only point
+                at which this is visible: at runtime the symptom is a destroy
+                that tears down an environment while an apply is writing it.
+        """
+        mode = self._configured_backend()
+        if self._cross_service and mode == "in_memory":
+            raise EnvironmentLockConfigError(
+                f"environment lock backend is 'in_memory' ({self._env_var} or "
+                "concurrency.env_lock_backend), but this service contends with "
+                "another service for the same environment locks. An in-process "
+                "lock cannot exclude a different process: control-service's "
+                "destroy/repair and workspace-runtime's apply would run "
+                "concurrently on one environment. Use 'redis' (or 'auto')."
+            )
+        return mode
 
     # --- backend selection ------------------------------------------------
 
@@ -568,12 +614,14 @@ class EnvironmentLocks:
         """
         mode = self._configured_backend()
         if mode == "in_memory":
+            self._log_in_process(reason="configured_in_memory")
             return None
 
         if mode not in ("auto", "redis"):
             logger.warning(
                 "environment_lock_unknown_backend_mode", mode=mode, fallback="in_memory"
             )
+            self._log_in_process(reason="unknown_backend_mode")
             return None
 
         from datacode_common.redis import get_redis, redis_available
@@ -582,9 +630,7 @@ class EnvironmentLocks:
         if client is None:
             # Platform-level redis.enabled=false — a configuration decision, not
             # an outage. In-process is the documented consequence.
-            logger.info(
-                "environment_lock_in_process_backend", reason="platform_redis_disabled"
-            )
+            self._log_in_process(reason="platform_redis_disabled")
             return None
 
         ttl = self._config().ttl_seconds
@@ -593,11 +639,7 @@ class EnvironmentLocks:
             ttl = 120
 
         if mode == "auto" and not await redis_available():
-            logger.warning(
-                "environment_lock_in_process_backend",
-                reason="redis_unreachable",
-                impact="across-replica protection is OFF with multiple replicas",
-            )
+            self._log_in_process(reason="redis_unreachable")
             return None
 
         logger.info("environment_lock_redis_backend", ttl_s=ttl)
@@ -615,6 +657,25 @@ class EnvironmentLocks:
                 if self._backend is _UNRESOLVED:
                     self._backend = await self._resolve_backend()
         return self._backend
+
+    def _log_in_process(self, *, reason: str) -> None:
+        """Record that this process will serialize locally only.
+
+        ERROR for a cross-service participant: the other contender is a
+        different process, so "in-process" means there is no exclusion with it
+        at all. INFO otherwise, where it is a legitimate single-process choice.
+        """
+        if self._cross_service:
+            logger.error(
+                "environment_lock_in_process_backend",
+                reason=reason,
+                impact=(
+                    "cross-service exclusion is OFF: lifecycle operations of "
+                    "another service can run concurrently with this one"
+                ),
+            )
+        else:
+            logger.info("environment_lock_in_process_backend", reason=reason)
 
     def reset_backend(self) -> None:
         """Force backend re-resolution. Test isolation only."""

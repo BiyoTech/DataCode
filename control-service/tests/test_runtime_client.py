@@ -17,7 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.runtime.client import RuntimeClient  # noqa: E402
+from src.runtime.client import RuntimeClient, RuntimeTarget  # noqa: E402
+from src.runtime.fleet import FleetView  # noqa: E402
 from src.utils.errors import (  # noqa: E402
     EnvironmentBusyError,
     GitRemoteAccessError,
@@ -26,10 +27,42 @@ from src.utils.errors import (  # noqa: E402
     WorkspaceNotFoundError,
 )
 
+# One working copy and its workspace, for endpoints that must be addressed.
+_COPY = RuntimeTarget(
+    tenant_id="t1", workspace_id="ws-t1-shop", user_id="u1", environment="dev"
+)
+_WS = RuntimeTarget(tenant_id="t1", workspace_id="ws-t1-shop")
+
+
+class _NoFleet:
+    """Coordination off: the Service address is the whole fleet."""
+
+    async def view(self) -> FleetView:
+        return FleetView(known=False)
+
+    def invalidate(self) -> None:
+        pass
+
+
+def _no_redis_router(base_url: str):
+    """A real LeaseRouter with coordination off, so tests never dial Redis."""
+    from datacode_common.lease_routing import LeaseRouter
+
+    async def _none():
+        return None
+
+    return LeaseRouter(fallback_url=base_url, redis_factory=_none)
+
 
 def _client_with(handler) -> RuntimeClient:
     transport = httpx.MockTransport(handler)
-    return RuntimeClient(base_url="http://runtime:8002", transport=transport)
+    base = "http://runtime:8002"
+    return RuntimeClient(
+        base_url=base,
+        transport=transport,
+        router=_no_redis_router(base),
+        fleet=_NoFleet(),
+    )
 
 
 def _error_response(status: int, code: str, message: str, detail=None) -> httpx.Response:
@@ -45,7 +78,7 @@ async def test_translates_busy_environment():
 
     client = _client_with(handler)
     with pytest.raises(EnvironmentBusyError) as excinfo:
-        await client.post("/internal/env-control/git/ensure-worktree", {})
+        await client.post("/internal/env-control/git/ensure-worktree", {}, target=_COPY)
     assert excinfo.value.status_code == 409
 
 
@@ -55,7 +88,11 @@ async def test_translates_workspace_not_found():
 
     client = _client_with(handler)
     with pytest.raises(WorkspaceNotFoundError):
-        await client.get("/internal/env-control/sqlmesh/state-environments")
+        await client.post(
+            "/internal/env-control/sqlmesh/invalidate-virtual-environment",
+            {},
+            target=_WS,
+        )
 
 
 async def test_translates_git_remote_access_denied():
@@ -74,7 +111,7 @@ async def test_translates_git_remote_access_denied():
 
     client = _client_with(handler)
     with pytest.raises(GitRemoteAccessError) as excinfo:
-        await client.post("/internal/env-control/git/push-branch", {})
+        await client.post("/internal/env-control/git/push-branch", {}, target=_COPY)
     detail = excinfo.value.detail
     assert detail["git_error_reason"] == "credential_missing"
     assert excinfo.value.status_code == 422
@@ -104,7 +141,7 @@ async def test_reads_git_fields_inlined_at_the_top_level():
 
     client = _client_with(handler)
     with pytest.raises(GitRemoteAccessError) as excinfo:
-        await client.post("/internal/env-control/git/ensure-repository", {})
+        await client.post("/internal/env-control/git/ensure-repository", {}, target=_COPY)
 
     detail = excinfo.value.detail
     assert detail["git_error_reason"] == "repo_not_found"
@@ -137,7 +174,7 @@ async def test_git_operation_failed_is_not_prefixed_twice():
 
     client = _client_with(handler)
     with pytest.raises(ServiceError) as excinfo:
-        await client.post("/internal/env-control/git/ensure-worktree", {})
+        await client.post("/internal/env-control/git/ensure-worktree", {}, target=_COPY)
 
     error = excinfo.value
     assert error.message == upstream
@@ -157,7 +194,7 @@ async def test_git_error_without_fields_still_yields_a_parseable_reason():
 
     client = _client_with(handler)
     with pytest.raises(ServiceError) as excinfo:
-        await client.post("/internal/env-control/git/ensure-repository", {})
+        await client.post("/internal/env-control/git/ensure-repository", {}, target=_COPY)
     assert excinfo.value.to_response_dict()["git_error_reason"] == "unknown"
 
 
@@ -167,7 +204,7 @@ async def test_translates_unknown_code_to_generic_service_error():
 
     client = _client_with(handler)
     with pytest.raises(ServiceError) as excinfo:
-        await client.post("/internal/env-control/workspace/hard-purge", {})
+        await client.post("/internal/env-control/workspace/provision-remote", {})
     assert not isinstance(excinfo.value, EnvironmentBusyError)
     assert excinfo.value.status_code == 418
 
@@ -178,7 +215,7 @@ async def test_transport_failure_is_retryable_unavailable():
 
     client = _client_with(handler)
     with pytest.raises(RuntimeUnavailableError) as excinfo:
-        await client.get("/internal/env-control/git/members")
+        await client.get("/internal/env-control/git/first-existing", target=_WS)
     assert excinfo.value.status_code == 503
 
 
@@ -188,7 +225,7 @@ async def test_malformed_body_is_unavailable():
 
     client = _client_with(handler)
     with pytest.raises(RuntimeUnavailableError):
-        await client.get("/internal/env-control/git/members")
+        await client.get("/internal/env-control/git/first-existing", target=_WS)
 
 
 async def test_posts_internal_token_header():
@@ -205,7 +242,7 @@ async def test_posts_internal_token_header():
     previous = settings.runtime_internal_token
     settings.runtime_internal_token = "secret-token"
     try:
-        body = await client.post("/internal/env-control/git/ensure-repository", {})
+        body = await client.post("/internal/env-control/git/ensure-repository", {}, target=_COPY)
     finally:
         settings.runtime_internal_token = previous
     assert body == {"ok": True}
@@ -220,4 +257,4 @@ async def test_missing_base_url_is_unavailable():
     # topology yields no URL and every dispatch must fail closed (503).
     client._base_url = ""
     with pytest.raises(RuntimeUnavailableError):
-        await client.get("/internal/env-control/git/members")
+        await client.get("/internal/env-control/git/first-existing", target=_WS)

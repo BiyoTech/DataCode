@@ -35,6 +35,10 @@ def _load_yaml_config(filename: str) -> dict:
     return load_yaml_config(filename, package_file=_CONFIG_FILE)
 
 
+class DagsterContractError(RuntimeError):
+    """The Dagster shape is invalid for the configured execution plane."""
+
+
 class Settings(BaseSettings):
     """workspace-runtime settings (sqlmesh engine + dagster data plane +
     ontology + executor)."""
@@ -43,7 +47,7 @@ class Settings(BaseSettings):
     rest_port: int = 8002
     host: str = "0.0.0.0"
 
-    # ── SQLMesh metadata (P6 close-out: reads go through the sandbox) ──
+    # ── SQLMesh metadata (reads go through the sandbox) ──
     # TTL of the runtime's cached metadata payloads (model lists, metrics,
     # environments, lineage). Explicit dirty/invalidate calls bypass it; the
     # TTL is the backstop for edits made outside our API.
@@ -58,12 +62,6 @@ class Settings(BaseSettings):
     workspace_write_lock_ttl: int = 600
     env_lock_backend: str = "auto"      # auto | redis | in_memory
     env_lock_ttl_seconds: int = 120
-
-    max_environments_per_workspace: int = 20
-    sandbox_default_ttl_hours: int = 168
-    environment_reaper_enabled: bool = True
-    environment_reaper_interval: int = 3600
-    sandbox_expiry_grace_hours: int = 24
 
     task_timeout_seconds: int = 600
     task_ttl_seconds: int = 3600
@@ -149,7 +147,7 @@ class Settings(BaseSettings):
     executor_max_open_files: int = 1024              # RLIMIT_NOFILE
     executor_shell_timeout_seconds: int = 120
 
-    # ── Task execution plane (design 04 §3, design 06 P6a) ─────────────
+    # ── Task execution plane (design 04 §3) ─────────────
     # Where a task that must NOT run in this process is sent. The isolation
     # profile decides WHICH level a task kind needs; this decides whether that
     # level is available at all (see src/isolation/policy.py):
@@ -249,7 +247,7 @@ class Settings(BaseSettings):
 
     # ── Kubernetes task backend ────────────────────────────────────────
     # Namespace the Jobs are created in. Must be the namespace whose
-    # NetworkPolicy denies egress by default (P6b).
+    # NetworkPolicy denies egress by default.
     task_namespace: str = "datacode-tasks"
     task_runner_image: str = "datacode/task-runner:latest"
     task_runner_image_pull_policy: str = "IfNotPresent"
@@ -271,10 +269,13 @@ class Settings(BaseSettings):
     # Seconds a finished Job is kept before Kubernetes reaps it. Long enough to
     # read its logs after a failure, short enough not to accumulate.
     task_job_ttl_seconds: int = 300
-    # Address of the controlled DNS resolver, used for profiles declaring
-    # `dns_policy: None`. Empty downgrades those Pods to ClusterFirst with a
-    # warning: a Pod with dnsPolicy None and no dnsConfig cannot resolve anything
-    # at all, which would look like a network bug rather than a missing setting.
+    # The controlled DNS resolver, used for profiles declaring
+    # `dns_policy: None`: an IP, or a Service DNS name the runtime resolves to
+    # its ClusterIP when building a Pod (a ClusterIP is assigned by the cluster
+    # and cannot be written into config ahead of time). Empty downgrades those
+    # Pods to ClusterFirst with a warning: a Pod with dnsPolicy None and no
+    # dnsConfig cannot resolve anything at all, which would look like a network
+    # bug rather than a missing setting. Inherited from services.egress_dns.host.
     task_dns_server: str = ""
 
     # ── Sandbox network and credentials (design 04 §3.4-3.5, P6b) ───────
@@ -302,14 +303,15 @@ class Settings(BaseSettings):
     # that medium is so the process can refuse a combination that loses data
     # silently (see datacode_common.materialize for the full matrix).
     #
-    # Defaults describe the CURRENT pre-P4 deployment: the shared volume that
-    # sqlmesh-service used, with no lease routing yet. P4b flips these to
-    # instance_local + lease_enabled.
+    # Defaults describe the SINGLE-NODE shape: one replica on one volume, no
+    # lease routing. The Kubernetes manifests override both (instance_local +
+    # leases), which is the only combination the contract accepts for a
+    # multi-replica StatefulSet.
     materialize_root: str = ""          # defaults to workspace_base_path
     materialize_mount_kind: str = "shared"
-    # LRU reclamation (design 06 4b): when the materialize volume crosses the
-    # HIGH watermark, working copies with no lease are discarded (worktree
-    # only; .repo is kept) until usage is back at/below the LOW watermark.
+    # LRU reclamation: when the materialize volume crosses the HIGH watermark,
+    # working copies with no lease are discarded (worktree only; .repo is
+    # kept) until usage is back at/below the LOW watermark.
     # Only meaningful on replica-private media (instance_local) — on a shared
     # volume one replica cannot reclaim another's copies.
     materialize_disk_high_watermark_percent: int = 85
@@ -329,7 +331,7 @@ class Settings(BaseSettings):
     lease_admission_rss_high_watermark: float = 0.80
     lease_idle_release_seconds: int = 1800
     # Retry-After seconds advertised on 429 tenant-quota rejections from the
-    # acquire path (P8). The limits themselves live in control-service and are
+    # acquire path. The limits themselves live in control-service and are
     # read from Redis; only the retry hint is runtime-local.
     lease_quota_retry_after_seconds: int = 60
     # Bounds how much uncommitted work a NON-GRACEFUL crash can lose. This is a
@@ -343,9 +345,13 @@ class Settings(BaseSettings):
     # ── Platform-derived settings (resolved once, explicit value wins) ──
     workspace_base_path: str = ""
     # Self-address handed to code locations and Dagster runs so their SQLMesh
-    # calls come back to this runtime (P3 merged the engine in; the standalone
-    # sqlmesh-service is gone). Resolved from services.runtime.
+    # calls come back to this runtime. Resolved from services.runtime.
     sqlmesh_service_url: str = ""
+    # Control plane address, for the registry writes this service may not
+    # perform itself (see src/environments/registry_client.py). Empty disables
+    # the channel: the writes are audit/bookkeeping and degrade to a warning,
+    # never to a failed business operation.
+    control_service_url: str = ""
     log_level: str = ""
 
     model_config = {"env_prefix": "WORKSPACE_RUNTIME_"}
@@ -370,14 +376,26 @@ class Settings(BaseSettings):
         if not self.workspace_base_path:
             self.workspace_base_path = platform.workspace_base_path
         if not self.materialize_root:
-            # Until P4b splits them, working copies are materialized into the
-            # same tree the platform already declares.
+            # Unset means the two trees coincide: working copies are
+            # materialized into the tree the platform already declares. A
+            # deployment that gives the runtime a private volume sets this.
             self.materialize_root = self.workspace_base_path
         if not self.sqlmesh_service_url:
             # services.runtime, NOT the retired services.sqlmesh: the SQLMesh
             # engine lives in this process, so code locations and Dagster runs
             # must call back here.
             self.sqlmesh_service_url = platform.services.url("runtime", "rest_url")
+        if not self.control_service_url:
+            self.control_service_url = platform.services.url("control", "rest_url")
+        # The sandbox egress plane is declared ONCE, in the platform profile
+        # (services.egress_proxy / services.egress_dns), next to the
+        # NetworkPolicies that make it honest. Without this inheritance the
+        # profile's values had no reader: K8s sandboxes ran with no proxy (no
+        # egress at all) and fell back to the cluster resolver.
+        if not self.egress_proxy_url:
+            self.egress_proxy_url = platform.services.url("egress_proxy", "url")
+        if not self.task_dns_server:
+            self.task_dns_server = platform.services.url("egress_dns", "host")
         self.log_level = (self.log_level or platform.log_level).upper()
         return self
 
@@ -400,6 +418,75 @@ class Settings(BaseSettings):
             distributed_env_lock=self.env_lock_backend.strip().lower()
             in ("auto", "redis"),
         )
+
+    def dagster_contract(self) -> dict:
+        """Validate the Dagster shape against the execution plane, or raise.
+
+        ``task.backend == kubernetes`` means this replica is one of several in a
+        cluster. In that deployment the ``local`` Dagster shape is never
+        correct: every replica would start its own daemon (each schedule fires
+        once per replica), keep run history in a SQLite file under
+        ``dagster_home`` (not on the working-copy volume, so a Pod restart
+        erases it), and run user code as a child of this process — skipping
+        the Pod isolation the code-location contract defines.
+
+        So the contract is: kubernetes task backend ⇒ ``dagster.mode=remote``
+        AND ``code_location_mode=pod`` AND a remote GraphQL URL to reach the
+        orchestration plane. Other backends (``local``, ``disabled``) are
+        single-node shapes and keep any combination.
+
+        Returns the validated shape for the startup log.
+
+        Raises:
+            DagsterContractError: the combination would run a per-replica
+                scheduler or in-process user code in a cluster.
+        """
+        backend = (self.task_backend or "").strip().lower()
+        mode = (self.dagster_mode or "").strip().lower()
+        vehicle = (self.code_location_mode or "").strip().lower()
+        shape = {
+            "task_backend": backend,
+            "dagster_mode": mode,
+            "code_location_mode": vehicle,
+            "daemon_enabled": self.dagster_daemon_enabled and mode != "remote",
+            "webserver_enabled": self.dagster_webserver_enabled and mode != "remote",
+        }
+        if mode not in ("local", "remote"):
+            raise DagsterContractError(
+                f"dagster.mode={self.dagster_mode!r}; expected 'local' or 'remote'"
+            )
+        if vehicle not in ("process", "pod"):
+            raise DagsterContractError(
+                f"dagster.code_location_mode={self.code_location_mode!r}; "
+                "expected 'process' or 'pod'"
+            )
+        if backend != "kubernetes":
+            return shape
+
+        problems: list[str] = []
+        if mode != "remote":
+            problems.append(
+                "dagster.mode must be 'remote': in 'local' mode every replica runs "
+                "its own daemon (schedules fire once per replica) on a SQLite "
+                "instance that does not survive a Pod restart"
+            )
+        if vehicle != "pod":
+            problems.append(
+                "dagster.code_location_mode must be 'pod': 'process' runs user code "
+                "as a child of this service, outside the user-code pool and its "
+                "isolation profile"
+            )
+        if mode == "remote" and not self.dagster_remote_graphql_url.strip():
+            problems.append(
+                "dagster.remote_graphql_url is empty: the orchestration plane's "
+                "webserver is unreachable, so the asset DAG and run status fail"
+            )
+        if problems:
+            raise DagsterContractError(
+                "task.backend='kubernetes' requires the cluster Dagster shape "
+                "(deploy/k8s/base/dagster-orchestrator.yaml): " + "; ".join(problems)
+            )
+        return shape
 
     # ── Shared platform config (read-only) ────────────────────────────
 
@@ -503,110 +590,110 @@ class Settings(BaseSettings):
         return self.code_location_host
 
 
+# Every YAML key below must map to a Settings field, and every key in
+# conf/<service>.yaml must appear here (or in a nested block handled in
+# _flatten_yaml) — tests/test_config_yaml_coverage.py enforces both, so a
+# new key cannot ship silently ignored the way `task.backend` once was.
+_YAML_FIELD_MAPPING = {
+    "server.rest_port": "rest_port",
+    "server.host": "host",
+    "sqlmesh.metadata_cache_ttl_seconds": "metadata_cache_ttl_seconds",
+    "sqlmesh.default_dialect": "sqlmesh_default_dialect",
+    "sqlmesh.query_max_row_limit": "query_max_row_limit",
+    "sqlmesh.query_default_row_limit": "query_default_row_limit",
+    "concurrency.workspace_write_lock_ttl": "workspace_write_lock_ttl",
+    "concurrency.env_lock_backend": "env_lock_backend",
+    "concurrency.env_lock_ttl_seconds": "env_lock_ttl_seconds",
+    "task.timeout_seconds": "task_timeout_seconds",
+    "task.ttl_seconds": "task_ttl_seconds",
+    # Execution plane. These were reachable through the environment
+    # only, so `task.backend` in the YAML was silently ignored and every
+    # deployment ran with the built-in default (`disabled`) — which refuses
+    # every sandboxed task, including `agent.shell`.
+    "task.backend": "task_backend",
+    "task.runner_root": "task_runner_root",
+    "task.max_timeout_seconds": "task_max_timeout_seconds",
+    "task.sandbox_tool_root": "sandbox_tool_root",
+    "task.log_tail_bytes": "task_log_tail_bytes",
+    "task.namespace": "task_namespace",
+    "task.runner_image": "task_runner_image",
+    "task.runner_image_pull_policy": "task_runner_image_pull_policy",
+    "task.service_account": "task_service_account",
+    "task.host_workdir": "task_host_workdir",
+    "task.workcopy_pvc": "task_workcopy_pvc",
+    "task.job_ttl_seconds": "task_job_ttl_seconds",
+    "task.dns_server": "task_dns_server",
+    "deps.index_url": "deps_index_url",
+    "deps.extra_index_urls": "deps_extra_index_urls",
+    "deps.trusted_hosts": "deps_trusted_hosts",
+    "deps.max_bytes": "deps_max_bytes",
+    "deps.install_timeout_seconds": "deps_install_timeout_seconds",
+    "deps.protected_packages": "deps_protected_packages",
+    "deps.relaxable_packages": "deps_relaxable_packages",
+    "deps.allow_source_packages": "deps_allow_source_packages",
+    "error_archive.enabled": "error_archive_enabled",
+    "error_archive.retention": "error_archive_retention",
+    "error_archive.max_sql_len": "error_archive_max_sql_len",
+    "dagster.mode": "dagster_mode",
+    "dagster.code_location_mode": "code_location_mode",
+    "dagster.code_location_container_image": "code_location_container_image",
+    "dagster.code_location_pod_ready_timeout": "code_location_pod_ready_timeout",
+    "dagster.code_location_host": "code_location_host",
+    "dagster.code_location_port": "code_location_port",
+    "dagster.code_location_port_segment_size": "code_location_port_segment_size",
+    "dagster.code_location_port_max_segments": "code_location_port_max_segments",
+    "dagster.code_location_advertise_host": "code_location_advertise_host",
+    "dagster.home": "dagster_home",
+    "dagster.daemon_enabled": "dagster_daemon_enabled",
+    "dagster.webserver_enabled": "dagster_webserver_enabled",
+    "dagster.webserver_host": "dagster_webserver_host",
+    "dagster.webserver_port": "dagster_webserver_port",
+    "dagster.graphql_url": "dagster_graphql_url",
+    "dagster.remote_graphql_url": "dagster_remote_graphql_url",
+    "dagster.process_start_timeout": "process_start_timeout",
+    "dagster.process_stop_timeout": "process_stop_timeout",
+    "dagster.process_health_interval": "process_health_interval",
+    "dagster.process_max_restarts": "process_max_restarts",
+    "dagster.process_restart_window": "process_restart_window",
+    "executor.enabled": "executor_enabled",
+    "executor.mode": "executor_mode",
+    "executor.container_image": "executor_container_image",
+    "executor.container_ready_timeout": "executor_container_ready_timeout",
+    "executor.user_base": "executor_user_base",
+    "executor.socket_dir": "executor_socket_dir",
+    "executor.idle_stop_seconds": "executor_idle_stop_seconds",
+    "executor.max_restarts": "executor_max_restarts",
+    "executor.restart_window_seconds": "executor_restart_window_seconds",
+    "executor.address_space_bytes": "executor_address_space_bytes",
+    "executor.cpu_seconds": "executor_cpu_seconds",
+    "executor.max_processes": "executor_max_processes",
+    "executor.max_file_size_bytes": "executor_max_file_size_bytes",
+    "executor.max_open_files": "executor_max_open_files",
+    "executor.shell_timeout_seconds": "executor_shell_timeout_seconds",
+    "materialize.root": "materialize_root",
+    "materialize.mount_kind": "materialize_mount_kind",
+    "materialize.disk_high_watermark_percent": "materialize_disk_high_watermark_percent",
+    "materialize.disk_low_watermark_percent": "materialize_disk_low_watermark_percent",
+    "materialize.reclaim_interval_seconds": "materialize_reclaim_interval_seconds",
+    "lease.enabled": "lease_enabled",
+    "lease.ttl_seconds": "lease_ttl_seconds",
+    "lease.max_per_instance": "lease_max_per_instance",
+    "lease.admission_rss_high_watermark": "lease_admission_rss_high_watermark",
+    "lease.idle_release_seconds": "lease_idle_release_seconds",
+    "lease.quota_retry_after_seconds": "lease_quota_retry_after_seconds",
+    "materialize.wip_snapshot_interval_seconds": "wip_snapshot_interval_seconds",
+    "materialize.wip_snapshot_skip_if_clean": "wip_snapshot_skip_if_clean",
+    "warm_pool.enabled": "warm_pool_enabled",
+    "warm_pool.max_pods": "warm_pool_max_pods",
+    "warm_pool.max_tasks": "warm_pool_max_tasks",
+    "warm_pool.idle_seconds": "warm_pool_idle_seconds",
+    "warm_pool.ready_timeout": "warm_pool_ready_timeout",
+    "warm_pool.kinds": "warm_pool_kinds",
+}
+
 def _flatten_yaml(data: dict) -> dict:
     """Flatten workspace-runtime YAML keys to pydantic field names."""
-    mapping = {
-        "server.rest_port": "rest_port",
-        "server.host": "host",
-        "sqlmesh.metadata_cache_ttl_seconds": "metadata_cache_ttl_seconds",
-        "sqlmesh.default_dialect": "sqlmesh_default_dialect",
-        "sqlmesh.query_max_row_limit": "query_max_row_limit",
-        "sqlmesh.query_default_row_limit": "query_default_row_limit",
-        "concurrency.workspace_write_lock_ttl": "workspace_write_lock_ttl",
-        "concurrency.env_lock_backend": "env_lock_backend",
-        "concurrency.env_lock_ttl_seconds": "env_lock_ttl_seconds",
-        "environments.max_per_workspace": "max_environments_per_workspace",
-        "environments.sandbox_default_ttl_hours": "sandbox_default_ttl_hours",
-        "environments.reaper_enabled": "environment_reaper_enabled",
-        "environments.reaper_interval": "environment_reaper_interval",
-        "environments.sandbox_expiry_grace_hours": "sandbox_expiry_grace_hours",
-        "task.timeout_seconds": "task_timeout_seconds",
-        "task.ttl_seconds": "task_ttl_seconds",
-        # Execution plane (P6a). These were reachable through the environment
-        # only, so `task.backend` in the YAML was silently ignored and every
-        # deployment ran with the built-in default (`disabled`) — which refuses
-        # every sandboxed task, including `agent.shell`.
-        "task.backend": "task_backend",
-        "task.runner_root": "task_runner_root",
-        "task.max_timeout_seconds": "task_max_timeout_seconds",
-        "task.sandbox_tool_root": "sandbox_tool_root",
-        "task.log_tail_bytes": "task_log_tail_bytes",
-        "task.namespace": "task_namespace",
-        "task.runner_image": "task_runner_image",
-        "task.runner_image_pull_policy": "task_runner_image_pull_policy",
-        "task.service_account": "task_service_account",
-        "task.host_workdir": "task_host_workdir",
-        "task.workcopy_pvc": "task_workcopy_pvc",
-        "task.job_ttl_seconds": "task_job_ttl_seconds",
-        "task.dns_server": "task_dns_server",
-        "deps.index_url": "deps_index_url",
-        "deps.extra_index_urls": "deps_extra_index_urls",
-        "deps.trusted_hosts": "deps_trusted_hosts",
-        "deps.max_bytes": "deps_max_bytes",
-        "deps.install_timeout_seconds": "deps_install_timeout_seconds",
-        "deps.protected_packages": "deps_protected_packages",
-        "deps.relaxable_packages": "deps_relaxable_packages",
-        "deps.allow_source_packages": "deps_allow_source_packages",
-        "error_archive.enabled": "error_archive_enabled",
-        "error_archive.retention": "error_archive_retention",
-        "error_archive.max_sql_len": "error_archive_max_sql_len",
-        "dagster.mode": "dagster_mode",
-        "dagster.code_location_mode": "code_location_mode",
-        "dagster.code_location_container_image": "code_location_container_image",
-        "dagster.code_location_pod_ready_timeout": "code_location_pod_ready_timeout",
-        "dagster.code_location_host": "code_location_host",
-        "dagster.code_location_port": "code_location_port",
-        "dagster.code_location_port_segment_size": "code_location_port_segment_size",
-        "dagster.code_location_port_max_segments": "code_location_port_max_segments",
-        "dagster.code_location_advertise_host": "code_location_advertise_host",
-        "dagster.home": "dagster_home",
-        "dagster.daemon_enabled": "dagster_daemon_enabled",
-        "dagster.webserver_enabled": "dagster_webserver_enabled",
-        "dagster.webserver_host": "dagster_webserver_host",
-        "dagster.webserver_port": "dagster_webserver_port",
-        "dagster.graphql_url": "dagster_graphql_url",
-        "dagster.remote_graphql_url": "dagster_remote_graphql_url",
-        "dagster.process_start_timeout": "process_start_timeout",
-        "dagster.process_stop_timeout": "process_stop_timeout",
-        "dagster.process_health_interval": "process_health_interval",
-        "dagster.process_max_restarts": "process_max_restarts",
-        "dagster.process_restart_window": "process_restart_window",
-        "executor.enabled": "executor_enabled",
-        "executor.mode": "executor_mode",
-        "executor.container_image": "executor_container_image",
-        "executor.container_ready_timeout": "executor_container_ready_timeout",
-        "executor.user_base": "executor_user_base",
-        "executor.socket_dir": "executor_socket_dir",
-        "executor.idle_stop_seconds": "executor_idle_stop_seconds",
-        "executor.max_restarts": "executor_max_restarts",
-        "executor.restart_window_seconds": "executor_restart_window_seconds",
-        "executor.address_space_bytes": "executor_address_space_bytes",
-        "executor.cpu_seconds": "executor_cpu_seconds",
-        "executor.max_processes": "executor_max_processes",
-        "executor.max_file_size_bytes": "executor_max_file_size_bytes",
-        "executor.max_open_files": "executor_max_open_files",
-        "executor.shell_timeout_seconds": "executor_shell_timeout_seconds",
-        "materialize.root": "materialize_root",
-        "materialize.mount_kind": "materialize_mount_kind",
-        "materialize.disk_high_watermark_percent": "materialize_disk_high_watermark_percent",
-        "materialize.disk_low_watermark_percent": "materialize_disk_low_watermark_percent",
-        "materialize.reclaim_interval_seconds": "materialize_reclaim_interval_seconds",
-        "lease.enabled": "lease_enabled",
-        "lease.ttl_seconds": "lease_ttl_seconds",
-        "lease.max_per_instance": "lease_max_per_instance",
-        "lease.admission_rss_high_watermark": "lease_admission_rss_high_watermark",
-        "lease.idle_release_seconds": "lease_idle_release_seconds",
-        "lease.quota_retry_after_seconds": "lease_quota_retry_after_seconds",
-        "materialize.wip_snapshot_interval_seconds": "wip_snapshot_interval_seconds",
-        "materialize.wip_snapshot_skip_if_clean": "wip_snapshot_skip_if_clean",
-        "warm_pool.enabled": "warm_pool_enabled",
-        "warm_pool.max_pods": "warm_pool_max_pods",
-        "warm_pool.max_tasks": "warm_pool_max_tasks",
-        "warm_pool.idle_seconds": "warm_pool_idle_seconds",
-        "warm_pool.ready_timeout": "warm_pool_ready_timeout",
-        "warm_pool.kinds": "warm_pool_kinds",
-    }
-    return flatten_yaml_mapping(data, mapping)
+    return flatten_yaml_mapping(data, _YAML_FIELD_MAPPING)
 
 
 settings = Settings()

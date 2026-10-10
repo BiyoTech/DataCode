@@ -291,3 +291,53 @@ class TestAccounting:
         # The tick completes (a hold decision) despite the broken reporter.
         outcome = await controller.run_once()
         assert outcome.action == "hold"
+
+
+class TestUnreadableHeartbeats:
+    """Redis unreadable must mean "no verdict", never "the fleet is idle".
+
+    The controller derives every input from the heartbeat stream. When that
+    read failed it used to yield an empty list, which is indistinguishable
+    from a healthy-but-idle fleet: utilization 0.0 drove scale-down, and a
+    pending drain's victim looked like it had finished draining. A Redis blip
+    therefore shrank a fleet whose replicas were all serving leases.
+    """
+
+    class _BrokenRedis(FakeRedis):
+        async def smembers(self, key):
+            raise ConnectionError("redis is unreachable")
+
+    async def test_no_scaling_decision_is_made(self):
+        driver = LoggingReplicaDriver(replicas=4)
+        recorder = _Recorder()
+
+        outcome = await _controller(self._BrokenRedis(), driver, recorder).run_once()
+
+        assert outcome.action == "hold"
+        assert outcome.reason == "heartbeats unreadable"
+        assert outcome.desired_replicas == 4
+        assert await driver.current_replicas() == 4
+
+    async def test_a_pending_drain_is_not_mistaken_for_a_finished_one(self):
+        """The victim's heartbeat is "unknown", not "gone"."""
+        driver = LoggingReplicaDriver(replicas=3)
+        recorder = _Recorder()
+        controller = _controller(self._BrokenRedis(), driver, recorder)
+        controller._drain_requested_at["rt-victim"] = datetime.now(timezone.utc)
+
+        outcome = await controller.run_once()
+
+        assert outcome.action == "hold"
+        assert await driver.current_replicas() == 3
+        # Still pending: the drain is resolved once heartbeats are readable.
+        assert "rt-victim" in controller._drain_requested_at
+
+    async def test_usage_and_quotas_are_not_rewritten_from_nothing(self):
+        """Zero usage from an unreadable stream would erase every tenant's count."""
+        driver = LoggingReplicaDriver(replicas=2)
+        recorder = _Recorder()
+
+        await _controller(self._BrokenRedis(), driver, recorder).run_once()
+
+        assert recorder.usage_reports == []
+        assert recorder.publish_calls == 0

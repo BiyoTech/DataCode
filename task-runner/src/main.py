@@ -1,4 +1,4 @@
-"""task-runner entry point — one task, then exit (design 04 §3, P6a).
+"""task-runner entry point — one task, then exit (design 04 §3).
 
 Lifecycle:
 

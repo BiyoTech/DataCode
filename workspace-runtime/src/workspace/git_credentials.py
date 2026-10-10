@@ -7,9 +7,8 @@ diagnose. Every remote operation therefore resolves the credential by the
 remote's HOST, and reports "no credential for this host" as a first-class,
 actionable error instead of falling through to a raw git failure.
 
-Ported from the legacy sqlmesh-service (P3 merge); shared by the env-control
-API (P5), the lease materializer and the Git REST endpoints so every layer
-behaves identically.
+Shared by the env-control API, the lease materializer and the Git REST
+endpoints, so every layer behaves identically.
 """
 
 import typing as t

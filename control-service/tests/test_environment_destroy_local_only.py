@@ -112,7 +112,9 @@ class _FakeGit:
         self.removed_worktrees.append(user_id)
         return True
 
-    async def delete_local_branch(self, *, tenant_id, workspace_id, user_id, branch):
+    async def delete_local_branch(
+        self, *, tenant_id, workspace_id, user_id, environment, branch
+    ):
         self.deleted_local_branches.append(user_id)
         return True
 

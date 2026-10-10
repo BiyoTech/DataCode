@@ -15,6 +15,7 @@ import pytest
 
 from datacode_common.locks import (
     EnvironmentLockConfig,
+    EnvironmentLockConfigError,
     EnvironmentLocks,
     environment_lock_key,
 )
@@ -81,6 +82,39 @@ class TestBackendSelection:
         locks = _locks("TEST_SERVICE")
         monkeypatch.setenv("TEST_SERVICE_ENV_LOCK_BACKEND", "postgres")
         assert await locks._get_backend() is None
+
+
+class TestCrossServiceParticipants:
+    """A lock shared by two services cannot be satisfied in-process.
+
+    The regression: the runtime shipped ``in_memory`` in Kubernetes because
+    the lease makes it the single writer of a working copy — true of the copy,
+    irrelevant to the lock, whose other contender is control-service.
+    """
+
+    def _cross(self, backend: str) -> EnvironmentLocks:
+        return EnvironmentLocks(
+            env_prefix="TEST_SERVICE",
+            config=lambda: EnvironmentLockConfig(backend=backend, ttl_seconds=120.0),
+            busy_error=Busy,
+            cross_service=True,
+        )
+
+    def test_in_memory_is_refused_at_startup(self):
+        with pytest.raises(EnvironmentLockConfigError, match="another service"):
+            self._cross("in_memory").validate()
+
+    def test_the_env_override_is_what_gets_validated(self, monkeypatch):
+        monkeypatch.setenv("TEST_SERVICE_ENV_LOCK_BACKEND", "in_memory")
+        with pytest.raises(EnvironmentLockConfigError):
+            self._cross("redis").validate()
+
+    @pytest.mark.parametrize("backend", ["redis", "auto"])
+    def test_distributed_modes_pass(self, backend):
+        assert self._cross(backend).validate() == backend
+
+    def test_single_service_participants_may_stay_in_process(self):
+        assert _locks(backend="in_memory").validate() == "in_memory"
 
 
 class TestContention:

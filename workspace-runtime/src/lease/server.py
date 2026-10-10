@@ -96,7 +96,7 @@ class LeaseServer:
         """Place a lease and return ``{runtime_id, addr}`` for routing."""
         tenant_id, _workspace_id, _user_id, _environment = split_lease_key(lease_key)
 
-        # Tenant capacity FIRST (P8): a 429 here answers the caller before any
+        # Tenant capacity FIRST: a 429 here answers the caller before any
         # placement work, and a quota verdict must not depend on which
         # instance happened to win. ``None`` = enforcement off for this call.
         guard = await TenantCapacityGuard.load(self._client, lease_key)

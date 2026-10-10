@@ -123,6 +123,9 @@ build workspace-runtime workspace-runtime/Dockerfile "${RUNTIME_BUILD_ARGS[@]}"
 build task-runner      task-runner/Dockerfile "${RUNNER_BUILD_ARGS[@]}"
 build egress-proxy     egress-proxy/Dockerfile
 build frontend         frontend/Dockerfile
+# Cell orchestration plane (deploy/k8s/base/dagster-orchestrator.yaml).
+build dagster-orchestrator    deploy/orchestrator/Dockerfile.dagster
+build dagster-workspace-sync  deploy/orchestrator/Dockerfile
 
 cat <<EOF
 

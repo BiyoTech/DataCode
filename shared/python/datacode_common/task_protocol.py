@@ -1,4 +1,4 @@
-"""task-runner wire protocol — spec in, result out (design 04 §3, P6a).
+"""task-runner wire protocol — spec in, result out (design 04 §3).
 
 The contract between workspace-runtime (which decides what must run and where)
 and task-runner (which runs it inside a sandbox). Deliberately separate from
@@ -25,7 +25,7 @@ What must never be in a spec
 Credentials. The spec is passed as a ConfigMap (not a Secret), it is written to
 audit records, and it is visible to anything that can read the Pod definition.
 Warehouse credentials reach the runner through the environment, injected from a
-per-task Secret (P6b). :meth:`TaskSpec.validate` actively rejects
+per-task Secret. :meth:`TaskSpec.validate` actively rejects
 credential-looking keys rather than trusting every future caller to remember.
 """
 
@@ -141,7 +141,7 @@ class TaskSpec:
             the local backend behaves the same.
         actor_user_id: The user this task is attributed to, for audit.
         gateway: Warehouse gateway name to use, empty for the default.
-        callback_url: Optional progress endpoint (P6b). Progress is
+        callback_url: Optional progress endpoint. Progress is
             best-effort; the result never travels this way.
     """
 

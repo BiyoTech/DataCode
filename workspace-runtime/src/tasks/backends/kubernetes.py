@@ -1,4 +1,4 @@
-"""Kubernetes task backend — one Job per task (design 04 §3, design 06 P6a).
+"""Kubernetes task backend — one Job per task (design 04 §3).
 
 The production vehicle, and the only one that can provide L2/L3-base: those
 levels ARE the container, so nothing here is optional decoration. Every field of
@@ -52,6 +52,43 @@ from src.tasks.credentials import SandboxCredentials
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def resolve_nameserver(configured: str) -> str:
+    """The resolver IP for a sandbox's ``dnsConfig``, or ``""``.
+
+    ``dnsConfig.nameservers`` accepts IPs only, while the stable identity of
+    the controlled resolver is its Service NAME — the ClusterIP is assigned by
+    the cluster and differs per cluster (and per re-creation), so it cannot
+    live in a profile. An IP is returned as-is; a name is resolved here, from
+    the runtime's own namespace where the cluster resolver still works.
+
+    Resolved per Pod, not cached: a re-created Service gets a new ClusterIP,
+    and a stale one would leave every new sandbox with a dead resolver.
+    Blocking (``getaddrinfo``) — callers build manifests in a worker thread.
+    """
+    import ipaddress
+    import socket
+
+    value = (configured or "").strip()
+    if not value:
+        return ""
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(value, 53, type=socket.SOCK_DGRAM)
+    except OSError as exc:
+        logger.error(
+            "task_k8s_dns_resolver_unresolvable", host=value, error=str(exc)
+        )
+        return ""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        for info in infos:
+            if info[0] == family:
+                return str(info[4][0])
+    return ""
 
 # Where the vehicle places the spec and the working copy inside the container.
 SPEC_MOUNT_PATH = "/task"
@@ -570,13 +607,14 @@ class KubernetesBackend(TaskBackend):
         loudly — a Pod with no resolver at all fails every connection, which looks
         like a network bug rather than a missing setting.
         """
-        resolver = (settings.task_dns_server or "").strip()
+        resolver = resolve_nameserver(settings.task_dns_server or "")
         if not resolver:
             logger.warning(
                 "task_k8s_dns_resolver_unset",
-                hint="set task_dns_server to the egress-dns service address; "
-                "falling back to ClusterFirst, which lets a sandbox resolve "
-                "internal service names",
+                configured=settings.task_dns_server or "",
+                hint="set services.egress_dns.host (or task_dns_server) to the "
+                "egress-dns Service; falling back to ClusterFirst, which lets a "
+                "sandbox resolve internal service names",
             )
             return None
         return self._api.V1PodDNSConfig(

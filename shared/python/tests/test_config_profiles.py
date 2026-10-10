@@ -326,5 +326,13 @@ class TestSandboxEgressIsOnlyClaimedWhereEnforced:
         services = raw_yaml("platform.k8s-cell.yaml")["services"]
 
         assert services["egress_proxy"]["url"].endswith(":3128")
-        # A Pod with dns_policy None has NO resolver without this address.
-        assert services["egress_dns"]["address"]
+        # A Pod with dns_policy None has NO resolver without this. A Service
+        # NAME, never an IP: a ClusterIP is cluster-assigned, so a literal IP
+        # here is a guess that is wrong on every other cluster.
+        import ipaddress
+
+        host = services["egress_dns"]["host"]
+        assert host.endswith(".svc.cluster.local")
+        with pytest.raises(ValueError):
+            ipaddress.ip_address(host)
+        assert "address" not in services["egress_dns"]

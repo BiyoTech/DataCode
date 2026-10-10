@@ -1,9 +1,9 @@
-"""Cell identity — a first-class concept from day one (design 03 §2, P1).
+"""Cell identity — a first-class concept from day one (design 03 §2).
 
 A Cell is a complete, self-sufficient platform instance serving a subset of
 tenants. Even while only ONE cell exists, every service instance knows its
 cell id, puts it in every log line, every metric label and every Redis key —
-so scaling from one cell to five (P7) is a deployment action, not a code
+so scaling from one cell to five is a deployment action, not a code
 change.
 
 Resolution order for the cell id:

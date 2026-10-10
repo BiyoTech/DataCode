@@ -1,4 +1,4 @@
-"""SQLMesh binder — the HTTP client for virtual environments (P5).
+"""SQLMesh binder — the HTTP client for virtual environments.
 
 The registry (this service) owns WHEN an environment exists; what that means
 inside the SQLMesh engine is executed by workspace-runtime behind the
@@ -15,6 +15,13 @@ Failures are reported, never raised: a warehouse that is unreachable while a
 branch was created successfully is drift, and drift is a registry state (see
 ``STATUS_DRIFTED``) that the reconciler repairs — not a reason to lose the
 branch.
+
+Addressing
+----------
+All three endpoints reach the engine THROUGH a working copy that the runtime
+locates by scanning its own disk, so they are addressed at the WORKSPACE: any
+replica holding a copy of it can answer, and a replica holding none answers
+404 no matter how healthy it is (see :mod:`src.runtime.routing`).
 """
 
 from __future__ import annotations
@@ -22,7 +29,7 @@ from __future__ import annotations
 import typing as t
 
 from src.environments.git_binder import _ids_from_path
-from src.runtime.client import RuntimeClient, get_runtime_client
+from src.runtime.client import RuntimeClient, RuntimeTarget, get_runtime_client
 from src.utils.errors import RuntimeUnavailableError
 from src.utils.logging import get_logger
 
@@ -63,6 +70,7 @@ class SqlMeshBinder:
                     "base_env": base_env,
                     "gateway": gateway or "",
                 },
+                target=RuntimeTarget(tenant_id=tenant, workspace_id=workspace),
             )
         except Exception as exc:  # noqa: BLE001 - reported as drift, never fatal
             logger.warning(
@@ -96,7 +104,7 @@ class SqlMeshBinder:
         """
         tenant, workspace, _, env = _ids_from_path(workspace_path)
         try:
-            body = await self._client.get(
+            replies = await self._client.get_all(
                 "/internal/env-control/sqlmesh/state-environments",
                 params={
                     "tenant_id": tenant,
@@ -106,6 +114,7 @@ class SqlMeshBinder:
                     "environment": env,
                     "gateway": gateway or "",
                 },
+                target=RuntimeTarget(tenant_id=tenant, workspace_id=workspace),
             )
         except Exception as exc:  # noqa: BLE001 - unknown, not empty
             logger.warning(
@@ -115,12 +124,13 @@ class SqlMeshBinder:
             )
             return None
 
-        environments = body.get("environments")
-        if environments is None:
-            # The runtime could not reach the engine either (or nobody holds a
-            # working copy): no verdict, exactly like a transport failure.
-            return None
-        return set(environments)
+        # Every replica reads the SAME shared state, so the first replica that
+        # actually reached it is authoritative. A replica with no working copy
+        # answers ``environments: null`` — no verdict, not an empty state.
+        for reply in replies:
+            if reply.body is not None and reply.body.get("environments") is not None:
+                return set(reply.body["environments"])
+        return None
 
     async def invalidate_virtual_environment(
         self,
@@ -152,6 +162,9 @@ class SqlMeshBinder:
                     "environment": environment,
                     "gateway": gateway or "",
                 },
+                target=RuntimeTarget(
+                    tenant_id=tenant_id, workspace_id=workspace_id
+                ),
             )
         except RuntimeUnavailableError as exc:
             logger.warning(

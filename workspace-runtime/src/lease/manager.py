@@ -259,7 +259,7 @@ class LeaseManager:
             )
 
     async def begin_drain(self) -> None:
-        """Announce draining, then drain — the controller's remote entry (P8).
+        """Announce draining, then drain — the controller's remote entry.
 
         Split from :meth:`drain` because announcement must not wait for the
         (potentially slow) final snapshots: the draining heartbeat has to be

@@ -1,4 +1,4 @@
-"""Egress policy — what a sandbox may connect to (design 04 §3.4, P6b).
+"""Egress policy — what a sandbox may connect to (design 04 §3.4).
 
 User code has legitimate outbound needs (the customer's warehouse, the Git
 server) and illegitimate ones (the platform's own Postgres, Redis, internal

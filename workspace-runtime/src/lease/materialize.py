@@ -1,4 +1,4 @@
-"""Working-copy materialization — turning a lease into files (design 06 P4).
+"""Working-copy materialization — turning a lease into files (design 06).
 
 There is exactly ONE materialization path, and this module is it:
 

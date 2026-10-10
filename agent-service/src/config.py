@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     memory_summarization: MemorySummarizationConfig = MemorySummarizationConfig()
 
     # Agent configuration
+    # Default autonomy for sessions whose client sends no execution style:
+    # "agent" (autonomous) or "interactive" (confirm each step).
+    default_execution_style: str = "agent"
     max_tool_call_timeout_seconds: int = 600
     # Per-message turn ceiling. Multi-agent handoffs + parallel tool calls + retries
     # consume turns fast; 20 is a balanced fallback. Overridable via conf/.agent config.
@@ -323,6 +326,28 @@ def _apply_llm_env_overrides(models: List[LLMModelConfig]) -> None:
             model.api_key = global_key
 
 
+# Every YAML key below must map to a Settings field, and every key in
+# conf/<service>.yaml must appear here (or in a nested block handled in
+# _flatten_yaml) — tests/test_config_yaml_coverage.py enforces both, so a
+# new key cannot ship silently ignored the way `task.backend` once was.
+_YAML_FIELD_MAPPING = {
+    "server.ws_port": "ws_port",
+    "server.grpc_port": "grpc_port",
+    "server.host": "host",
+    "services.workspace_service_url": "workspace_service_url",
+    "agent.default_execution_style": "default_execution_style",
+    "agent.max_tool_call_timeout_seconds": "max_tool_call_timeout_seconds",
+    "agent.max_turns_per_message": "max_turns_per_message",
+    "agent.shell_auto_install_python": "shell_auto_install_python",
+    "agent.session_cache_max_size": "session_cache_max_size",
+    "agent.workspace_context_cache_max_size": "workspace_context_cache_max_size",
+    "retention.enabled": "retention_enabled",
+    "retention.interval": "retention_interval",
+    "retention.timeline_days": "timeline_retention_days",
+    "retention.memory_event_days": "memory_event_retention_days",
+    "retention.batch_size": "retention_batch_size",
+}
+
 def _flatten_yaml(data: dict) -> dict:
     """Flatten service-specific YAML keys to pydantic field names.
 
@@ -330,23 +355,7 @@ def _flatten_yaml(data: dict) -> dict:
     service URL, and logging are sourced from platform.yaml (see :class:`Settings`
     properties).
     """
-    scalar_mapping = {
-        "server.ws_port": "ws_port",
-        "server.grpc_port": "grpc_port",
-        "server.host": "host",
-        "services.workspace_service_url": "workspace_service_url",
-        "agent.max_tool_call_timeout_seconds": "max_tool_call_timeout_seconds",
-        "agent.max_turns_per_message": "max_turns_per_message",
-        "agent.shell_auto_install_python": "shell_auto_install_python",
-        "agent.session_cache_max_size": "session_cache_max_size",
-        "agent.workspace_context_cache_max_size": "workspace_context_cache_max_size",
-        "retention.enabled": "retention_enabled",
-        "retention.interval": "retention_interval",
-        "retention.timeline_days": "timeline_retention_days",
-        "retention.memory_event_days": "memory_event_retention_days",
-        "retention.batch_size": "retention_batch_size",
-    }
-    result = flatten_yaml_mapping(data, scalar_mapping)
+    result = flatten_yaml_mapping(data, _YAML_FIELD_MAPPING)
 
     # LLM multi-model config (complex nested structure)
     llm_data = data.get("llm")

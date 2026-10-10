@@ -1,10 +1,9 @@
-"""Tenant quota bookkeeping (design 03, landed as schema in P5).
+"""Tenant quota bookkeeping (design 03).
 
 ``tenant_quotas`` carries the LIMITS the platform enforces on a tenant;
 ``tenant_usage`` carries the LIVE counters those limits are compared against.
-Enforcement itself arrives with P8 (配额治理) — P5 only establishes the
-contract both sides compile against, so quota data can start accumulating the
-moment the control plane ships.
+The rules that read them live in :mod:`src.quota.service`; this module is only
+the contract both sides compile against.
 
 All timestamps are stored in UTC.
 """

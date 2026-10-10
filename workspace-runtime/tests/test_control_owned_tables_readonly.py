@@ -1,6 +1,7 @@
 """Ownership contract: this service must never WRITE control-owned tables.
 
-``workspaces`` and ``user_git_credentials`` belong to control-service. Control's
+``workspaces``, ``user_git_credentials``, ``environments`` and
+``environment_events`` belong to control-service. Control's
 migrate step creates them and control's REST API performs every write to them
 (workspace lifecycle in ``control-service/src/workspace``, credential CRUD in
 ``control-service/src/api/rest/git_credentials.py``). This service reads them
@@ -15,6 +16,15 @@ copy kept it. Sixteen dead methods were removed with it. (Control's own routine
 is gone too: workspace deletion is now physical, so no tombstone is left to
 reclaim — which is exactly the kind of divergence a dead copy would have hidden.)
 
+The environment registry joined this contract later and shows the rule in its
+sharpest form. This service READS one row of ``environments`` on the plan /
+apply gate (hot path, tolerates a stale row, cannot corrupt anything) and used
+to WRITE two things: the watermark a successful apply leaves, and the audit row
+a merge produces. Both are facts this service authors, and both are now SENT to
+control-service (``src/environments/registry_client.py``) instead of written
+here — the read stays direct, the write does not. Eleven more dead copies of
+control's repository went with it.
+
 These tests make that boundary structural rather than documented: re-adding a
 write — anywhere, not just in the repository classes — fails here.
 """
@@ -28,15 +38,22 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 REPOSITORY = SRC / "workspace" / "repository.py"
+ENV_REPOSITORY = SRC / "environments" / "repository.py"
 
 # Tables control-service owns. ``file_drafts`` is deliberately absent: this
 # service owns and writes it, and the checks below must not constrain it.
-CONTROL_OWNED_MODELS = {"WorkspaceModel", "UserGitCredentialModel"}
+CONTROL_OWNED_MODELS = {
+    "WorkspaceModel",
+    "UserGitCredentialModel",
+    "EnvironmentModel",
+    "EnvironmentEventModel",
+}
 
 # Methods each read-only repository may expose. The list is a whitelist on
 # purpose: a new read is a decision, and a new write is a contract violation.
 ALLOWED_METHODS = {
     "WorkspaceRepository": {"get_by_id"},
+    "EnvironmentRepository": {"get"},
     "UserGitCredentialRepository": {
         "list_by_user",
         "get_default",
@@ -50,6 +67,7 @@ ALLOWED_METHODS = {
 # even though it is not a write.
 REQUIRED_METHODS = {
     "WorkspaceRepository": {"get_by_id"},
+    "EnvironmentRepository": {"get"},
     "UserGitCredentialRepository": {"get_default", "get_for_host", "get_for_provider"},
 }
 
@@ -63,13 +81,14 @@ def _walks() -> list[tuple[Path, ast.AST]]:
 
 
 def _repositories() -> dict[str, ast.ClassDef]:
-    """The two read-only repository classes, by name."""
-    tree = ast.parse(REPOSITORY.read_text(), filename=str(REPOSITORY))
-    return {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name in ALLOWED_METHODS
-    }
+    """Every read-only repository class over a control-owned table, by name."""
+    found: dict[str, ast.ClassDef] = {}
+    for path in (REPOSITORY, ENV_REPOSITORY):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name in ALLOWED_METHODS:
+                found[node.name] = node
+    return found
 
 
 def _method_names(node: ast.ClassDef) -> set[str]:
@@ -157,3 +176,64 @@ def test_no_insert_of_a_control_owned_row(path: Path) -> None:
                     f"{arg.func.id} row. Control-service owns this table; "
                     "create it through its API instead."
                 )
+
+
+# ── The write channel is the ONLY way these facts reach the registry ──────
+
+
+def test_registry_writes_go_through_the_client_and_nowhere_else() -> None:
+    """Only ``registry_client`` may name the control plane's write endpoints.
+
+    A second caller assembling the same request by hand is how two copies of
+    one contract start drifting — the exact failure this whole module exists
+    to prevent, one layer up.
+    """
+    offenders = []
+    for path, tree in _walks():
+        if path.name == "registry_client.py":
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "/internal/env-registry" in node.value:
+                    offenders.append(f"{path.relative_to(SRC)}:{node.lineno}")
+    assert not offenders, (
+        "these modules address the control plane's registry surface directly: "
+        f"{offenders}. Call src/environments/registry_client.py instead."
+    )
+
+
+def test_the_write_client_never_touches_the_database() -> None:
+    """It is an HTTP client; a session here would defeat its whole purpose."""
+    client = SRC / "environments" / "registry_client.py"
+    tree = ast.parse(client.read_text(), filename=str(client))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = getattr(node, "module", "") or ""
+            names = {alias.name for alias in node.names}
+            assert "database" not in module and "get_session" not in names, (
+                f"{client.name}:{node.lineno} imports database access; this "
+                "module exists precisely so the write does NOT happen locally."
+            )
+
+
+def test_the_apply_watermark_is_not_written_locally() -> None:
+    """``mark_applied`` must send, not UPDATE.
+
+    The watermark is a column of control's ``environments`` table. Writing it
+    here is what the client replaced; a regression would restore two writers
+    on one row.
+    """
+    guard = SRC / "environments" / "guard.py"
+    tree = ast.parse(guard.read_text(), filename=str(guard))
+    func = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "mark_applied"
+    )
+    for node in ast.walk(func):
+        if isinstance(node, ast.Attribute) and node.attr in {"update", "add", "execute"}:
+            pytest.fail(
+                f"guard.py:{node.lineno} mark_applied performs a database write; "
+                "it must call registry_client.mark_applied instead."
+            )

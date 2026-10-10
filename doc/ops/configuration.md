@@ -71,7 +71,7 @@ the same information with symptoms attached.
 | `DB_PASSWORD` | all DB-backed services | nothing connects; a wrong-but-present value crash-loops in ways that look like anything but auth. Locally the value is injected from `.data/postgres_password` (see below), so the shell only needs it on a bare `docker compose` run |
 | `GW_JWT_SECRET` | gateway + identity-service | identity cannot mint tokens, the gateway cannot verify them. ONE value installation-wide; locally injected from `.data/gateway_jwt_secret` (truth file) |
 | `IDENTITY_SERVICE_INTERNAL_TOKEN` | identity + gateway + control | identity's `/internal/*` disabled AND the gateway denies every authorization-requiring route (fail closed) |
-| `WORKSPACE_RUNTIME_INTERNAL_TOKEN` | runtime + gateway + agent + workspace-sync | env-control channel, lease placement/accept/drain and code-location inventory all reject their callers. Without it, agent-service cannot place a lease either, so its calls fall back to the router's degraded path |
+| `WORKSPACE_RUNTIME_INTERNAL_TOKEN` | runtime + gateway + agent + workspace-sync | env-control channel, lease placement/accept/drain and code-location inventory all reject their callers. Without it, agent-service cannot place a lease either, so its calls fall back to the router's degraded path. It is also what the runtime PRESENTS when it sends registry writes to control's `/internal/env-registry/*` — one token for one trust relationship, in both directions; without it those writes degrade to a warning (an apply's watermark and a merge's audit row go unrecorded, nothing fails) |
 | `CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN` | control-service | control cannot dispatch any filesystem or engine side effect. Must equal `WORKSPACE_RUNTIME_INTERNAL_TOKEN` |
 
 ### Optional
