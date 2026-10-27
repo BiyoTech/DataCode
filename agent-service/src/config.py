@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from datacode_common.config.platform import platform_config
-from datacode_common.config.yaml_loader import flatten_yaml_mapping, load_yaml_config
+from datacode_common.config.yaml_loader import (
+    drop_env_provided_keys,
+    flatten_yaml_mapping,
+    load_yaml_config,
+)
 from datacode_common.database.url import build_database_url
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
@@ -97,6 +101,9 @@ class Settings(BaseSettings):
     memory_summarization: MemorySummarizationConfig = MemorySummarizationConfig()
 
     # Agent configuration
+    # Default autonomy for sessions whose client sends no execution style:
+    # "agent" (autonomous) or "interactive" (confirm each step).
+    default_execution_style: str = "agent"
     max_tool_call_timeout_seconds: int = 600
     # Per-message turn ceiling. Multi-agent handoffs + parallel tool calls + retries
     # consume turns fast; 20 is a balanced fallback. Overridable via conf/.agent config.
@@ -122,13 +129,31 @@ class Settings(BaseSettings):
     # Workspace service URL (grpc) — kept as a field since it's not in platform topology.
     workspace_service_url: str = "localhost:50053"
 
+    # ── Session data retention (design 05 §2.3) ─────────────────────────
+    # timeline_events is the highest-frequency append stream the service owns
+    # (~2×10⁶ rows/day per full cell); without expiry it grows monotonically
+    # and page-refresh replay gets slower forever. memory_events is the L1
+    # memory index with a longer window (memory is a longer-lived asset).
+    # 0 disables one table's retention without disabling the loop.
+    retention_enabled: bool = True
+    retention_interval: int = 86400  # daily
+    timeline_retention_days: int = 30
+    memory_event_retention_days: int = 90
+    # Rows deleted per statement: a first pass over a months-old backlog must
+    # not lock the table in one transaction.
+    retention_batch_size: int = 5000
+
     model_config = {"env_prefix": "AGENT_SERVICE_"}
 
     def __init__(self, **kwargs):
-        # Load service-specific YAML first, then let env vars override.
+        # YAML first, then let the environment override it. The env-provided
+        # keys are dropped from the init kwargs because pydantic-settings ranks
+        # the init source ABOVE the env source: passing them would silently
+        # shadow every AGENT_SERVICE_* override a container sets.
         yaml_data = _load_yaml_config("agent-service.yaml")
         yaml_flat = _flatten_yaml(yaml_data)
-        merged = {**yaml_flat, **kwargs}
+        not_from_env = drop_env_provided_keys(yaml_flat, env_prefix="AGENT_SERVICE_")
+        merged = {**not_from_env, **kwargs}
         super().__init__(**merged)
 
     # ── Shared platform config (read-only) ────────────────────────────
@@ -216,20 +241,33 @@ class Settings(BaseSettings):
     # ── Service URLs (from platform topology) ──────────────────────────
 
     @property
-    def sqlmesh_service_url(self) -> str:
-        """SQLMesh service URL from platform topology (env override wins)."""
-        env_val = os.getenv("AGENT_SERVICE_SQLMESH_SERVICE_URL")
+    def runtime_service_url(self) -> str:
+        """workspace-runtime URL from platform topology (env override wins).
+
+        The home of every gated tool call (design 06 P3d) AND of every SQLMesh /
+        Dagster metadata call (P3a-P3c merged those engines in): agent-service
+        neither touches the filesystem nor spawns user processes itself.
+        """
+        env_val = os.getenv("AGENT_SERVICE_RUNTIME_SERVICE_URL")
         if env_val:
             return env_val
-        return self.platform.services.url("sqlmesh", "rest_url")
+        return self.platform.services.url("runtime", "rest_url")
 
     @property
-    def dagster_service_url(self) -> str:
-        """Dagster service URL from platform topology (env override wins)."""
-        env_val = os.getenv("AGENT_SERVICE_DAGSTER_SERVICE_URL")
-        if env_val:
-            return env_val
-        return self.platform.services.url("dagster", "rest_url")
+    def runtime_internal_token(self) -> str:
+        """Shared secret for workspace-runtime's ``/internal/*`` API — env-only.
+
+        Used for ONE call: lease placement, when a working copy this service must
+        reach is held by nobody yet (``/internal/leases/acquire``). Unset means
+        placement is skipped, so a lease miss falls back to the router's degraded
+        path instead of failing — the endpoint is fail-closed and would reject an
+        unauthenticated attempt anyway.
+
+        Deliberately the same variable every other caller of that API uses
+        (gateway, control-service, the Dagster workspace-sync sidecar): one
+        secret per guarded surface, not one per client.
+        """
+        return os.getenv("WORKSPACE_RUNTIME_INTERNAL_TOKEN", "")
 
     # ── Logging (from platform) ────────────────────────────────────────
 
@@ -288,6 +326,28 @@ def _apply_llm_env_overrides(models: List[LLMModelConfig]) -> None:
             model.api_key = global_key
 
 
+# Every YAML key below must map to a Settings field, and every key in
+# conf/<service>.yaml must appear here (or in a nested block handled in
+# _flatten_yaml) — tests/test_config_yaml_coverage.py enforces both, so a
+# new key cannot ship silently ignored the way `task.backend` once was.
+_YAML_FIELD_MAPPING = {
+    "server.ws_port": "ws_port",
+    "server.grpc_port": "grpc_port",
+    "server.host": "host",
+    "services.workspace_service_url": "workspace_service_url",
+    "agent.default_execution_style": "default_execution_style",
+    "agent.max_tool_call_timeout_seconds": "max_tool_call_timeout_seconds",
+    "agent.max_turns_per_message": "max_turns_per_message",
+    "agent.shell_auto_install_python": "shell_auto_install_python",
+    "agent.session_cache_max_size": "session_cache_max_size",
+    "agent.workspace_context_cache_max_size": "workspace_context_cache_max_size",
+    "retention.enabled": "retention_enabled",
+    "retention.interval": "retention_interval",
+    "retention.timeline_days": "timeline_retention_days",
+    "retention.memory_event_days": "memory_event_retention_days",
+    "retention.batch_size": "retention_batch_size",
+}
+
 def _flatten_yaml(data: dict) -> dict:
     """Flatten service-specific YAML keys to pydantic field names.
 
@@ -295,18 +355,7 @@ def _flatten_yaml(data: dict) -> dict:
     service URL, and logging are sourced from platform.yaml (see :class:`Settings`
     properties).
     """
-    scalar_mapping = {
-        "server.ws_port": "ws_port",
-        "server.grpc_port": "grpc_port",
-        "server.host": "host",
-        "services.workspace_service_url": "workspace_service_url",
-        "agent.max_tool_call_timeout_seconds": "max_tool_call_timeout_seconds",
-        "agent.max_turns_per_message": "max_turns_per_message",
-        "agent.shell_auto_install_python": "shell_auto_install_python",
-        "agent.session_cache_max_size": "session_cache_max_size",
-        "agent.workspace_context_cache_max_size": "workspace_context_cache_max_size",
-    }
-    result = flatten_yaml_mapping(data, scalar_mapping)
+    result = flatten_yaml_mapping(data, _YAML_FIELD_MAPPING)
 
     # LLM multi-model config (complex nested structure)
     llm_data = data.get("llm")

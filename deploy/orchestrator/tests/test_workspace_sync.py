@@ -1,0 +1,353 @@
+"""Tests for the control-plane workspace syncer.
+
+Covers the guarantees the data plane depends on: a rendered workspace file Dagster
+can actually load, no spurious reloads, name-collision resolution (a duplicate
+takes the WHOLE workspace down in Dagster, so it must never be written), and the
+failure tolerance that keeps one slow replica from unregistering its deployments.
+"""
+
+import asyncio
+
+import pytest
+import yaml
+
+from datacode_dagster_control_plane.config import ConfigError, SyncerConfig
+from datacode_dagster_control_plane.workspace_sync import (
+    WorkspaceSyncer,
+    _Advertisement,
+    _render_workspace_yaml,
+    _write_atomic,
+)
+
+REPLICA_A = "http://dagster-service-a:8004"
+REPLICA_B = "http://dagster-service-b:8004"
+
+
+@pytest.fixture
+def config(tmp_path):
+    return SyncerConfig(
+        replica_urls=(REPLICA_A, REPLICA_B),
+        internal_token="secret",
+        workspace_file=str(tmp_path / "workspace.yaml"),
+        graphql_url="http://webserver:3000/graphql",
+        poll_interval=0.01,
+        request_timeout=1.0,
+    )
+
+
+def _advertisement(name: str, port: int, *, revision: int = 1, host: str = "host-a"):
+    return {"location_name": name, "host": host, "port": port, "revision": revision}
+
+
+class _FakeSyncer(WorkspaceSyncer):
+    """Syncer with the two network boundaries replaced by in-memory fakes.
+
+    Only ``_fetch`` and the two outbound calls are stubbed; merging, rendering,
+    change detection and tolerance — the logic under test — run for real.
+    """
+
+    def __init__(self, config, payloads, **kwargs):
+        super().__init__(config, **kwargs)
+        # {replica_url: list[dict] | Exception}
+        self.payloads = payloads
+        self.reloads = 0
+        self.heartbeats: list[tuple[str, dict]] = []
+
+    async def _fetch(self, client, replica_url):
+        result = self.payloads.get(replica_url, [])
+        if isinstance(result, BaseException):
+            raise result
+        return [
+            ad
+            for ad in (_Advertisement.parse(item, replica_url) for item in result)
+            if ad is not None
+        ]
+
+    def _client(self):
+        class _NullClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        return _NullClient()
+
+    async def _reload_webserver(self):
+        self.reloads += 1
+
+    async def _acknowledge(self, served):
+        by_replica = {url: {} for url in self._config.replica_urls}
+        for ad in served:
+            by_replica.setdefault(ad.replica_url, {})[ad.location_name] = ad.revision
+        self.heartbeats.extend(by_replica.items())
+
+    def rendered(self) -> dict:
+        from pathlib import Path
+
+        return yaml.safe_load(Path(self._config.workspace_file).read_text())
+
+
+# --- Config ------------------------------------------------------------------
+
+
+def test_config_requires_replica_urls(monkeypatch):
+    monkeypatch.delenv("DATACODE_DATA_PLANE_URLS", raising=False)
+    with pytest.raises(ConfigError):
+        SyncerConfig.from_env()
+
+
+def test_config_rejects_non_http_replica(monkeypatch):
+    monkeypatch.setenv("DATACODE_DATA_PLANE_URLS", "dagster-service:8004")
+    monkeypatch.setenv("DATACODE_INTERNAL_TOKEN", "t")
+    monkeypatch.setenv("DATACODE_DAGSTER_GRAPHQL_URL", "http://ws/graphql")
+    with pytest.raises(ConfigError):
+        SyncerConfig.from_env()
+
+
+def test_config_requires_internal_token(monkeypatch):
+    monkeypatch.setenv("DATACODE_DATA_PLANE_URLS", "http://dagster-service:8004")
+    monkeypatch.delenv("DATACODE_INTERNAL_TOKEN", raising=False)
+    monkeypatch.setenv("DATACODE_DAGSTER_GRAPHQL_URL", "http://ws/graphql")
+    with pytest.raises(ConfigError):
+        SyncerConfig.from_env()
+
+
+def test_config_reads_a_full_environment(monkeypatch):
+    monkeypatch.setenv("DATACODE_DATA_PLANE_URLS", "http://a:8004, http://b:8004/")
+    monkeypatch.setenv("DATACODE_INTERNAL_TOKEN", "t")
+    monkeypatch.setenv("DATACODE_DAGSTER_GRAPHQL_URL", "http://ws/graphql")
+    monkeypatch.setenv("DATACODE_SYNC_INTERVAL_SECONDS", "5")
+
+    cfg = SyncerConfig.from_env()
+    # Trailing slashes stripped so endpoint concatenation cannot double them.
+    assert cfg.replica_urls == ("http://a:8004", "http://b:8004")
+    assert cfg.poll_interval == 5.0
+
+
+# --- Rendering ---------------------------------------------------------------
+
+
+def test_renders_grpc_server_entries():
+    """grpc_server is the only workspace target that names a remote location."""
+    content = _render_workspace_yaml(
+        [_Advertisement("ws__dev", "host-a", 4000, 1, REPLICA_A)]
+    )
+    parsed = yaml.safe_load(content)
+    assert parsed == {
+        "load_from": [
+            {"grpc_server": {"host": "host-a", "port": 4000, "location_name": "ws__dev"}}
+        ]
+    }
+    assert content.startswith("# Generated by")
+
+
+def test_renders_an_empty_workspace_when_nothing_is_advertised():
+    """Dagster accepts an empty load_from; omitting the key would not parse."""
+    assert yaml.safe_load(_render_workspace_yaml([])) == {"load_from": []}
+
+
+def test_atomic_write_replaces_content(tmp_path):
+    target = tmp_path / "nested" / "workspace.yaml"
+    _write_atomic(target, "first")
+    _write_atomic(target, "second")
+    assert target.read_text() == "second"
+    # No temp files left behind.
+    assert [p.name for p in target.parent.iterdir()] == ["workspace.yaml"]
+
+
+# --- Sync cycle --------------------------------------------------------------
+
+
+async def test_sync_writes_and_reloads_on_first_cycle(config):
+    syncer = _FakeSyncer(
+        config,
+        {
+            REPLICA_A: [_advertisement("ws__dev", 4000)],
+            REPLICA_B: [_advertisement("ws__prod", 4001, host="host-b")],
+        },
+    )
+    summary = await syncer.sync_once()
+
+    assert summary["changed"] is True
+    assert summary["locations"] == 2
+    assert syncer.reloads == 1
+    names = [
+        entry["grpc_server"]["location_name"] for entry in syncer.rendered()["load_from"]
+    ]
+    assert names == ["ws__dev", "ws__prod"]
+
+
+async def test_unchanged_topology_does_not_reload(config):
+    """Reloading evicts every location's cached definitions, so an unchanged
+    topology must not trigger one on every interval."""
+    syncer = _FakeSyncer(config, {REPLICA_A: [_advertisement("ws__dev", 4000)]})
+    await syncer.sync_once()
+    summary = await syncer.sync_once()
+
+    assert summary["changed"] is False
+    assert syncer.reloads == 1
+
+
+async def test_new_deployment_triggers_a_reload(config):
+    syncer = _FakeSyncer(config, {REPLICA_A: [_advertisement("ws__dev", 4000)]})
+    await syncer.sync_once()
+
+    syncer.payloads[REPLICA_A] = [
+        _advertisement("ws__dev", 4000),
+        _advertisement("ws__feature", 4001),
+    ]
+    summary = await syncer.sync_once()
+
+    assert summary["changed"] is True
+    assert syncer.reloads == 2
+
+
+async def test_port_change_triggers_a_reload(config):
+    """A location whose endpoint moved must be rewritten, not just re-listed."""
+    syncer = _FakeSyncer(config, {REPLICA_A: [_advertisement("ws__dev", 4000)]})
+    await syncer.sync_once()
+
+    syncer.payloads[REPLICA_A] = [_advertisement("ws__dev", 4009)]
+    await syncer.sync_once()
+
+    assert syncer.rendered()["load_from"][0]["grpc_server"]["port"] == 4009
+    assert syncer.reloads == 2
+
+
+async def test_only_own_locations_are_acknowledged(config):
+    syncer = _FakeSyncer(
+        config,
+        {
+            REPLICA_A: [_advertisement("ws__dev", 4000, revision=3)],
+            REPLICA_B: [_advertisement("ws__prod", 4001)],
+        },
+    )
+    await syncer.sync_once()
+
+    acknowledged = dict(syncer.heartbeats)
+    assert acknowledged[REPLICA_A] == {"ws__dev": 3}
+    assert acknowledged[REPLICA_B] == {"ws__prod": 1}
+
+
+async def test_every_replica_is_contacted_even_when_it_serves_nothing(config):
+    """A replica whose locations were dropped must learn it is no longer served,
+    instead of resting on a stale acknowledgement."""
+    syncer = _FakeSyncer(config, {REPLICA_A: [_advertisement("ws__dev", 4000)]})
+    await syncer.sync_once()
+
+    acknowledged = dict(syncer.heartbeats)
+    assert acknowledged[REPLICA_A] == {"ws__dev": 1}
+    assert acknowledged[REPLICA_B] == {}
+
+
+# --- Collision handling ------------------------------------------------------
+
+
+async def test_duplicate_location_names_keep_the_higher_revision(config):
+    """Dagster refuses a workspace with duplicate location names, taking the
+    ENTIRE control plane workspace down — so a collision must be resolved here."""
+    syncer = _FakeSyncer(
+        config,
+        {
+            REPLICA_A: [_advertisement("ws__dev", 4000, revision=1, host="host-a")],
+            REPLICA_B: [_advertisement("ws__dev", 4000, revision=2, host="host-b")],
+        },
+    )
+    await syncer.sync_once()
+
+    entries = syncer.rendered()["load_from"]
+    assert len(entries) == 1
+    assert entries[0]["grpc_server"]["host"] == "host-b"
+
+
+async def test_collision_loser_is_not_acknowledged(config):
+    """Telling the stale replica it is being served would hide the anomaly."""
+    syncer = _FakeSyncer(
+        config,
+        {
+            REPLICA_A: [_advertisement("ws__dev", 4000, revision=1, host="host-a")],
+            REPLICA_B: [_advertisement("ws__dev", 4000, revision=2, host="host-b")],
+        },
+    )
+    await syncer.sync_once()
+
+    acknowledged = dict(syncer.heartbeats)
+    assert acknowledged[REPLICA_A] == {}
+    assert acknowledged[REPLICA_B] == {"ws__dev": 2}
+
+
+# --- Malformed input ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"location_name": "", "host": "h", "port": 4000},
+        {"location_name": "ws__dev", "host": "", "port": 4000},
+        {"location_name": "ws__dev", "host": "h", "port": 0},
+        {"location_name": "ws__dev", "host": "h", "port": 70000},
+        {"location_name": "ws__dev", "host": "h"},
+    ],
+)
+async def test_malformed_advertisements_are_dropped(config, bad):
+    """One bad entry breaks the load for every other location in the file."""
+    syncer = _FakeSyncer(config, {REPLICA_A: [bad, _advertisement("ws__ok", 4001)]})
+    await syncer.sync_once()
+
+    names = [
+        entry["grpc_server"]["location_name"] for entry in syncer.rendered()["load_from"]
+    ]
+    assert names == ["ws__ok"]
+
+
+# --- Failure tolerance -------------------------------------------------------
+
+
+async def test_transient_failure_keeps_cached_locations(config):
+    """One slow response must not unregister a replica's deployments."""
+    syncer = _FakeSyncer(
+        config, {REPLICA_A: [_advertisement("ws__dev", 4000)]}, failure_tolerance=2
+    )
+    await syncer.sync_once()
+
+    syncer.payloads[REPLICA_A] = asyncio.TimeoutError("timeout")
+    summary = await syncer.sync_once()
+
+    assert summary["changed"] is False
+    assert summary["locations"] == 1
+    assert len(syncer.rendered()["load_from"]) == 1
+
+
+async def test_persistent_failure_drops_the_replica(config):
+    """A replica that is really gone must stop being dialed."""
+    syncer = _FakeSyncer(
+        config, {REPLICA_A: [_advertisement("ws__dev", 4000)]}, failure_tolerance=2
+    )
+    await syncer.sync_once()
+    syncer.payloads[REPLICA_A] = asyncio.TimeoutError("timeout")
+
+    await syncer.sync_once()  # failure 1 — within tolerance
+    await syncer.sync_once()  # failure 2 — within tolerance
+    summary = await syncer.sync_once()  # failure 3 — exceeded
+
+    assert summary["locations"] == 0
+    assert syncer.rendered() == {"load_from": []}
+    assert syncer.reloads == 2  # initial write + the drop
+
+
+async def test_recovery_restores_the_replica(config):
+    syncer = _FakeSyncer(
+        config, {REPLICA_A: [_advertisement("ws__dev", 4000)]}, failure_tolerance=1
+    )
+    await syncer.sync_once()
+    syncer.payloads[REPLICA_A] = asyncio.TimeoutError("timeout")
+    await syncer.sync_once()
+    await syncer.sync_once()  # dropped
+
+    syncer.payloads[REPLICA_A] = [_advertisement("ws__dev", 4000)]
+    summary = await syncer.sync_once()
+
+    assert summary["changed"] is True
+    assert summary["locations"] == 1
+    assert summary["replicas_ok"] >= 1

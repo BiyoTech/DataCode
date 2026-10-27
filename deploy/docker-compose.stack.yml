@@ -1,0 +1,232 @@
+# Single-machine, ALL-container stack (profile: docker).
+#
+# The "one machine, real topology" deployment: every service in a container,
+# including the frontend, resolving peers by compose service name. It
+# exercises the same images, the same config mechanism (conf/ mounted at
+# /app/conf, DATACODE_ENV=docker) and the same startup ordering as production.
+#
+# Usage:
+#   make up                                  # bootstraps deploy/.env on first
+#                                            # use, injects DB_PASSWORD and
+#                                            # GW_JWT_SECRET from .data/ truth
+#                                            # files, then: compose --env-file
+#                                            # deploy/.env -f infra.yml
+#                                            # -f stack.yml up -d --build
+#   open http://localhost:8080
+#
+# What this stack does NOT provide, and where to get it:
+#   * cell isolation          -> make global-up + make cell-up (the P7 topology)
+#   * Dagster orchestration   -> make dagster-up (stackable on this one)
+#   * NetworkPolicy-enforced sandbox egress -> Kubernetes only
+#
+# Storage: named volumes. postgres_data and redis_data are defined in the
+# merged infra file and therefore SHARED with the host dev stack — same
+# compose project name (`datacode`), same postgres/redis instance, and the
+# same GW_JWT_SECRET truth file, so a login token from `make dev` still
+# verifies here. workspaces_1/workspaces_2 (one per runtime replica) are
+# docker-managed and NOT host bind mounts: host-run services cannot see the
+# working copies (that interoperability is the data-plane stack's job).
+
+name: datacode
+
+x-service-defaults: &service-defaults
+  # ONE mechanism for every container: the repository's conf/ directory, the
+  # `docker` profile on top of the base. A container that mounted a private
+  # full-copy platform.yaml would be a second truth source drifting from this
+  # one (that is exactly what deploy/conf-*/ used to be).
+  volumes:
+    - ../conf:/app/conf:ro
+  environment: &service-env
+    CONFIG_PATH: /app/conf
+    DATACODE_ENV: docker
+    DB_PASSWORD: ${DB_PASSWORD}
+    # No inline defaults: a well-known literal like "dev-internal-token" that
+    # survives into a non-local deployment is an authentication bypass for
+    # every /internal/* surface. deploy/.env (bootstrapped from the committed
+    # example by `make up`) supplies them, so `:?` fails LOUDLY when the
+    # env-file was forgotten instead of quietly shipping a public secret.
+    WORKSPACE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+    CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+    IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+  restart: unless-stopped
+
+services:
+  # ── Infrastructure (merged from docker-compose.infra.yml) ────────────
+  # postgres / redis come from the infra file; `make up` merges both. They are
+  # NOT redefined here — defining them twice would let the copies drift.
+
+  # ── Migration (one-shot, ordered BEFORE the services) ─────────────────
+  # Creates the control-plane tables and runs control-service's alembic chain
+  # to head, once, instead of every replica racing to do it at boot. This is
+  # the ONLY creator of the control-owned tables (runtime creates just its
+  # own three); see control-service/src/db_migrate.py. Idempotent, so a re-run
+  # is always safe. The services below wait for its successful exit.
+  migrate:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: control-service/Dockerfile
+    command: ["python", "-m", "src.db_migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Global tier (identity, single instance) ───────────────────────────
+  identity-service:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: identity-service/Dockerfile
+    environment:
+      <<: *service-env
+      GW_JWT_SECRET: ${GW_JWT_SECRET:?injected by make from .data/gateway_jwt_secret}
+      # Single replica: migrations at boot are race-free and keep this stack
+      # self-contained (the migrate job covers control's chain only).
+      IDENTITY_SERVICE_AUTO_MIGRATE: "1"
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # ── Cell tier services ─────────────────────────────────────────────────
+  control-service:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: control-service/Dockerfile
+    environment:
+      <<: *service-env
+      # Migrations ran in the migrate job; a replica must never re-run them.
+      AUTO_MIGRATE: "0"
+      CONTROL_SERVICE_ENV_LOCK_BACKEND: redis
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  agent-service:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: agent-service/Dockerfile
+    environment:
+      <<: *service-env
+      AGENT_SERVICE_LLM_API_KEY: ${AGENT_SERVICE_LLM_API_KEY:-}
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Two replicas: the lease router's single-writer property only gets
+  # exercised with more than one — a single replica would make every routing
+  # bug invisible until production.
+  #
+  # The replicas differ in EXACTLY three things: their runtime id, their
+  # private volume and their published port. Everything else comes from the
+  # anchors below — a hand-copied environment block is how one replica ends up
+  # with a setting the other lacks, and lease bugs caused that way surface as
+  # "this workspace behaves differently", which is very hard to attribute.
+  workspace-runtime-1: &workspace-runtime
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: workspace-runtime/Dockerfile
+      # Forwarded, or `RUNTIME_EXTRAS=spark make build up` silently builds an
+      # image without it: compose declares no build-arg for a service unless
+      # the compose file names it, and the Dockerfile's own default is empty.
+      # An unset variable passes "" — the same value the Dockerfile defaults
+      # to, so the ordinary build is byte-identical.
+      args:
+        RUNTIME_EXTRAS: ${RUNTIME_EXTRAS:-}
+    environment: &workspace-runtime-env
+      <<: *service-env
+      WORKSPACE_RUNTIME_LEASE_ENABLED: "true"
+      # Named volume per replica: the lease guarantees one writer per working
+      # copy; sharing ONE volume would turn a lease violation into silent Git
+      # corruption instead of a visible error.
+      WORKSPACE_RUNTIME_MATERIALIZE_MOUNT_KIND: instance_local
+      WORKSPACE_RUNTIME_WORKSPACE_BASE_PATH: /data/workspaces
+      WORKSPACE_RUNTIME_MATERIALIZE_ROOT: /data/workspaces
+      DATACODE_RUNTIME_ID: workspace-runtime-1
+      DATACODE_REPLICA_ID: workspace-runtime-1
+      DATACODE_TASK_TOKEN_SECRET: ${DATACODE_TASK_TOKEN_SECRET:?injected from deploy/.env}
+    volumes:
+      - ../conf:/app/conf:ro
+      - workspaces_1:/data/workspaces
+    ports:
+      - "8002:8002"
+    # The runtime owns three tables of its own, and the migrate step creates
+    # them. Without this dependency this service is the ONE replica that races
+    # the migration — the ordering contract in deploy/README.md holds for every
+    # replica or for none.
+    depends_on: &workspace-runtime-deps
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  workspace-runtime-2:
+    <<: *workspace-runtime
+    environment:
+      <<: *workspace-runtime-env
+      DATACODE_RUNTIME_ID: workspace-runtime-2
+      DATACODE_REPLICA_ID: workspace-runtime-2
+    volumes:
+      - ../conf:/app/conf:ro
+      - workspaces_2:/data/workspaces
+    ports:
+      - "8012:8002"
+    depends_on: *workspace-runtime-deps
+
+  # ── Edge ───────────────────────────────────────────────────────────────
+  gateway:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    environment:
+      <<: *service-env
+      GW_JWT_SECRET: ${GW_JWT_SECRET:?injected by make from .data/gateway_jwt_secret}
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      identity-service:
+        condition: service_healthy
+      control-service:
+        condition: service_healthy
+      agent-service:
+        condition: service_healthy
+      workspace-runtime-1:
+        condition: service_started
+
+  frontend:
+    <<: *service-defaults
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+    environment:
+      <<: *service-env
+      GATEWAY_UPSTREAM: gateway:8000
+    ports:
+      - "8080:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+volumes:
+  workspaces_1:
+  workspaces_2:

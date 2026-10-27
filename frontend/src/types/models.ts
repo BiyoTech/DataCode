@@ -19,6 +19,21 @@ export interface ModelSummary {
   gateway?: string
 }
 
+/**
+ * One gateway whose listing could not be fetched.
+ *
+ * The model listing merges every configured gateway and skips a failing one, so
+ * the tree can be incomplete without anything saying so. Carries the reason
+ * because an unreachable warehouse is the user's `sql-warehouse/config.yaml`
+ * to fix, not a platform fault.
+ */
+export interface ModelGatewayError {
+  gateway: string
+  /** Backend error code, e.g. `DB_CONNECTION_ERROR`. Empty when unclassified. */
+  code: string
+  message: string
+}
+
 // ─────────── Model detail (with columns / schema) ───────────
 export interface ModelColumn {
   name: string

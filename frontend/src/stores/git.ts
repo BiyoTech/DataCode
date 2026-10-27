@@ -365,7 +365,13 @@ export const useGitStore = defineStore('git', () => {
 
     isLoading.value = true
     try {
-      await api.post('/git/commit', { workspace_path: ws.path, message: msg })
+      // user_id lets the backend resolve this user's git credential for the
+      // commit's author identity — same wiring as push/pull/fetch.
+      await api.post('/git/commit', {
+        workspace_path: ws.path,
+        message: msg,
+        user_id: currentUserId(),
+      })
       commitMessage.value = ''
       await fetchStatus()
     } catch (e) {
@@ -615,7 +621,6 @@ export const useGitStore = defineStore('git', () => {
       const { data } = await api.get('/git/branch-diff', {
         params: {
           workspace_path: ws.path,
-          user_id: currentUserId(),
           source,
           target,
         },
@@ -644,7 +649,6 @@ export const useGitStore = defineStore('git', () => {
       const { data } = await api.get('/git/branch-diff', {
         params: {
           workspace_path: ws.path,
-          user_id: currentUserId(),
           source,
           target,
           file_path: filePath,

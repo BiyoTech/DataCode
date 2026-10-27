@@ -1,0 +1,124 @@
+# identity-service — the GLOBAL tier's only workload (design 03 §2, P7).
+#
+# Single writer of the identity dataset: users, tenants, roles,
+# tenant_placement. Reached on the login path and for placement/registry
+# calls — never on a cell's hot request path, which is why one small
+# deployment serves the whole installation.
+#
+# Migrations do NOT run at boot here: with replicas > 1 they race each other
+# and against the migrate Job. The overlay-enforced Job (migrate-job.yaml)
+# applies them before a rolling update proceeds.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service
+  namespace: datacode
+  labels:
+    app: identity-service
+spec:
+  selector:
+    app: identity-service
+  ports:
+    - name: http
+      port: 8003
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity-service
+  namespace: datacode
+  labels:
+    app: identity-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: identity-service
+  template:
+    metadata:
+      labels:
+        app: identity-service
+    spec:
+      containers:
+        - name: identity-service
+          image: datacode/identity-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8003
+          env:
+            # The config mechanism. identity belongs to the GLOBAL tier, so the
+            # base declares the global profile; the global overlay keeps it,
+            # the cell overlay removes the workload entirely.
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-global
+            # The global tier is not a cell; the id keeps its log lines and
+            # Redis keys distinguishable from any cell's.
+            - name: DATACODE_CELL_ID
+              value: global
+            - name: GW_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: gateway-jwt-secret
+            - name: IDENTITY_SERVICE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: identity-internal-token
+            # OFF in the cluster: the migrate Job owns migrations. A replica
+            # racing the Job would apply the same DDL twice.
+            - name: IDENTITY_SERVICE_AUTO_MIGRATE
+              value: "0"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+            # Redis is used for login rate limiting; with >1 replica it must
+            # be shared (a per-replica limiter multiplies the limit).
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-redis
+                  key: password
+                  optional: true
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity-service
+  namespace: datacode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: identity-service

@@ -1,0 +1,125 @@
+# control-service — the control plane (design 02, design 06 P5).
+#
+# Environment registry + reconciler + TTL reaper, workspace metadata, Git
+# credentials, quota bookkeeping. Stateless beyond the shared database —
+# every filesystem/engine side effect is dispatched to workspace-runtime over
+# the internal env-control channel, which is the token below.
+#
+# Migrations run in the migrate Job, never at boot: with replicas > 1 each
+# would race create_all + upgrade head against the others.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-service
+  namespace: datacode
+  labels:
+    app: control-service
+spec:
+  selector:
+    app: control-service
+  ports:
+    - name: http
+      port: 8004
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-service
+  namespace: datacode
+  labels:
+    app: control-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: control-service
+  template:
+    metadata:
+      labels:
+        app: control-service
+    spec:
+      containers:
+        - name: control-service
+          image: datacode/control-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8004
+          env:
+            # The config mechanism, identical to every other deployment shape:
+            # conf/ from the ConfigMap, profile selected by DATACODE_ENV. The
+            # base declares the cell profile; overlays replace it where needed.
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-cell
+            - name: DATACODE_CELL_ID
+              value: cell-0
+            # OFF: the migrate Job owns migrations.
+            - name: AUTO_MIGRATE
+              value: "0"
+            # The env-lock backend shares its Redis namespace (sm:env_lock:*)
+            # with the runtime's apply path — cross-replica mutual exclusion.
+            - name: CONTROL_SERVICE_ENV_LOCK_BACKEND
+              value: redis
+            # The value control SENDS on the runtime's internal channel; must
+            # equal WORKSPACE_RUNTIME_INTERNAL_TOKEN on every replica.
+            - name: CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            # For calls into identity's /internal/* (placement, registry).
+            - name: IDENTITY_SERVICE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: identity-internal-token
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-redis
+                  key: password
+                  optional: true
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-service
+  namespace: datacode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: control-service

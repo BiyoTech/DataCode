@@ -1,7 +1,12 @@
 # Gateway Service Configuration
 #
-# Service-specific settings only. Service topology, logging, and auth DB path
-# are sourced from conf/platform.yaml.
+# Service-specific settings only. Service topology and logging come from
+# conf/platform.yaml.
+#
+# P5.5: the gateway holds NO database. Identity, authorization and the password
+# policy live in identity-service (which reads platform.yaml plus its own env
+# vars); the former auth.db_path / login_max_attempts / bcrypt_cost settings
+# were removed from here so there is only one place to configure them.
 server:
   http_port: 8000
 
@@ -9,20 +14,24 @@ server:
 cors:
   frontend_origin: "http://localhost:5173"
 
-# Authentication (JWT signing secret comes from env GW_JWT_SECRET only)
+# Token verification (JWT signing secret comes from env GW_JWT_SECRET only).
+# The gateway VERIFIES tokens; identity-service issues them and reads the same
+# TTLs, so these values must match on both sides.
 auth:
   access_token_ttl_minutes: 120
   refresh_token_ttl_hours: 168
   pre_auth_token_ttl_minutes: 5
-  login_max_attempts: 5
-  login_lockout_minutes: 5
-  bcrypt_cost: 10
-  # db_path comes from platform.yaml: database.services.gateway_auth.sqlite_path
-  # To override: GW_AUTH_DB_PATH env var
+  # How long an authorization snapshot fetched from identity-service is reused.
+  # Staleness is additionally cut short by the perms_version claim.
+  authz_cache_ttl_seconds: 60
 
 # ── Shared config (from platform.yaml) ──────────────────────────────────
-# services:  → platform.yaml → services.{agent,sqlmesh,ontology,dagster}
+# services:  → platform.yaml → services.{agent,runtime,control,identity}
 # logging:   → platform.yaml → logging.level
 #
 # To override per-service, use env vars:
-#   GW_AGENT_SERVICE_URL, GW_SQLMESH_SERVICE_URL, etc.
+#   GW_AGENT_SERVICE_URL, GW_IDENTITY_SERVICE_URL, etc.
+#
+# Required env vars:
+#   GW_JWT_SECRET                     token signing secret (shared with identity)
+#   IDENTITY_SERVICE_INTERNAL_TOKEN   internal-API token for authz + bindings

@@ -1,0 +1,69 @@
+[project]
+name = "control-service"
+version = "0.1.0"
+description = "Control plane: environment registry, workspace metadata, reconciliation and reclamation (design 02, P5)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "structlog>=24.4.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "pyyaml>=6.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    # Core, not an extra: PostgreSQL is the platform engine everywhere (dev,
+    # Docker, Kubernetes — no shipped profile selects anything else), so an
+    # install without the driver crash-loops at startup (same contract as
+    # agent-service and workspace-runtime).
+    "asyncpg>=0.30.0",
+    # Sync driver alembic migrates over (alembic/env.py rewrites +asyncpg to
+    # +psycopg2): migrations are this service's job — dev db-upgrade, the
+    # compose migrate service, the k8s migrate Job — so it ships core too.
+    "psycopg2-binary>=2.9.0",
+    # Core, not a dev extra: the image OWNS the migrations (the compose migrate
+    # service and the k8s control-migrate Job both run `python -m src.db_migrate`
+    # from it), and db_migrate imports alembic.config — a core psycopg2 with an
+    # extra alembic is half a migration toolchain.
+    "alembic>=1.14.0",
+    "httpx>=0.27.0",
+    "redis>=5.0.0",
+    # Local shared package, NOT published to any index. Install it beforehand
+    # or in the same pip command, e.g.
+    # `pip install ./shared/python -e ./control-service`.
+    "datacode-common",
+]
+
+[project.optional-dependencies]
+# MySQL is not selected by any shipped profile; the dialect stays available
+# for bespoke deployments via this extra (pymysql: the sync driver alembic's
+# env.py maps +aiomysql to when migrating such a deployment).
+mysql = ["aiomysql>=0.2.0", "pymysql>=1.1.0"]
+# KubernetesReplicaDriver (P8 capacity orchestration). Optional on purpose:
+# control-service stays light by default, and the logging driver covers dev.
+k8s = ["kubernetes>=28.1.0"]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "DTZ"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

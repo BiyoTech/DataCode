@@ -1,0 +1,70 @@
+# Profile: cell — one containerized Cell's stack (DATACODE_ENV=cell)
+#
+# Used by deploy/docker-compose.cell.yml. EVERY cell shares this file
+# unchanged: a cell's identity arrives through DATACODE_CELL_ID (see
+# datacode_common/cell.py and gateway/internal/cellx), which is exactly what
+# lets one file serve all of them. A per-cell copy would drift the first time
+# one was edited, and the drift would present as "this tenant's platform
+# behaves differently" — among the hardest failures to attribute.
+#
+# Differences from the `docker` profile:
+#   - the database and Redis are the CELL's own instances (cell-pg/cell-redis),
+#     not a shared pair;
+#   - identity is reached in the GLOBAL stack, over the datacode-global network;
+#   - `cells.expect_global_db` is on, so a broken split fails at startup.
+
+database:
+  # The CELL tier: this cell's workspaces, environments, quotas, audit records.
+  host: "cell-pg"
+  port: 5432
+  name: "datacode"
+  username: "datacode"
+  # password: env-only (DB_PASSWORD)
+
+  services:
+    # The GLOBAL tier. identity-service owns these tables and is their only
+    # writer (P5.5), which is what makes this one entry the whole split.
+    #
+    # Note the host: `global-pg` resolves on the datacode-global network, which
+    # the gateway and control-service join. A cell service that does NOT join
+    # it cannot reach identity — deliberately, since nothing else needs to.
+    identity:
+      type: "postgresql"
+      host: "global-pg"
+      port: 5432
+      name: "identity"
+      username: "datacode"
+
+cells:
+  # Declared, and therefore enforced: control-service refuses to start if the
+  # override above is missing or points back at the cell database. Without the
+  # declaration that mistake is invisible — identity tables get created next to
+  # this cell's own and every cell ends up sharing this cell's users.
+  expect_global_db: true
+
+redis:
+  # The cell's own Redis. Leases, environment locks and the SSE bus are all
+  # cell-local by definition: a lease is over a working copy that exists on
+  # this cell's disks only.
+  host: "cell-redis"
+  port: 6379
+
+workspace:
+  base_path: "/data/workspaces"
+
+services:
+  gateway:
+    http_url: "http://gateway:8000"
+  agent:
+    ws_url: "ws://agent-service:8001"
+    grpc_url: "agent-service:50051"
+    rest_url: "http://agent-service:8001"
+  runtime:
+    rest_url: "http://workspace-runtime-1:8002"
+  control:
+    rest_url: "http://control-service:8004"
+  # The GLOBAL identity service, shared by every cell. Reached on the login
+  # path and for placement/registry calls — never on the hot request path,
+  # which is why an outage here does not stop this cell's existing sessions.
+  identity:
+    rest_url: "http://identity-service:8003"

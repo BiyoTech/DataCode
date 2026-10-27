@@ -58,6 +58,41 @@ def _generate_request_id() -> str:
     return f"cmd-approval-{uuid.uuid4().hex[:12]}"
 
 
+def _register_remote(session_id: str, request_id: str) -> None:
+    """Cross-replica existence for this pending command approval (best-effort)."""
+    import asyncio
+
+    from src.runtime.session_coordination import (
+        KIND_COMMAND_APPROVAL,
+        get_session_coordination,
+    )
+
+    coro = get_session_coordination().register_pending(
+        KIND_COMMAND_APPROVAL, session_id, request_id, int(DEFAULT_APPROVAL_TIMEOUT_S)
+    )
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+
+
+def _unregister_remote(session_id: str, request_id: str) -> None:
+    import asyncio
+
+    from src.runtime.session_coordination import (
+        KIND_COMMAND_APPROVAL,
+        get_session_coordination,
+    )
+
+    coro = get_session_coordination().unregister_pending(
+        KIND_COMMAND_APPROVAL, session_id, request_id
+    )
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+
+
 async def request_command_approval(
     session_id: str,
     commands: List[str],
@@ -88,6 +123,7 @@ async def request_command_approval(
     approval = CommandApprovalRequest(session_id, request_id, commands)
     session_registry = _registry.setdefault(session_id, {})
     session_registry[request_id] = approval
+    _register_remote(session_id, request_id)
 
     logger.info(
         "command_approval_requested",
@@ -168,6 +204,7 @@ def resolve_command_approval(
         approval.future.set_result(approved)
 
     _cleanup_request(session_id, request_id)
+    _unregister_remote(session_id, request_id)
 
     logger.info(
         "command_approval_resolved_by_user",

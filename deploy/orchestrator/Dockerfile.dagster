@@ -1,0 +1,29 @@
+# Control-plane Dagster image: webserver + daemon only.
+#
+# This is plain upstream Dagster — no DataCode code runs in the control plane.
+# The workspace.yaml it loads is RENDERED by the workspace-sync sidecar, which
+# is why the two share the dagster_home volume.
+#
+# Build context is the datacode/ directory.
+
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir \
+    "dagster>=1.8.0,<2" \
+    "dagster-webserver>=1.8.0,<2" \
+    # NOTE: dagster-postgres follows its own 0.x line (0.29.x pairs with
+    # dagster 1.13.x) — it has no 1.x versions.
+    "dagster-postgres>=0.29" \
+    # The Kubernetes run launcher the cell's instance config selects
+    # (deploy/k8s/base/dagster-orchestrator.yaml). Same 0.x line as postgres.
+    "dagster-k8s>=0.29" \
+    "psycopg2-binary>=2.9"
+
+# dagster.yaml (storage/run_launcher/...) is mounted into DAGSTER_HOME by the
+# compose stack; the workspace.yaml is written there by the syncer.
+ENV DAGSTER_HOME=/opt/dagster/dagster_home
+RUN mkdir -p ${DAGSTER_HOME}
+
+# The command (webserver or daemon) is chosen by the compose service.
+CMD ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", \
+     "-w", "/opt/dagster/dagster_home/workspace.yaml"]

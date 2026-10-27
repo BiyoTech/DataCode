@@ -1,6 +1,6 @@
 # Agent Service Configuration
 #
-# Service-specific settings only. Database, sqlmesh service URL, and logging
+# Service-specific settings only. Database, workspace-runtime URL, and logging
 # are sourced from conf/platform.yaml.
 
 server:
@@ -48,11 +48,26 @@ agent:
       temperature: 0.8
       max_tokens: 2000
 
+# ── Session data retention (design 05 §2.3) ─────────────────────────────
+# timeline_events is the service's highest-frequency append stream; this is
+# its expiry. memory_events keeps a longer window (memory is a longer-lived
+# asset); its summaries cascade with it. Messages and sessions are NOT
+# expired here — their lifecycle belongs to explicit user deletion.
+retention:
+  enabled: true
+  interval: 86400                # daily
+  timeline_days: 30              # session replay demand is recent by nature
+  memory_event_days: 90
+  # Rows deleted per statement — a first run after months must not lock the
+  # table with one giant DELETE.
+  batch_size: 5000
+
 # ── Shared config (from platform.yaml) ──────────────────────────────────
 # database:             → platform.yaml → database.services.agent (SQLite)
 #                         (password: env DB_PASSWORD)
-# services.sqlmesh:     → platform.yaml → services.sqlmesh.rest_url
+# services.runtime:     → platform.yaml → services.runtime.rest_url
+#                         (workspace-runtime owns the working-copy surface)
 # logging:              → platform.yaml → logging.level
 #
 # To override per-service, use env vars:
-#   AGENT_SERVICE_DATABASE_TYPE, AGENT_SERVICE_SQLMESH_SERVICE_URL, etc.
+#   AGENT_SERVICE_DATABASE_TYPE, AGENT_SERVICE_RUNTIME_SERVICE_URL, etc.

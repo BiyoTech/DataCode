@@ -1,0 +1,117 @@
+# Dagster ORCHESTRATION plane — webserver + daemon + workspace-sync.
+#
+# Stackable on the SINGLE-MACHINE stack only (`make dagster-up` merges
+# infra.yml + stack.yml + this file). NOT on a cell: DAGSTER_PG_DB names a
+# `dagster` database that only the infra/stack postgres has — init-db/init.sql
+# runs on that instance, while a cell's `cell-pg` is created with POSTGRES_DB
+# alone. Stacking it on a cell fails at connect time with "database dagster
+# does not exist".
+#
+#   make dagster-up      # = compose -f infra.yml -f stack.yml -f dagster.yml up -d
+#   open http://localhost:3000
+#
+# The daemon is intentionally a single service (no replicas): Dagster's daemon
+# must run exactly once or schedules/sensors fire repeatedly.
+#
+# ── Why this file also patches the runtime replicas ──────────────────────────
+# conf/workspace-runtime.yaml defaults to the SINGLE-NODE Dagster shape
+# (mode: local, own webserver + daemon per replica) because that is correct
+# when no orchestration plane exists. Merging this file introduces one, so the
+# replicas must step down to `remote`: otherwise each replica runs its own
+# daemon alongside the one below and every schedule fires three times. Compose
+# merges `environment` maps with last-file-wins per key, so the override here
+# only applies while this file is part of the merge.
+
+name: datacode
+
+x-runtime-remote-dagster: &runtime-remote-dagster
+  # The DagsterInstance belongs to the orchestration plane; a replica only
+  # hosts code locations that the syncer publishes into workspace.yaml.
+  WORKSPACE_RUNTIME_DAGSTER_MODE: remote
+  WORKSPACE_RUNTIME_DAGSTER_WEBSERVER_ENABLED: "false"
+  WORKSPACE_RUNTIME_DAGSTER_DAEMON_ENABLED: "false"
+
+x-dagster: &dagster
+  build:
+    context: ..
+    dockerfile: deploy/orchestrator/Dockerfile.dagster
+  environment:
+    DAGSTER_HOME: /opt/dagster/dagster_home
+    DAGSTER_PG_HOST: postgres
+    DAGSTER_PG_PORT: "5432"
+    DAGSTER_PG_DB: dagster
+    DAGSTER_PG_USER: datacode
+    DAGSTER_PG_PASSWORD: ${DB_PASSWORD}
+  volumes:
+    # Instance config (storage/run_launcher/...) lives with the orchestrator
+    # deployment unit; workspace.yaml is written into the same home by the
+    # syncer.
+    - ./orchestrator/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml:ro
+    - dagster_control_home:/opt/dagster/dagster_home
+  restart: unless-stopped
+
+services:
+  # ── Runtime replicas: step down to remote mode (see the header) ───────────
+  # Only the keys that must change; the rest of each service comes from
+  # stack.yml, which this file is always merged with.
+  workspace-runtime-1:
+    environment: *runtime-remote-dagster
+
+  workspace-runtime-2:
+    environment: *runtime-remote-dagster
+
+  dagster-webserver:
+    <<: *dagster
+    command:
+      ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000",
+       "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; u.urlopen('http://localhost:3000/server_info')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # Single instance, hard constraint: see the header. Must point at the same
+  # rendered workspace.yaml as the webserver (written by workspace-sync).
+  dagster-daemon:
+    <<: *dagster
+    command:
+      ["dagster-daemon", "run", "-w", "/opt/dagster/dagster_home/workspace.yaml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dagster-webserver:
+        condition: service_started
+
+  # The single WRITER of the control plane's workspace.yaml: polls every data
+  # plane replica's /internal/code-locations, renders the file, reloads the
+  # webserver, and acknowledges loaded revisions back.
+  workspace-sync:
+    build:
+      context: ..
+      dockerfile: deploy/orchestrator/Dockerfile
+    environment:
+      # Comma-separated data-plane replica base URLs. Extend when adding
+      # replicas; the merge logic tolerates unreachable replicas.
+      DATACODE_DATA_PLANE_URLS: http://workspace-runtime-1:8002,http://workspace-runtime-2:8002
+      # Must match WORKSPACE_RUNTIME_INTERNAL_TOKEN on every data-plane replica.
+      # No inline default, for the same reason the stacks dropped theirs.
+      DATACODE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+      DATACODE_DAGSTER_GRAPHQL_URL: http://dagster-webserver:3000/graphql
+      DATACODE_WORKSPACE_FILE: /opt/dagster/dagster_home/workspace.yaml
+      DATACODE_SYNC_INTERVAL_SECONDS: "15"
+    volumes:
+      - dagster_control_home:/opt/dagster/dagster_home
+    depends_on:
+      dagster-webserver:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  dagster_control_home:

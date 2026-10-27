@@ -18,6 +18,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import api from '@/utils/api'
+import { useQuotaStore } from './quotas'
 import { useWorkspaceStore } from '@/stores/workspace'
 
 /** Lifecycle status of an environment, as recorded by the registry. */
@@ -71,6 +72,36 @@ export interface CreateEnvironmentPayload {
   envType?: EnvironmentType
   baseEnv?: string
   ttlHours?: number
+}
+
+/**
+ * Where a newly created environment's code came from.
+ *
+ * `reusedRemote` is the case worth surfacing: the remote branch outlived a
+ * previous environment of the same name, so the user gets that line of
+ * development back instead of a fresh copy of the base.
+ */
+export type BranchSource = 'reused_remote' | 'adopted_local' | 'created_from_base'
+
+export interface CreatedEnvironment {
+  environment: EnvironmentInfo
+  branchSource: BranchSource
+}
+
+/**
+ * Work that destroying an environment would lose.
+ *
+ * `unpushed` is the number that matters: the remote branch is always
+ * preserved, so committed-but-unpushed commits are the only code a destroy can
+ * still make disappear. It is shown as a warning, never as a blocker.
+ */
+export interface PendingWorkSummary {
+  environmentId: string
+  branch: string
+  uncommitted: number
+  unpushed: number
+  /** Per-member breakdown, for diagnosis only. */
+  members: Array<{ userId: string; uncommitted: number; unpushed: number }>
 }
 
 /** Map a registry payload onto the store model. */
@@ -211,7 +242,7 @@ export const useEnvironmentStore = defineStore('environment', () => {
    */
   async function createEnvironment(
     payload: CreateEnvironmentPayload
-  ): Promise<EnvironmentInfo> {
+  ): Promise<CreatedEnvironment> {
     const workspaceStore = useWorkspaceStore()
     const workspaceId = workspaceStore.currentWorkspaceId
     if (!workspaceId) throw new Error('No workspace is open')
@@ -221,13 +252,26 @@ export const useEnvironmentStore = defineStore('environment', () => {
     if (payload.baseEnv) body.base_env = payload.baseEnv
     if (payload.ttlHours !== undefined) body.ttl_hours = payload.ttlHours
 
-    const { data } = await api.post(`/workspaces/${workspaceId}/environments`, body)
-    const created = toEnvironmentInfo(data)
-    environments.value = [
-      ...environments.value.filter((env) => env.environmentId !== created.environmentId),
-      created,
-    ]
-    return created
+    try {
+      const { data } = await api.post(`/workspaces/${workspaceId}/environments`, body)
+      const created = toEnvironmentInfo(data)
+      environments.value = [
+        ...environments.value.filter((env) => env.environmentId !== created.environmentId),
+        created,
+      ]
+      return {
+        environment: created,
+        branchSource: (data?.branch_source ?? 'created_from_base') as BranchSource,
+      }
+    } catch (err) {
+      // A quota rejection must refresh the cached overview so the quota panel
+      // the user opens next agrees with the rejection they just saw.
+      if ((err as { response?: { data?: { error_code?: string } } })?.response
+        ?.data?.error_code === 'QUOTA_EXCEEDED') {
+        void useQuotaStore().refresh()
+      }
+      throw err
+    }
   }
 
   /**
@@ -289,12 +333,47 @@ export const useEnvironmentStore = defineStore('environment', () => {
   }
 
   /**
-   * Destroy an environment: releases its SQLMesh views, worktree and branch.
-   * The registry row and its events are kept for audit.
+   * Read what destroying an environment would lose, BEFORE asking to confirm.
    *
-   * `force` discards uncommitted changes in the caller's working copy. Without
-   * it the backend refuses (409) and names how many changes would be lost, so
-   * the decision is always the user's.
+   * Returns `null` on any failure instead of throwing: this only enriches the
+   * confirmation dialog, and a warning the platform could not compute must
+   * never stand between the user and a deletion they are entitled to make.
+   */
+  async function fetchPendingWork(
+    environmentId: string
+  ): Promise<PendingWorkSummary | null> {
+    try {
+      const { data } = await api.get(
+        `/environments/${encodeURIComponent(environmentId)}/pending-work`
+      )
+      return {
+        environmentId: data.environment_id,
+        branch: data.branch,
+        uncommitted: Number(data.uncommitted ?? 0),
+        unpushed: Number(data.unpushed ?? 0),
+        members: (data.members || []).map((member: any) => ({
+          userId: member.user_id,
+          uncommitted: Number(member.uncommitted ?? 0),
+          unpushed: Number(member.unpushed ?? 0),
+        })),
+      }
+    } catch (err) {
+      console.warn('[environment] Failed to read pending work', err)
+      return null
+    }
+  }
+
+  /**
+   * Destroy an environment: releases its SQLMesh views, worktree, local branch
+   * and Dagster deployment. The registry row and its events are kept for audit.
+   *
+   * The REMOTE branch is preserved — recreating an environment with the same
+   * name picks it back up. Unpushed commits are therefore the only code this
+   * can lose, which is what `fetchPendingWork` warns about beforehand.
+   *
+   * `force` discards uncommitted changes in the working copies. Without it the
+   * backend refuses (409) and names how many changes would be lost, so the
+   * decision is always the user's.
    */
   async function destroyEnvironment(
     environmentId: string,
@@ -335,6 +414,7 @@ export const useEnvironmentStore = defineStore('environment', () => {
     createEnvironment,
     switchEnvironment,
     reconcileEnvironment,
+    fetchPendingWork,
     destroyEnvironment,
     reset,
   }

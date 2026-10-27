@@ -1,0 +1,21 @@
+# The two namespaces a CELL needs (see base/namespace.yaml for the contract).
+# Overlays own the Namespace objects because kustomize's `namespace:` field
+# would rename them into conflicts; base resources keep their explicit
+# datacode-tasks namespace, which this overlay does not touch.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: datacode
+  labels:
+    name: datacode
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: datacode-tasks
+  labels:
+    name: datacode-tasks
+    # Consumed by the platform namespace's own policies to allow the proxy's
+    # traffic in, without naming pods across namespaces (see egress-plane.yaml).
+    datacode.io/plane: user-code

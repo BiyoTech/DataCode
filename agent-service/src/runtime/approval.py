@@ -57,9 +57,48 @@ class PendingApproval:
 _pending_approvals: t.Dict[str, t.Dict[str, PendingApproval]] = {}
 
 
+def _register_remote(approval: PendingApproval) -> None:
+    """Make this pending approval visible to every replica (best-effort).
+
+    Registered with the same TTL as the local entry so the cross-replica key
+    never outlives the future it points at.
+    """
+    from src.runtime.session_coordination import KIND_SDK_APPROVAL, get_session_coordination
+
+    _spawn_remote(
+        get_session_coordination().register_pending(
+            KIND_SDK_APPROVAL,
+            approval.session_id,
+            approval.request_id,
+            _PENDING_APPROVAL_TTL_SECONDS,
+        )
+    )
+
+
+def _spawn_remote(coro) -> None:
+    """Schedule from this sync function; drop silently without a running loop."""
+    import asyncio
+
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+
+
+def _unregister_remote(session_id: str, request_id: str) -> None:
+    from src.runtime.session_coordination import KIND_SDK_APPROVAL, get_session_coordination
+
+    _spawn_remote(
+        get_session_coordination().unregister_pending(
+            KIND_SDK_APPROVAL, session_id, request_id
+        )
+    )
+
+
 def register_pending_approval(approval: PendingApproval) -> None:
     session_approvals = _pending_approvals.setdefault(approval.session_id, {})
     session_approvals[approval.request_id] = approval
+    _register_remote(approval)
     logger.info(
         "approval_registered",
         session_id=approval.session_id,
@@ -78,6 +117,7 @@ def resolve_pending_approval(session_id: str, request_id: str, approved: bool) -
     if not approval.future.done():
         approval.future.set_result(approved)
 
+    _unregister_remote(session_id, request_id)
     logger.info(
         "approval_resolved",
         session_id=session_id,

@@ -1,0 +1,46 @@
+# Ingress — the public entry point.
+#
+# One host, two paths: the frontend serves /; the API and WebSocket traffic
+# go directly to the gateway (bypassing the frontend's nginx, which the
+# browser-driven paths use). The annotations cover the two connection shapes
+# the platform needs: long-lived streams (SSE, plan/apply) and WebSockets.
+#
+# The class and annotations below target nginx-ingress; adjust for the
+# controller your cluster actually runs.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datacode
+  namespace: datacode
+  annotations:
+    # SSE and slow plan/apply calls hold connections open on purpose.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # WebSocket upgrade for the agent chat channel (/ws).
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8000
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

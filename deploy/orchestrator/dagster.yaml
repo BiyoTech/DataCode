@@ -1,0 +1,70 @@
+# Dagster instance configuration for the CONTROL PLANE.
+#
+# This file configures the DagsterInstance shared by the control plane's
+# webserver and daemon. Mount it at $DAGSTER_HOME/dagster.yaml.
+#
+# ── Why PostgreSQL is not optional here ──────────────────────────────────
+# Without a dagster.yaml, Dagster auto-provisions SQLite storage under
+# DAGSTER_HOME. That is the right default for the single-process local mode of
+# dagster-service, and the wrong one here for two reasons:
+#
+#   1. The webserver and the daemon are SEPARATE processes reading and writing
+#      the same run/event storage concurrently. SQLite serialises writers and
+#      the daemon's tick loop would contend with every UI page load.
+#   2. Control-plane replicas do not share a filesystem. Per-replica SQLite
+#      files would mean each replica saw a different set of runs — the run a
+#      user launched would be invisible to the replica that renders its status.
+#
+# ── Configuration ────────────────────────────────────────────────────────
+# All values are read from the environment so this file carries no secrets and
+# is identical across environments. Dagster resolves `env:` at load time and
+# fails startup when a referenced variable is unset, which is the behaviour we
+# want: a control plane that silently fell back to SQLite would look healthy.
+#
+#   DAGSTER_PG_HOST      e.g. postgres
+#   DAGSTER_PG_PORT      e.g. 5432
+#   DAGSTER_PG_DB        e.g. dagster
+#   DAGSTER_PG_USER      e.g. datacode
+#   DAGSTER_PG_PASSWORD  secret; never stored in this file
+#
+# The database MUST be separate from the platform's application database
+# (`datacode`): Dagster owns its schema outright and manages it with its own
+# migrations, which must not interleave with the services' alembic chain.
+
+storage:
+  postgres:
+    postgres_db:
+      hostname:
+        env: DAGSTER_PG_HOST
+      port:
+        env: DAGSTER_PG_PORT
+      db_name:
+        env: DAGSTER_PG_DB
+      username:
+        env: DAGSTER_PG_USER
+      password:
+        env: DAGSTER_PG_PASSWORD
+
+# Runs are launched into the code location's own process on the data plane
+# replica that serves it. The default launcher targets the code location
+# server, which is exactly the remote gRPC endpoint workspace_sync registers.
+run_launcher:
+  module: dagster._core.launcher
+  class: DefaultRunLauncher
+
+# Bound how many runs execute at once so a backfill cannot saturate every data
+# plane replica's code location process at the same time.
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 10
+
+# Outbound telemetry is disabled platform-wide.
+telemetry:
+  enabled: false
+
+# Retain the code location client connection long enough to survive a data
+# plane replica restart without failing the run that was mid-flight.
+code_servers:
+  local_startup_timeout: 180

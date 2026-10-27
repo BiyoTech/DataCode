@@ -1,0 +1,57 @@
+# Overlay: kind — local cluster verification of the CELL shape.
+#
+# Differences from the cell overlay, all in service of running on a laptop:
+#   * replicas: 1 (a kind cluster has neither the capacity nor the need for
+#     the production replica counts)
+#   * resources: trimmed to fit a small node
+#   * workspace-runtime storage: 1Gi (the default 100Gi claim can exceed a
+#     kind node's allocatable storage and strand the pod in Pending forever)
+#   * NodePort for the gateway and frontend: no ingress controller runs here
+#
+# Not adjusted: the security posture. The egress plane and its policies apply
+# unchanged — a verification overlay that silently weakened isolation would
+# verify nothing.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../cell
+
+patches:
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target:
+      kind: StatefulSet
+      name: workspace-runtime
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: { cpu: 100m, memory: 512Mi }
+          limits: { memory: 2Gi }
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 1Gi
+
+  # NodePort: `kubectl get svc gateway frontend` prints the ports.
+  - target:
+      kind: Service
+      name: gateway
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort
+  - target:
+      kind: Service
+      name: frontend
+    patch: |-
+      - op: replace
+        path: /spec/type
+        value: NodePort

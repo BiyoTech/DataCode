@@ -6,17 +6,17 @@ Supports:
 - Context lines before/after each match.
 - Three output modes: ``content``, ``files_with_matches``, ``count``.
 - Configurable max results with graceful truncation.
+
+The grep runs in workspace-runtime (``src/files/search.py``) — it has the files.
+What is left here is the part the model consumes: parameter validation and the
+three renderings.
 """
 
-import fnmatch
-import re
-from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.tool_context import ToolContext
-from src.tools._file_utils import EXCLUDE_DIRS, is_binary_file, resolve_safe_path
+from src.tools import workspace_fs
 from src.tools.registry import ToolRegistry
 from src.utils.logging import get_logger
 
@@ -24,6 +24,10 @@ logger = get_logger(__name__)
 
 _VALID_OUTPUT_MODES = {"content", "files_with_matches", "count"}
 DEFAULT_MAX_RESULTS = 50
+
+# The runtime bounds these too; clamping here keeps the model's mistake from
+# becoming a rejected request it cannot interpret.
+MAX_CONTEXT_LINES = 20
 
 
 @ToolRegistry.register("search_code", level=1)
@@ -64,144 +68,66 @@ async def search_code(
     """
     workspace_path = ctx.context.workspace_path
 
-    root = Path(workspace_path)
-    if not root.exists():
-        return f"Error: Workspace path does not exist: {workspace_path}"
-
-    # Validate parameters.
     if output_mode not in _VALID_OUTPUT_MODES:
         return (
             f"Error: invalid output_mode '{output_mode}'. "
             f"Choose from: {', '.join(sorted(_VALID_OUTPUT_MODES))}."
         )
+    if not (query or "").strip():
+        return "Error: query is required."
     if max_results < 1:
         max_results = DEFAULT_MAX_RESULTS
-    if context_before < 0:
-        context_before = 0
-    if context_after < 0:
-        context_after = 0
+    context_before = min(max(context_before, 0), MAX_CONTEXT_LINES)
+    context_after = min(max(context_after, 0), MAX_CONTEXT_LINES)
 
-    # Compile matcher.
+    wants_lines = output_mode == "content"
     try:
-        if regex:
-            pattern = re.compile(query, re.IGNORECASE)
-            matcher = lambda line: bool(pattern.search(line))
-        else:
-            needle = query.lower()
-            matcher = lambda line: needle in line.lower()
-    except re.error as exc:
-        return f"Error: invalid regex pattern: {exc}"
+        result = await workspace_fs.search(
+            workspace_path,
+            query,
+            file_pattern=file_pattern or "*",
+            regex=regex,
+            context_before=context_before if wants_lines else 0,
+            context_after=context_after if wants_lines else 0,
+            max_results=max_results,
+            include_matches=wants_lines,
+        )
+    except workspace_fs.WorkspaceFileError as exc:
+        logger.warning("search_code_failed", query=query, error=str(exc))
+        return f"Error: search failed: {exc}"
 
-    # Collect results.
-    # Each match: (rel_path, line_num, line_content, [context_lines])
-    matches: List[Tuple[str, int, str, List[str]]] = []
-    files_with_matches: dict[str, int] = {}
-
-    for filepath in root.rglob("*"):
-        # Skip excluded directories.
-        if any(part in EXCLUDE_DIRS for part in filepath.parts):
-            continue
-        if not filepath.is_file():
-            continue
-
-        # Apply file_pattern (supports ``dir/**/*.py`` style patterns).
-        rel = filepath.relative_to(root)
-        rel_str = str(rel)
-        if not _match_glob(rel_str, file_pattern):
-            continue
-
-        # Skip binary files.
-        if is_binary_file(filepath):
-            continue
-
-        try:
-            content = filepath.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-
-        file_lines = content.splitlines()
-        file_match_count = 0
-
-        for line_num, line in enumerate(file_lines, 1):
-            if matcher(line):
-                file_match_count += 1
-                files_with_matches[rel_str] = (
-                    files_with_matches.get(rel_str, 0) + 1
-                )
-
-                if output_mode == "content":
-                    # Gather context lines.
-                    ctx_start = max(0, line_num - 1 - context_before)
-                    ctx_end = min(len(file_lines), line_num + context_after)
-                    context_block = []
-                    for ci in range(ctx_start, ctx_end):
-                        cl = file_lines[ci]
-                        marker = ">>" if (ci + 1) == line_num else "  "
-                        context_block.append(f"  {marker} L{ci + 1}: {cl}")
-                    matches.append((rel_str, line_num, line, context_block))
-
-                    if len(matches) >= max_results:
-                        break
-
-        if output_mode == "content" and len(matches) >= max_results:
-            break
-
-    # Build output.
-    if not files_with_matches:
+    if not result.files:
         return f"No matches found for '{query}' in {file_pattern} files."
 
     if output_mode == "files_with_matches":
-        return _format_files_with_matches(query, file_pattern, files_with_matches)
-
+        return _format_files_with_matches(query, file_pattern, result.files)
     if output_mode == "count":
-        return _format_count(query, file_pattern, files_with_matches)
-
-    # content mode
-    return _format_content(
-        query, file_pattern, matches, max_results
-    )
+        return _format_count(query, file_pattern, result.files)
+    return _format_content(query, file_pattern, result.hits, result.truncated)
 
 
 # ─────────────────────── Output formatters ───────────────────────
 
 
-def _match_glob(rel_path: str, pattern: str) -> bool:
-    """Match *rel_path* against *pattern*, supporting ``**`` recursion."""
-    if pattern == "*":
-        return True
-    # fnmatch doesn't handle ``**`` natively; do a two-pass check.
-    # ``models/**/*.sql`` → match the tail ``*.sql`` and the head ``models/``.
-    if "**/" in pattern:
-        head, _, tail = pattern.partition("**/")
-        # head is a directory prefix; tail is a file glob.
-        if head and not rel_path.startswith(head):
-            return False
-        return fnmatch.fnmatch(rel_path.split("/")[-1], tail or "*")
-    return fnmatch.fnmatch(rel_path, pattern)
-
-
 def _format_content(
     query: str,
     file_pattern: str,
-    matches: List[Tuple[str, int, str, List[str]]],
-    max_results: int,
+    hits: List[workspace_fs.SearchHit],
+    truncated: bool,
 ) -> str:
     lines = [f"## Search Results for '{query}'"]
-    lines.append(
-        f"Pattern: `{file_pattern}` | Found: {len(matches)} match(es)"
-    )
+    lines.append(f"Pattern: `{file_pattern}` | Found: {len(hits)} match(es)")
 
     current_file = ""
-    for rel_path, line_num, line_content, context_block in matches:
-        if rel_path != current_file:
-            current_file = rel_path
-            lines.append(f"\n### {rel_path}")
-        lines.append(f"  L{line_num}: {line_content[:200]}")
-        for ctx_line in context_block:
-            lines.append(ctx_line)
+    for hit in hits:
+        if hit.path != current_file:
+            current_file = hit.path
+            lines.append(f"\n### {hit.path}")
+        lines.append(f"  L{hit.line}: {hit.text[:200]}")
+        lines.extend(hit.context)
 
-    if len(matches) >= max_results:
-        lines.append(f"\n... (results capped at {max_results})")
+    if truncated:
+        lines.append(f"\n... (results capped at {len(hits)})")
 
     return "\n".join(lines)
 
@@ -219,9 +145,7 @@ def _format_files_with_matches(
     return "\n".join(lines)
 
 
-def _format_count(
-    query: str, file_pattern: str, files: dict[str, int]
-) -> str:
+def _format_count(query: str, file_pattern: str, files: dict[str, int]) -> str:
     total = sum(files.values())
     lines = [
         f"## Match counts for '{query}'",

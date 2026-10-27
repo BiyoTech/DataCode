@@ -1,0 +1,93 @@
+# Profile: k8s-cell — a Cell running in Kubernetes (DATACODE_ENV=k8s-cell)
+#
+# Delivered as a ConfigMap generated from this conf/ directory by
+# deploy/k8s/overlays/cell, mounted at /app/conf with CONFIG_PATH set. The
+# mechanism is identical to the compose profiles; only the addresses differ.
+#
+# Namespace contract: platform services live in `datacode`, sandbox vehicles
+# (task-runner, warm pool, code locations, egress plane) in `datacode-tasks`.
+# Those two names are referenced by the NetworkPolicies, so they are fixed.
+#
+# Multi-cell: every cell uses THIS file. A cell's identity comes from
+# DATACODE_CELL_ID, injected per overlay. When cells live in separate clusters
+# the Service DNS below resolves locally in each; when they share a cluster,
+# give each cell its own namespace and adjust the FQDNs in a copied overlay —
+# never by editing this file, which all of them read.
+#
+# Fully-qualified names, not short ones: a short name resolves through the
+# pod's search domains, which differ between namespaces. An FQDN means a
+# service moved to another namespace fails to resolve loudly instead of
+# silently binding to a same-named neighbour.
+
+database:
+  # The CELL tier. Point this at your managed PostgreSQL when you have one; the
+  # in-cluster Service name below assumes the reference deployment.
+  host: "postgres.datacode.svc.cluster.local"
+  port: 5432
+  name: "datacode"
+  username: "datacode"
+  # password: env-only (DB_PASSWORD, from Secret datacode-db)
+  # Larger than the compose default: a cluster runs more replicas per database,
+  # and exhausting the pool shows up as request latency rather than an error.
+  pool_size: 10
+  pool_overflow: 20
+
+  services:
+    # The GLOBAL tier, reached across the cluster/region boundary. identity
+    # tables must NOT live in a cell database — see conf/platform.yaml.
+    identity:
+      type: "postgresql"
+      host: "global-pg.datacode-global.svc.cluster.local"
+      port: 5432
+      name: "identity"
+      username: "datacode"
+
+cells:
+  # Enforced at startup: declaring the split without performing it is refused.
+  expect_global_db: true
+
+redis:
+  host: "redis.datacode.svc.cluster.local"
+  port: 6379
+
+workspace:
+  # The per-replica ReadWriteOnce PVC mounted by the workspace-runtime
+  # StatefulSet (design 07 ADR-003: persisted local disk, never a shared RWX
+  # volume). Must match WORKSPACE_RUNTIME_MATERIALIZE_ROOT in that manifest —
+  # which sets the same path via env, so this value never actually reached the
+  # process while the two disagreed (`workcopies` here, `workspaces` there).
+  # A dead value that looks authoritative is worse than no value.
+  base_path: "/var/lib/datacode/workspaces"
+
+services:
+  gateway:
+    http_url: "http://gateway.datacode.svc.cluster.local:8000"
+  agent:
+    ws_url: "ws://agent-service.datacode.svc.cluster.local:8001"
+    grpc_url: "agent-service.datacode.svc.cluster.local:50051"
+    rest_url: "http://agent-service.datacode.svc.cluster.local:8001"
+  # The HEADLESS service of the runtime StatefulSet. It provides DNS only —
+  # working-copy traffic is dialed at the POD resolved from the lease, because
+  # a load-balancing ClusterIP is exactly what a lease forbids. This URL is for
+  # the control plane's env-control dispatch, which any replica may serve.
+  runtime:
+    rest_url: "http://workspace-runtime.datacode.svc.cluster.local:8002"
+  control:
+    rest_url: "http://control-service.datacode.svc.cluster.local:8004"
+  identity:
+    rest_url: "http://identity-service.datacode-global.svc.cluster.local:8003"
+
+  # ── Sandbox egress plane (P6b) ──────────────────────────────────────
+  # Set HERE and nowhere else: these addresses are only honest when the
+  # NetworkPolicies in deploy/k8s/base/egress-plane.yaml are applied, making the
+  # proxy a sandbox's ONLY outbound path. Without them a configured proxy would
+  # mediate some traffic while the rest flowed freely.
+  egress_proxy:
+    url: "http://egress-proxy.datacode-tasks.svc.cluster.local:3128"
+  # The controlled resolver for Pods whose isolation profile declares
+  # `dns_policy: None` — without it such a Pod has NO resolver at all. A Service
+  # NAME, not an IP: a ClusterIP is assigned by the cluster and cannot be
+  # predicted, so workspace-runtime resolves this name to the ClusterIP when it
+  # builds a sandbox Pod (Pod dnsConfig only accepts IPs).
+  egress_dns:
+    host: "egress-dns.datacode-tasks.svc.cluster.local"

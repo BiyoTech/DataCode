@@ -51,7 +51,12 @@ export function useSSE(options: UseSSEOptions): UseSSEReturn {
       }
     },
     onStateChange,
-    maxReconnectAttempts,
+    // A chat page outlives any single outage: a backend restart or a laptop
+    // waking up must not leave the stream permanently dead. Giving up (the
+    // generic default) is what makes an agent run look like it produced
+    // nothing — the run finishes server-side while the client is deaf, and the
+    // answer only appears in one block after a manual page reload.
+    maxReconnectAttempts: maxReconnectAttempts ?? Number.POSITIVE_INFINITY,
     heartbeatTimeout,
     label: 'SSE',
   })

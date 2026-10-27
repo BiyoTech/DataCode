@@ -1,7 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================================
-# sqlmesh.sh — Unified CLI wrapper for sqlmesh
+# sqlmesh.sh — HUMAN-FACING CLI wrapper for sqlmesh
 # ============================================================================
+# WHO THIS IS FOR
+#   A person working in a terminal on a workspace they have open. It is NOT on
+#   the agent's path any more and must not be put back there.
+#
+#   Governed verbs used to be dispatched from INSIDE the executing side: this
+#   shim was prepended to the agent sandbox's PATH and called the platform back
+#   over HTTP. That required handing the sandbox the platform's address and the
+#   caller's identity — the exact network path the L3-base NetworkPolicy denies
+#   (threats T3/T6) — and it made dev and production decide differently, because
+#   the deciding factor was whether the shim could be injected at all.
+#
+#   Agent commands are now ROUTED by workspace-runtime before anything executes
+#   (workspace-runtime/src/tools/command_router.py). The verb list both sides
+#   agree on lives in shared/python/datacode_common/command_verbs.py; a sandbox
+#   additionally carries generated guards that refuse those verbs, for the case
+#   routing cannot cover (a governed verb inside a compound command).
+#
+#   This file therefore serves one remaining audience: a human whose shell has
+#   the platform reachable. Keep it in sync with command_verbs.py when the set
+#   of governed verbs changes.
+#
 # Command model:
 #   sqlmesh plan <env>   → preview (intercepted → backend API POST /api/v1/plan).
 #                          Shows diff summary; never deploys. Read-only.
@@ -14,7 +35,7 @@
 # (--skip-tests, --forward-only, --start, --end, etc.). The legacy
 # "plan --auto-apply" is intentionally rejected.
 #
-# Ontology commands (intercepted → Ontology Service API on port 8003):
+# Ontology commands (intercepted → the runtime's ontology API on port 8002):
 #   sqlmesh ontology validate <name> → validate cross-references in one ontology
 #                                      (POST /api/v1/ontology/{name}/validate).
 #   sqlmesh ontology validate --all  → validate every ontology in the workspace.
@@ -23,8 +44,8 @@
 # All other read-only / local commands are transparently forwarded to the
 # native sqlmesh binary. Before forwarding, the shim locates the SQLMesh
 # project directory ({workspace}/sql-warehouse/ under the platform layout)
-# and execs the native binary from there, because the shell tool places us
-# at the worktree root while native sqlmesh expects cwd inside the project.
+# and execs the native binary from there, because a shell places us at the
+# worktree root while native sqlmesh expects cwd inside the project.
 #
 #   sqlmesh run ...     → REJECTED. Data refresh is a write operation that
 #                          would bypass platform governance (environment
@@ -32,17 +53,14 @@
 #                          or trigger an orchestrated refresh with
 #                          `dc run <job_name>`.
 #
-# Designed to be invoked via a thin "sqlmesh" executable placed in PATH
-# before the real sqlmesh binary. The shell tool (shell.py) injects the
-# shim directory at the front of PATH and exports DATACODE_* env vars.
-#
-# Environment variables (injected by shell.py or set manually):
-#   DATACODE_SQLMESH_SERVICE_URL  Backend API base URL (default: http://localhost:8002)
-#   DATACODE_ONTOLOGY_SERVICE_URL Ontology service base URL (default: http://localhost:8003)
+# Environment variables (set manually by the user, or by their shell profile):
+#   DATACODE_WORKSPACE_RUNTIME_URL  Backend (workspace-runtime) API base URL
+#                                   (default: http://localhost:8002)
+#   DATACODE_ONTOLOGY_SERVICE_URL Ontology service base URL (default: http://localhost:8002)
 #   DATACODE_WORKSPACE_PATH       Absolute path to workspace root
-#   DATACODE_ENVIRONMENT          Authoritative active environment (from toolbar).
-#                                    When set, it overrides any environment the LLM
-#                                    passes to plan/apply (anti-hallucination guard).
+#   DATACODE_ENVIRONMENT          Authoritative active environment, when the
+#                                    caller wants one pinned. Overrides the
+#                                    environment passed to plan/apply.
 #   DATACODE_TRIGGER_TYPE         "agent" or "human" (default: human)
 #   DATACODE_USER_ID              User identifier (default: $USER)
 #   DATACODE_SESSION_ID           Session identifier (agent context only)
@@ -93,10 +111,11 @@ REAL_SQLMESH=$(_resolve_real_sqlmesh)
 # -------------------------------------------------------------------
 # Resolve backend API base URL
 # -------------------------------------------------------------------
-API_URL="${DATACODE_SQLMESH_SERVICE_URL:-http://localhost:8002}"
+API_URL="${DATACODE_WORKSPACE_RUNTIME_URL:-http://localhost:8002}"
 
-# Ontology Service runs on a separate port (8003) from sqlmesh-service (8002).
-ONTOLOGY_API_URL="${DATACODE_ONTOLOGY_SERVICE_URL:-http://localhost:8003}"
+# workspace-runtime (8002) owns the working-copy surface since P3; the
+# ontology data plane moved into it as well.
+ONTOLOGY_API_URL="${DATACODE_ONTOLOGY_SERVICE_URL:-http://localhost:8002}"
 
 # -------------------------------------------------------------------
 # Resolve workspace path (required for backend API commands)
@@ -728,7 +747,7 @@ if written:
 # -------------------------------------------------------------------
 # _handle_ontology_command — intercepted ontology subcommands.
 #
-# Routes to the Ontology Service (default port 8003) via HTTP API.
+# Routes to the runtime's ontology API (default port 8002) via HTTP.
 #
 # Usage:
 #   sqlmesh ontology validate <name>   Validate cross-references in a specific ontology
@@ -808,7 +827,7 @@ _handle_ontology_command() {
             echo "  list              List all available ontologies" >&2
             echo "" >&2
             echo "Environment:" >&2
-            echo "  DATACODE_ONTOLOGY_SERVICE_URL  Ontology service URL (default: http://localhost:8003)" >&2
+            echo "  DATACODE_ONTOLOGY_SERVICE_URL  Ontology service URL (default: http://localhost:8002)" >&2
             exit 0
             ;;
         *)
@@ -835,7 +854,7 @@ _ontology_run_python() {
     python3 -c "
 import json, os, sys, urllib.request, urllib.error, urllib.parse
 
-api_url   = os.environ.get('_AD_ONTOLOGY_API_URL', 'http://localhost:8003')
+api_url   = os.environ.get('_AD_ONTOLOGY_API_URL', 'http://localhost:8002')
 mode      = os.environ.get('_AD_ONTOLOGY_MODE', '')
 workspace = os.environ.get('_AD_WORKSPACE', '')
 name      = os.environ.get('_AD_ONTOLOGY_NAME', '')
@@ -999,7 +1018,7 @@ if [[ "$SUBCOMMAND" == "create_external_models" ]]; then
     exit $?
 fi
 
-# ontology validate/list → Ontology Service API (port 8003)
+# ontology validate/list → the runtime's ontology API (port 8002)
 if [[ "$SUBCOMMAND" == "ontology" ]]; then
     _handle_ontology_command "${@:2}"
     exit $?

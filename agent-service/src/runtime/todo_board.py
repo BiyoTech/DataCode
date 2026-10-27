@@ -1,50 +1,53 @@
-"""Workspace task board — persistence for write_todo and goal-run completion checks."""
+"""Session task board — todo state for write_todo and goal-run continuation.
+
+Held in THIS PROCESS, deliberately not in the working copy. Two reasons, both
+structural:
+
+* agent-service owns no working copy. The copy belongs to the
+  workspace-runtime replica that holds its lease, and in every container
+  deployment the agent is given no volume for it at all — which is how a chat
+  used to die with ``[Errno 13] Permission denied: '/data'``: the board's
+  ``mkdir(parents=True)`` walked up to a root the container may not create.
+* Even where the path happens to be reachable (host dev), writing there makes
+  agent-service a SECOND writer inside a leased Git worktree, which is exactly
+  what the lease exists to prevent.
+
+Lifetime is the process, and that is enough: the board is run-control state,
+read only by the goal loop while a run is in flight. What the USER sees is the
+``todo_list`` timeline event, which ``write_todo`` persists — so a restart
+costs the continuation nudge, never the visible task list.
+"""
 
 from __future__ import annotations
 
-import json
 import threading
-from dataclasses import dataclass, field
-from pathlib import Path
+from collections import OrderedDict
 from typing import Any
 
 _ALLOWED_STATUS = {"pending", "in_progress", "completed", "deleted"}
 _INCOMPLETE_STATUS = {"pending", "in_progress"}
 
+# Boards are keyed per (workspace, session) and nothing tells this module when a
+# session ends, so the registry is bounded and evicts the least recently used —
+# an unbounded dict here would be a slow leak in a long-running service. A board
+# is a handful of short strings, so the cap can be generous.
+MAX_BOARDS = 500
 
-@dataclass
+
 class TaskBoard:
-    """Thread-safe, file-based task storage (one JSON file per task)."""
+    """Thread-safe todo storage for one session.
 
-    root: Path
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+    Thread-safe rather than async-locked: the writer is an async tool and the
+    reader is the goal loop, but both call in from threads the SDK owns, and a
+    ``threading.Lock`` is the only primitive correct for both.
+    """
 
-    def __post_init__(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-
-    def _next_id(self) -> int:
-        ids: list[int] = []
-        for fp in self.root.glob("task_*.json"):
-            try:
-                ids.append(int(fp.stem.split("_")[1]))
-            except (IndexError, ValueError):
-                continue
-        return (max(ids) if ids else 0) + 1
-
-    def _path(self, task_id: int) -> Path:
-        return self.root / f"task_{task_id}.json"
-
-    def _load(self, task_id: int) -> dict[str, Any]:
-        fp = self._path(task_id)
-        if not fp.exists():
-            raise ValueError(f"task {task_id} not found")
-        return json.loads(fp.read_text(encoding="utf-8"))
-
-    def _save(self, data: dict[str, Any]) -> None:
-        fp = self._path(int(data["id"]))
-        tmp = fp.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(fp)
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Insertion-ordered: list_all() must reproduce the order the agent
+        # declared its plan in, which is what the UI card renders.
+        self._tasks: "OrderedDict[int, dict[str, Any]]" = OrderedDict()
+        self._next = 1
 
     def create(self, content: str, status: str = "pending") -> dict[str, Any]:
         content = (content or "").strip()
@@ -54,66 +57,61 @@ class TaskBoard:
             raise ValueError("content too long (max 200 chars)")
         with self._lock:
             task = {
-                "id": self._next_id(),
+                "id": self._next,
                 "content": content,
                 "status": status if status in _ALLOWED_STATUS else "pending",
             }
-            self._save(task)
-        return task
+            self._tasks[task["id"]] = task
+            self._next += 1
+        return dict(task)
 
     def update(self, task_id: int, status: str) -> dict[str, Any]:
         normalized = status.lower()
         if normalized not in _ALLOWED_STATUS:
             raise ValueError(f"invalid status: {status}")
         with self._lock:
-            task = self._load(task_id)
+            task = self._tasks.get(int(task_id))
+            if task is None:
+                raise ValueError(f"task {task_id} not found")
             task["status"] = normalized
             if normalized == "deleted":
-                self._path(task_id).unlink(missing_ok=True)
-            else:
-                self._save(task)
-        return task
+                # Deleted items must disappear from the incomplete set AND from
+                # the snapshot; keeping them would re-nudge forever.
+                self._tasks.pop(int(task_id), None)
+            return dict(task)
 
     def list_all(self) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        for fp in sorted(self.root.glob("task_*.json")):
-            try:
-                items.append(json.loads(fp.read_text(encoding="utf-8")))
-            except Exception:
-                continue
-        return items
+        with self._lock:
+            return [dict(task) for task in self._tasks.values()]
 
     def list_incomplete(self) -> list[dict[str, Any]]:
         return [
-            t for t in self.list_all()
-            if t.get("status", "pending") in _INCOMPLETE_STATUS
+            task for task in self.list_all()
+            if task.get("status", "pending") in _INCOMPLETE_STATUS
         ]
 
     def clear_all(self) -> None:
         with self._lock:
-            for fp in self.root.glob("task_*.json"):
-                fp.unlink(missing_ok=True)
+            self._tasks.clear()
 
 
-_boards: dict[str, TaskBoard] = {}
+_boards: "OrderedDict[str, TaskBoard]" = OrderedDict()
 _boards_lock = threading.Lock()
 
 
-def task_board_root(workspace_path: str, session_id: str = "") -> Path:
-    """Resolve the on-disk directory for a task board."""
-    base = Path(workspace_path).resolve() / ".agent" / "tasks"
-    if session_id:
-        return base / session_id
-    return base
-
-
 def get_task_board(workspace_path: str, session_id: str = "") -> TaskBoard:
-    root = task_board_root(workspace_path, session_id)
-    key = str(root)
+    """The board for one working copy + session, created on first use."""
+    key = f"{workspace_path}\x00{session_id}"
     with _boards_lock:
-        if key not in _boards:
-            _boards[key] = TaskBoard(root=root)
-        return _boards[key]
+        board = _boards.get(key)
+        if board is None:
+            board = TaskBoard()
+            _boards[key] = board
+        else:
+            _boards.move_to_end(key)
+        while len(_boards) > MAX_BOARDS:
+            _boards.popitem(last=False)
+        return board
 
 
 # NOTE: Read and write paths MUST resolve to the SAME board. ``write_todo`` only

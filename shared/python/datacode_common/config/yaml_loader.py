@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def find_config_file(filename: str, *, package_file: Path) -> Optional[Path]:
@@ -61,3 +64,49 @@ def flatten_yaml_mapping(data: dict[str, Any], mapping: dict[str, str]) -> dict[
         if value is not None:
             result[field_name] = value
     return result
+
+
+def drop_env_provided_keys(
+    yaml_flat: dict[str, Any], *, env_prefix: str
+) -> dict[str, Any]:
+    """Remove keys the environment already provides, so env wins over YAML.
+
+    pydantic-settings ranks its INIT source ABOVE its ENV source. Every service
+    here loads its YAML file and passes the result as ``__init__`` kwargs, which
+    therefore SHADOWS every ``<PREFIX>_<FIELD>`` environment variable — silently,
+    because both layers produce a valid value and nothing reports which one won.
+
+    That failure mode is not theoretical: a container setting
+    ``WORKSPACE_RUNTIME_LEASE_ENABLED=true`` kept booting with leases disabled
+    because ``conf/workspace-runtime.yaml`` also declares ``lease.enabled``.
+
+    Dropping the env-provided keys here lets pydantic's env source fill them,
+    restoring the documented precedence: env > service YAML > platform > defaults.
+
+    Note ``os.environ`` membership, not truthiness: an intentionally empty value
+    (``FOO=``) is still a decision by the deployment and must not fall back to
+    the file.
+
+    Args:
+        yaml_flat: Flattened YAML values, keyed by pydantic field name.
+        env_prefix: The service's ``env_prefix`` (e.g. ``WORKSPACE_RUNTIME_``).
+
+    Returns:
+        A new mapping without the keys the environment supplies.
+    """
+    kept: dict[str, Any] = {}
+    shadowed: list[str] = []
+    for key, value in yaml_flat.items():
+        if f"{env_prefix}{key.upper()}" in os.environ:
+            shadowed.append(key)
+            continue
+        kept[key] = value
+    if shadowed:
+        # Deliberately logged: "my env var had no effect" is otherwise an
+        # invisible failure, and this line is the only place that knows.
+        logger.debug(
+            "config_env_override_applied prefix=%s fields=%s",
+            env_prefix,
+            ",".join(sorted(shadowed)),
+        )
+    return kept

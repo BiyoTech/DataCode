@@ -113,7 +113,7 @@ Use `create_file` for brand-new model files. Do NOT use it to modify existing fi
 4. **Create**: Use `create_file` to create the new model in the appropriate directory
 5. **Preview**: Run `shell(commands=["sqlmesh plan <active_env>"])` to show the impact of changes (which models will be added/modified/removed). This is read-only and never deploys.
 6. **Confirm**: Present the preview to the user and ask for explicit confirmation to deploy. Do NOT proceed without a clear "yes".
-7. **Apply**: ONLY after the user confirms, run `shell(commands=["sqlmesh apply <active_env>"])` to deploy changes. This is intercepted by the platform wrapper and executed via the sqlmesh-service backend API for unified governance (locking, optimistic concurrency, auditability).
+7. **Apply**: ONLY after the user confirms, run `shell(commands=["sqlmesh apply <active_env>"])` to deploy changes. The platform serves this itself — the same code path as the Web deploy button — for unified governance (locking, optimistic concurrency, auditability).
 
 ---
 
@@ -162,14 +162,21 @@ virtual environment activated.
 **How to call**: `shell(commands=["sqlmesh <subcommand> <args>", "..."], timeout_ms=<ms>)`
 
 **Working directory**: The SQLMesh project lives at `{workspace}/sql-warehouse/`.
-The CLI wrapper locates it automatically — run `sqlmesh test`, `sqlmesh audit`,
+The platform locates it automatically — run `sqlmesh test`, `sqlmesh audit`,
 `sqlmesh render`, etc. directly from anywhere in the workspace. Do NOT prepend
 `cd sql-warehouse` yourself.
+
+**One command per string.** `plan`, `apply`, `create_external_models` and
+`ontology` are served by the platform itself (environment lock, apply history,
+audit). The platform can only do that for a SINGLE command — a string containing
+`&&`, `;`, `|` or `$(...)` is executed in the sandbox instead, where those verbs
+are REFUSED. So write `shell(commands=["sqlmesh plan dev", "sqlmesh test"])`,
+never `shell(commands=["sqlmesh plan dev && sqlmesh test"])`.
 
 | Command | Purpose | Risk |
 |---------|---------|------|
 | `sqlmesh plan <env>` | Preview changes without applying (read-only, never deploys) | Read-only |
-| `sqlmesh apply <env>` | Deploy changes via platform backend API — **requires user confirmation first** | **Write** ⚠️ |
+| `sqlmesh apply <env>` | Deploy changes — **requires user confirmation first** | **Write** ⚠️ |
 | `sqlmesh run <env>` | **DISABLED** — data refresh bypasses governance; use `sqlmesh apply` for versioned landing or `dc run <job>` for orchestrated refresh | **Blocked** ⚠️ |
 | `sqlmesh test` | Run all unit tests for models | Read-only |
 | `sqlmesh audit` | Run data quality audits | Read-only |
@@ -183,9 +190,13 @@ The CLI wrapper locates it automatically — run `sqlmesh test`, `sqlmesh audit`
 | `sqlmesh create_external_models` | Register external tables | **Write** ⚠️ |
 
 > **`--auto-apply` is disabled.** Preview (`plan`) and deploy (`apply`) are two
-> distinct commands. The wrapper rejects `sqlmesh plan <env> --auto-apply` so a
-> preview can never accidentally deploy. Deployment must be an explicit,
+> distinct commands. `sqlmesh plan <env> --auto-apply` is rejected so a preview
+> can never accidentally deploy. Deployment must be an explicit,
 > user-confirmed `sqlmesh apply <env>` call.
+
+> **The environment argument does not choose the target.** Your working copy is
+> checked out to exactly one environment, and that is where `plan`/`apply` act.
+> Naming a different one is reported back to you and ignored.
 
 **When to use CLI over tool calls:**
 - `shell(commands=["sqlmesh plan <active_env>"])` — preview plan changes
@@ -204,8 +215,8 @@ The CLI wrapper locates it automatically — run `sqlmesh test`, `sqlmesh audit`
 5. shell(commands=["sqlmesh apply <active_env>"])  # deploy — ONLY after user confirms
 ```
 
-**Warning**: `sqlmesh apply <env>` is intercepted by the platform CLI wrapper and
-executed via the sqlmesh-service backend API for unified governance, locking, and
+**Warning**: `sqlmesh apply <env>` is served by the platform itself — the same
+code path the Web deploy button uses — for unified governance, locking and
 auditability. It is a destructive write operation and MUST only be run after the
 user has explicitly confirmed the deployment. Always run `sqlmesh plan <env>` first
 to preview. The legacy `plan --auto-apply` is disabled, and so is `sqlmesh run`:

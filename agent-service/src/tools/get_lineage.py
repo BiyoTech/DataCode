@@ -1,19 +1,17 @@
 """Tool: get_lineage - get model dependency DAG (Lineage).
 
 Retrieves the blood relationship graph showing how models depend on each other.
-Calls the sqlmesh-service /lineage endpoint which returns:
+Calls workspace-runtime's /lineage endpoint which returns:
   {
     "graph": {"<fqn>": ["<upstream_dep_fqn>", ...]},
     "nodes": {"<fqn>": {"name", "fqn", "type", "kind", "columns": [{name, type}]}}
   }
 """
 
-import httpx
 from agents import RunContextWrapper, function_tool
-
-from src.config import settings
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry
+from src.tools.runtime_client import RuntimeUnavailable, get_runtime_client
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,27 +35,16 @@ async def get_lineage(ctx: RunContextWrapper[ToolContext], model_name: str = "")
     logger.info("get_lineage_tool_invoked", workspace_path=workspace_path, model_name=model_name)
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{settings.sqlmesh_service_url}/api/v1/lineage",
-                params={"workspace_path": workspace_path, "model_name": model_name},
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.TimeoutException:
-        logger.error("get_lineage_timeout", workspace_path=workspace_path, model_name=model_name)
-        return "Error: lineage request timed out. Please try again."
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "get_lineage_http_error",
-            status_code=e.response.status_code,
+        data = await get_runtime_client().get(
+            "/api/v1/lineage",
             workspace_path=workspace_path,
+            params={"workspace_path": workspace_path, "model_name": model_name},
         )
-        return f"Error: lineage service returned HTTP {e.response.status_code}."
-    except Exception as e:
-        logger.error("get_lineage_request_failed", error=str(e))
-        return f"Error: failed to fetch lineage: {e}"
+    except RuntimeUnavailable as exc:
+        logger.warning(
+            "get_lineage_failed", workspace_path=workspace_path, error=str(exc)
+        )
+        return f"Error: failed to fetch lineage: {exc}"
 
     graph = data.get("graph", {})
     nodes = data.get("nodes", {})

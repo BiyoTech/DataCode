@@ -24,11 +24,36 @@ import type {
   DeploymentDiff,
   DeploymentInfo,
   ModeInfo,
+  ReloadJobInfo,
   RunInfo,
   RunLogEvent,
   ScheduleInfo,
   SqlmeshLineageResponse,
 } from '@/types/dagster'
+
+// Transcript lines kept in memory for the progress panel. pip is chatty and the
+// interesting part is always the end.
+const OUTPUT_LINES = 500
+
+// How long the UI waits for a reload before giving up on it. Above the backend's
+// own install budget plus the code-location start, so a legitimate first install
+// finishes inside it; the job itself is bounded by the sandbox, so this only
+// decides how long the PAGE waits.
+const RELOAD_WAIT_MS = 20 * 60 * 1000
+
+/**
+ * A reload that reached a terminal, non-successful state.
+ *
+ * Carries the job so a caller can render the structured reason instead of only a
+ * message: the failure code decides the wording, and `error_log_id` names the
+ * archived record under `{workspace}/logs/errors/`.
+ */
+export class ReloadFailedError extends Error {
+  constructor(readonly job: ReloadJobInfo) {
+    super(job.message || 'the reload failed')
+    this.name = 'ReloadFailedError'
+  }
+}
 
 // Prefix applied to every SQLMesh-derived Dagster asset key (mirrors the
 // backend bridge). Used to detect SQLMesh assets and to convert between an
@@ -80,6 +105,11 @@ export const useDagsterStore = defineStore('dagster', () => {
   // Deployment backing the loaded graph. Carries the environment, its type and
   // whether its schedules may run, which is what the DAG/schedule views display.
   const deployment = ref<DeploymentInfo | null>(null)
+  // The reload in flight (or the last one), and the installer output collected
+  // for it. Held in the store rather than in a component so switching views
+  // during a ten-minute install does not lose the progress.
+  const reloadJob = ref<ReloadJobInfo | null>(null)
+  const reloadOutput = ref<string[]>([])
 
   const graphLoading = ref(false)
   // Loading / error state for the selected asset's lineage subgraph.
@@ -201,13 +231,109 @@ export const useDagsterStore = defineStore('dagster', () => {
     }
   }
 
-  /** Reload the environment's deployment (after user edits asset-dag/ code). */
-  async function reloadDeployment(workspacePath: string): Promise<void> {
-    const { data } = await api.post<DeploymentInfo>('/dagster/deployments/reload', {
+  /**
+   * Reload the environment's deployment (after user edits asset-dag/ code).
+   *
+   * The backend runs this as a JOB: it installs the working copy's declared
+   * Python packages before starting the code location, which can take minutes on
+   * a first install. So this starts the job and resolves only when it reaches a
+   * terminal state, exposing `reloadJob` for the progress panel meanwhile.
+   *
+   * Progress comes from two sources on purpose. The SSE `deployment` topic is the
+   * live one, and polling is the authoritative fallback: a dropped connection, a
+   * background tab or a runtime restart must not leave the UI waiting forever on
+   * an event that will never arrive.
+   *
+   * Rejects when the reload failed, so callers keep their existing error handling
+   * — but the reason is also left in `reloadJob` for the panel to render, since a
+   * toast cannot hold a pip transcript.
+   */
+  async function reloadDeployment(workspacePath: string): Promise<ReloadJobInfo> {
+    if (!workspacePath) throw new Error('workspace path is required')
+
+    const { data } = await api.post<ReloadJobInfo>('/dagster/deployments/reload', {
+      workspace_path: workspacePath,
+      source: 'ui',
+    })
+    reloadJob.value = data
+    reloadOutput.value = data.output_tail ? data.output_tail.split('\n') : []
+
+    const final = await watchReloadJob(workspacePath, data.job_id)
+    if (final.state !== 'succeeded') {
+      throw new ReloadFailedError(final)
+    }
+    if (final.deployment) deployment.value = final.deployment
+    await loadGraph(workspacePath, true)
+    return final
+  }
+
+  /**
+   * Apply one reload progress update.
+   *
+   * Written as a reducer over the job envelope rather than as inline assignments
+   * because the same shape arrives from two channels: the status endpoint (what
+   * this store polls) and the runtime's SSE `deployment` topic (published for
+   * other consumers — the CLI, a second tab — which this app does not subscribe
+   * to today). A single reducer is what keeps them from disagreeing about the
+   * current stage if that subscription is ever added.
+   */
+  function applyReloadEvent(event: ReloadJobInfo): void {
+    // Ignore anything about a job we are not watching: the topic is per working
+    // copy, so a second tab's reload of a different copy can arrive here.
+    if (reloadJob.value && event.job_id !== reloadJob.value.job_id) return
+    if (event.line) {
+      reloadOutput.value = [...reloadOutput.value, event.line].slice(-OUTPUT_LINES)
+      // A progress event deliberately carries no tail (it would resend the whole
+      // transcript per line), so keep the one accumulated so far.
+      reloadJob.value = { ...event, output_tail: reloadJob.value?.output_tail || '' }
+      return
+    }
+    if (event.output_tail) {
+      reloadOutput.value = event.output_tail.split('\n').slice(-OUTPUT_LINES)
+    }
+    reloadJob.value = event
+  }
+
+  /**
+   * Poll a reload job until it is terminal.
+   *
+   * The interval is short at the start (a reload with nothing to install finishes
+   * in a second) and stretches out, so a ten-minute install does not cost six
+   * hundred requests.
+   */
+  async function watchReloadJob(
+    workspacePath: string,
+    jobId: string
+  ): Promise<ReloadJobInfo> {
+    const started = Date.now()
+    let delay = 400
+    while (Date.now() - started < RELOAD_WAIT_MS) {
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      delay = Math.min(delay * 1.4, 3000)
+      try {
+        const { data } = await api.get<ReloadJobInfo>('/dagster/deployments/reload/status', {
+          // workspace_path is REQUIRED, not decoration: the runtime is a headless
+          // Service and the gateway routes this request to the replica holding
+          // this copy's lease. Without it the query reaches a random replica.
+          params: { workspace_path: workspacePath, job_id: jobId },
+        })
+        applyReloadEvent(data)
+        if (data.state !== 'running') return data
+      } catch (e) {
+        // A transient 404/5xx while the job runs must not abort the watch: the
+        // job is still going, and the next poll is the cheapest recovery.
+        console.warn('[dagster] reload status poll failed:', e)
+      }
+    }
+    throw new Error('reload timed out')
+  }
+
+  /** Cancel the reload in flight for a working copy. */
+  async function cancelReload(workspacePath: string): Promise<void> {
+    const { data } = await api.post<ReloadJobInfo>('/dagster/deployments/reload/cancel', {
       workspace_path: workspacePath,
     })
-    deployment.value = data
-    await loadGraph(workspacePath, true)
+    applyReloadEvent(data)
   }
 
   /**
@@ -423,6 +549,8 @@ export const useDagsterStore = defineStore('dagster', () => {
     runLogs.value = {}
     schedules.value = []
     deployment.value = null
+    reloadJob.value = null
+    reloadOutput.value = []
     errorMsg.value = ''
     lineageError.value = ''
     lineageLoading.value = false
@@ -441,6 +569,8 @@ export const useDagsterStore = defineStore('dagster', () => {
     runLogs,
     schedules,
     deployment,
+    reloadJob,
+    reloadOutput,
     graphLoading,
     lineageLoading,
     lineageError,
@@ -458,6 +588,7 @@ export const useDagsterStore = defineStore('dagster', () => {
     ensureDeployment,
     loadGraph,
     reloadDeployment,
+    cancelReload,
     selectAsset,
     triggerRun,
     refreshRun,

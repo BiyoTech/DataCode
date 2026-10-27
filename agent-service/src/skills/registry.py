@@ -10,7 +10,8 @@ class-level dict + classmethod decorator-style register().
 
 Skill locations:
   - Builtin: src/skills/builtin/<skill_name>/SKILL.md  (service code)
-  - Installed: .agent/skills/installed/<skill_name>/SKILL.md (workspace-level, from session scaffold)
+  - Installed: .agent/skills/installed/<skill_name>/SKILL.md
+  (workspace-level, from session scaffold)
   - Custom: .agent/skills/custom/<skill_name>/SKILL.md (user-defined)
 """
 

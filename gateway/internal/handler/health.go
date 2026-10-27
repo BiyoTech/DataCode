@@ -31,9 +31,9 @@ func HealthCheck(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 		}
 
 		upstreams := map[string]string{
-			"agent":    cfg.Services.AgentServiceURL + "/health",
-			"sqlmesh":  cfg.Services.SQLMeshServiceURL + "/health",
-			"ontology": cfg.Services.OntologyServiceURL + "/health",
+			"agent":   cfg.Services.AgentServiceURL + "/health",
+			"runtime": cfg.Services.RuntimeServiceURL + "/health",
+			"control": controlPlaneURL(cfg) + "/health",
 		}
 
 		results := make(map[string]upstreamHealth, len(upstreams))

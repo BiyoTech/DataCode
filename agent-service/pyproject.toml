@@ -17,15 +17,32 @@ dependencies = [
     "pyyaml>=6.0.0",
     "aiosqlite>=0.20.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "datacode-common @ file:../shared/python",
+    # Core, not an extra: PostgreSQL is the platform engine everywhere (dev,
+    # Docker, Kubernetes — no shipped profile selects anything else), so an
+    # install without the driver crash-loops at startup (same contract as
+    # control-service and workspace-runtime).
+    "asyncpg>=0.30.0",
+    # Required, not optional: cross-replica run coordination AND lease-aware
+    # routing to workspace-runtime both read the shared Redis keyspace. Without
+    # it, routing silently degrades to the load-balanced Service address — which
+    # in Kubernetes is headless, so requests land on replicas that do not hold
+    # the working copy's lease and answer 409.
+    "redis>=5.0.0",
+    # Local shared package, NOT published to any index (PyPI has no
+    # datacode-common). Install it beforehand or in the same pip command,
+    # e.g. `pip install ./shared/python -e ./agent-service`; the dev
+    # scripts already install shared first. pip then sees the requirement
+    # satisfied and never hits the network.
+    "datacode-common",
 ]
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [project.optional-dependencies]
+# MySQL is not selected by any shipped profile; the dialect stays available
+# for bespoke deployments via this extra.
 mysql = ["aiomysql>=0.2.0"]
-postgresql = ["asyncpg>=0.30.0"]
 # Office document parsing for the read_file tool (PDF/Word/Excel/PowerPoint).
 # Install with: pip install -e ".[documents]"
 documents = [
@@ -53,7 +70,7 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = ["E", "F", "I", "W", "DTZ"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

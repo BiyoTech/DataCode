@@ -1,0 +1,103 @@
+# agent-service — conversational agents (design 02).
+#
+# REST (8001) carries user traffic via the gateway; gRPC (50051) carries the
+# streaming tool channel and stays internal to the cell network. Sessions
+# live in the cell's database; engine side effects belong to
+# workspace-runtime.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-service
+  namespace: datacode
+  labels:
+    app: agent-service
+spec:
+  selector:
+    app: agent-service
+  ports:
+    - name: http
+      port: 8001
+      targetPort: http
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-service
+  namespace: datacode
+  labels:
+    app: agent-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent-service
+  template:
+    metadata:
+      labels:
+        app: agent-service
+    spec:
+      containers:
+        - name: agent-service
+          image: datacode/agent-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8001
+            - name: grpc
+              containerPort: 50051
+          env:
+            # The config mechanism, identical to every other deployment shape:
+            # conf/ from the ConfigMap, profile selected by DATACODE_ENV. The
+            # base declares the cell profile; overlays replace it where needed.
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-cell
+            - name: DATACODE_CELL_ID
+              value: cell-0
+            # LLM key: global fallback for every model with an empty key.
+            - name: AGENT_SERVICE_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: agent-llm-api-key
+                  optional: true
+            # Authenticates the runtime's /internal/* calls this service makes.
+            - name: WORKSPACE_RUNTIME_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-db
+                  key: password
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "2", memory: 1Gi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf

@@ -22,13 +22,12 @@ Client → Server:
   - context.file_open
 """
 
+import json
 import typing as t
 import uuid
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-
 
 # ============================================================
 # Client → Server 消息类型
@@ -145,6 +144,27 @@ class ACPEvent:
             "payload": self.payload,
         }, ensure_ascii=False)
 
+    @classmethod
+    def from_json(cls, data) -> "ACPEvent":
+        """Rebuild an event from its JSON form (used by the Redis fan-out).
+
+        Accepts the event as a nested object (the fan-out envelope embeds it
+        parsed) or as a JSON string. Raises ValueError on an unknown event
+        type — e.g. a rolling upgrade where a newer replica publishes a type
+        this process does not know yet. Callers treat that as a dropped
+        message rather than an error: the event also reaches clients through
+        the producing replica directly.
+        """
+        obj = data if isinstance(data, dict) else json.loads(data)
+        return cls(
+            type=EventType(obj["type"]),
+            session_id=obj.get("session_id", ""),
+            event_id=obj.get("event_id", ""),
+            parent_event_id=obj.get("parent_event_id"),
+            timestamp=obj.get("timestamp", ""),
+            payload=obj.get("payload", {}),
+        )
+
 
 # ============================================================
 # 便捷构造函数 — 按事件分类组织
@@ -187,7 +207,17 @@ def agent_finish(
     outcome: str = "success",
     summary: str = "",
 ) -> ACPEvent:
-    """Agent 执行完成。"""
+    """Agent 执行完成。
+
+    TERMINAL invariant: this event must only be emitted where no further work
+    follows on the current turn (goal-loop finalizer, cancel, max-turns/budget
+    pause after the auto-resume budget is exhausted, resume failure). The
+    frontend treats it as the one event that releases the composer's busy
+    state — message.complete is NOT usable for that because it is emitted
+    mid-run to seal a streamed text segment. Emitting agent_finish mid-run
+    (e.g. between handoffs) would return the send button to idle while the
+    task is still running.
+    """
     return create_event(EventType.AGENT_FINISH, session_id, {
         "agent_name": agent_name,
         "outcome": outcome,

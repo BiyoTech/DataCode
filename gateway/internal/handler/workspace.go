@@ -3,10 +3,23 @@
 //
 // All pure-passthrough workspace/file/git-panel routes are now handled
 // declaratively via GenericProxy / MakeValidatedProxy.
+//
+// P5.5 NOTE — where authorization data comes from:
+//
+// These handlers used to read and write the gateway's own `workspace_members`
+// table. They no longer do: identity-service is the single writer of that
+// dataset (design 06 P2, and a hard prerequisite for the P7 Global/Cell split,
+// which cannot move a schema another service still writes).
+//
+//   - READS of the CALLER's own bindings come from the authorization snapshot
+//     the Authorize middleware already fetched — no extra round trip.
+//   - READS of OTHER users' bindings and ALL WRITES go through
+//     authz.Bindings, identity-service's internal binding API.
 package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,26 +30,44 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"github.com/datacode/gateway/internal/auth"
+	"github.com/datacode/gateway/internal/authz"
 	"github.com/datacode/gateway/internal/config"
 	"github.com/datacode/gateway/internal/middleware"
-	"github.com/datacode/gateway/internal/rbac"
+	"github.com/datacode/shared/httperr"
+	rbac "github.com/datacode/shared/rbac"
 )
 
 const workspacesBasePath = "/api/v1/workspaces"
+
+// controlPlaneURL returns the upstream for workspace-metadata and
+// Git-credential operations: control-service since P5. There is no fallback:
+// the legacy per-service entries were removed from platform.yaml with the
+// services they named, so an unset services.control surfaces as proxy errors
+// rather than traffic silently routed elsewhere.
+func controlPlaneURL(cfg *config.Config) string {
+	return cfg.Services.ControlServiceURL
+}
 
 // ---------------------------------------------------------------------------
 // Workspace handlers — identity injection into request body
 // ---------------------------------------------------------------------------
 
-// CreateWorkspace proxies workspace creation to SQLMesh Service and records the
-// owner role binding, which the gateway owns.
+// CreateWorkspace proxies workspace creation to the control plane and records
+// the owner role binding in identity-service.
 //
 // The two steps are ordered so that a failure can never leave a workspace that
 // nobody may open: if the binding cannot be stored, the freshly created
 // workspace is deleted again and the caller receives an error.
+//
+// The creator's cached snapshot MUST be dropped afterwards. It was taken before
+// the workspace existed, so it carries no binding for it — and the very next
+// request the client makes is "open the workspace I just created", a
+// workspace-scoped route. Decided from the stale snapshot it is denied as
+// workspace_not_member: the creator is told they are not a member of their own
+// brand-new workspace, for as long as the cache TTL lasts.
 func CreateWorkspace(
-	cfg *config.Config, rbacService *rbac.Service, logger *zap.Logger,
+	cfg *config.Config, bindings *authz.Bindings, resolver *authz.Resolver,
+	logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := middleware.GetUserID(r.Context())
@@ -47,9 +78,9 @@ func CreateWorkspace(
 			return
 		}
 		resp, err := callUpstream(r, http.MethodPost,
-			cfg.Services.SQLMeshServiceURL, workspacesBasePath, body, logger)
+			controlPlaneURL(cfg), workspacesBasePath, body, logger)
 		if err != nil {
-			http.Error(w, `{"error":"upstream service unavailable"}`, http.StatusBadGateway)
+			httperr.WriteUpstreamUnavailable(w)
 			return
 		}
 		if !resp.OK() {
@@ -67,7 +98,7 @@ func CreateWorkspace(
 			return
 		}
 
-		if err := rbacService.GrantWorkspaceOwner(
+		if err := bindings.GrantWorkspaceOwner(
 			r.Context(), tenantID, created.WorkspaceID, userID,
 		); err != nil {
 			// Compensate: without the owner binding the workspace would be
@@ -79,9 +110,12 @@ func CreateWorkspace(
 			http.Error(w, `{"error":"failed to record workspace ownership"}`, http.StatusBadGateway)
 			return
 		}
+		// The ownership binding must apply to the creator's next request, which
+		// is the open that follows immediately (see the note above).
+		resolver.Invalidate(userID, tenantID)
 
 		writeUpstream(w, withWorkspaceCapabilities(resp, rbac.RoleWorkspaceOwner,
-			ownerPermissions(r, rbacService, tenantID, logger), logger))
+			ownerPermissions(r, bindings, tenantID, logger), logger))
 	}
 }
 
@@ -97,7 +131,7 @@ func compensateWorkspaceCreation(
 	// action, so it carries the delete capability explicitly.
 	r.Header.Set(middleware.HeaderPermissions, rbac.PermWorkspaceDelete)
 	if _, err := callUpstream(r, http.MethodDelete,
-		cfg.Services.SQLMeshServiceURL, path, nil, logger); err != nil {
+		controlPlaneURL(cfg), path, nil, logger); err != nil {
 		logger.Error("workspace_create_compensation_failed",
 			zap.String("workspace_id", workspaceID), zap.Error(err))
 		return
@@ -108,10 +142,10 @@ func compensateWorkspaceCreation(
 // ownerPermissions resolves the effective permissions of the workspace owner
 // role; an error only degrades the response payload, never the request.
 func ownerPermissions(
-	r *http.Request, rbacService *rbac.Service, tenantID string, logger *zap.Logger,
+	r *http.Request, bindings *authz.Bindings, tenantID string, logger *zap.Logger,
 ) []string {
-	permissions, err := rbacService.EffectivePermissions(
-		r.Context(), tenantID, rbac.ScopeWorkspace, rbac.RoleWorkspaceOwner)
+	permissions, err := bindings.RolePermissions(
+		r.Context(), tenantID, string(rbac.ScopeWorkspace), rbac.RoleWorkspaceOwner)
 	if err != nil {
 		logger.Warn("workspace_owner_permissions_unavailable", zap.Error(err))
 		return []string{}
@@ -141,20 +175,14 @@ func withWorkspaceCapabilities(
 	return resp
 }
 
-// BindGitRepo proxies Git repository binding to SQLMesh Service.
+// BindGitRepo proxies Git repository binding to the control plane.
 func BindGitRepo(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 	return injectIdentityIntoBody(cfg, logger, workspacesBasePath+"/bind-git", true)
 }
 
-// SyncWorkspace proxies "commit + push my working copy" to SQLMesh Service.
+// SyncWorkspace proxies "commit + push my working copy" to the control plane.
 func SyncWorkspace(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 	return injectIdentityIntoBody(cfg, logger, workspacesBasePath+"/sync", true)
-}
-
-// CreateGitCredential proxies Git credential creation to SQLMesh Service.
-// Credentials are user-scoped, so no tenant is injected.
-func CreateGitCredential(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
-	return injectIdentityIntoBody(cfg, logger, "/api/v1/git/credentials", false)
 }
 
 // OpenWorkspace materializes the caller's working copy of a workspace.
@@ -167,7 +195,7 @@ func OpenWorkspace(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 			return
 		}
 		backendPath := fmt.Sprintf("%s/%s/open", workspacesBasePath, url.PathEscape(workspaceID))
-		proxyPost(w, r, cfg.Services.SQLMeshServiceURL, backendPath, body, logger)
+		proxyPost(w, r, controlPlaneURL(cfg), backendPath, body, logger)
 	}
 }
 
@@ -185,7 +213,7 @@ func injectIdentityIntoBody(
 		if !ok {
 			return
 		}
-		proxyPost(w, r, cfg.Services.SQLMeshServiceURL, backendPath, body, logger)
+		proxyPost(w, r, controlPlaneURL(cfg), backendPath, body, logger)
 	}
 }
 
@@ -247,12 +275,14 @@ func stampIdentityField(
 
 // ListWorkspaces returns the workspaces the caller has been granted access to.
 //
-// The gateway owns the role bindings, so it resolves them first and asks the
-// SQLMesh Service only for the metadata of those identifiers. The role and the
-// effective permissions in the response are authoritative and always come from
-// the gateway, never from the downstream service.
+// The caller's bindings and the permissions of the roles they hold are read
+// from the authorization snapshot the Authorize middleware already resolved:
+// it carries exactly this data, so the listing needs no call to
+// identity-service at all. The control plane is asked only for the METADATA of
+// those identifiers, and the role/permissions in the response always come from
+// the snapshot — never from the downstream service.
 func ListWorkspaces(
-	cfg *config.Config, rbacService *rbac.Service, logger *zap.Logger,
+	cfg *config.Config, resolver *authz.Resolver, logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID := middleware.GetUserID(r.Context())
@@ -262,14 +292,16 @@ func ListWorkspaces(
 			return
 		}
 
-		bindings, err := rbacService.ListWorkspaceRolesForUser(r.Context(), tenantID, userID)
+		snapshot, err := resolver.Resolve(
+			r.Context(), userID, tenantID, middleware.GetPermsVersion(r.Context()))
 		if err != nil {
 			logger.Error("workspace_bindings_lookup_failed",
 				zap.String("tenant_id", tenantID), zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "internal_error",
-				"Failed to resolve workspace access.")
+			writeError(w, http.StatusServiceUnavailable, "authz_unavailable",
+				"Authorization data is temporarily unavailable.")
 			return
 		}
+		bindings := snapshot.WorkspaceRoles
 		if len(bindings) == 0 {
 			// No membership: skip the upstream call entirely.
 			writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -291,9 +323,9 @@ func ListWorkspaces(
 		path := fmt.Sprintf("%s?%s&workspace_ids=%s",
 			workspacesBasePath, query, url.QueryEscape(strings.Join(ids, ",")))
 
-		resp, err := callUpstream(r, http.MethodGet, cfg.Services.SQLMeshServiceURL, path, nil, logger)
+		resp, err := callUpstream(r, http.MethodGet, controlPlaneURL(cfg), path, nil, logger)
 		if err != nil {
-			http.Error(w, `{"error":"upstream service unavailable"}`, http.StatusBadGateway)
+			httperr.WriteUpstreamUnavailable(w)
 			return
 		}
 		if !resp.OK() {
@@ -310,7 +342,6 @@ func ListWorkspaces(
 			return
 		}
 
-		permissionsByRole := make(map[string][]string, 4)
 		enriched := make([]map[string]interface{}, 0, len(payload.Workspaces))
 		for _, workspace := range payload.Workspaces {
 			workspaceID, _ := workspace["workspace_id"].(string)
@@ -320,16 +351,9 @@ func ListWorkspaces(
 				// binding for, whatever the downstream service returned.
 				continue
 			}
-			permissions, cached := permissionsByRole[roleCode]
-			if !cached {
-				permissions, err = rbacService.EffectivePermissions(
-					r.Context(), tenantID, rbac.ScopeWorkspace, roleCode)
-				if err != nil {
-					logger.Warn("workspace_permissions_unavailable",
-						zap.String("role_code", roleCode), zap.Error(err))
-					permissions = []string{}
-				}
-				permissionsByRole[roleCode] = permissions
+			permissions := snapshot.PermissionsForWorkspaceRole(roleCode)
+			if permissions == nil {
+				permissions = []string{}
 			}
 			workspace["role"] = roleCode
 			workspace["is_owner"] = roleCode == rbac.RoleWorkspaceOwner
@@ -350,30 +374,32 @@ func ListWorkspaceRemoteBranches(cfg *config.Config, logger *zap.Logger) http.Ha
 		}
 		backendPath := fmt.Sprintf("%s/%s/remote-branches?%s",
 			workspacesBasePath, url.PathEscape(chi.URLParam(r, "workspaceID")), query)
-		proxyGet(w, r, cfg.Services.SQLMeshServiceURL, backendPath, logger)
+		proxyGet(w, r, controlPlaneURL(cfg), backendPath, logger)
 	}
 }
 
 // ListWorkspaceMembers returns the role bindings of a workspace, enriched with
-// the usernames owned by the auth domain. Authorization was already enforced by
-// the Authorize middleware (workspace:member:read).
+// the usernames owned by the identity domain. Authorization was already
+// enforced by the Authorize middleware (workspace:member:read).
+//
+// Both facts come from identity-service: these are OTHER users' bindings, which
+// the caller's own snapshot does not contain.
 func ListWorkspaceMembers(
-	authService *auth.Service, rbacService *rbac.Service, logger *zap.Logger,
+	bindingsClient *authz.Bindings, logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := middleware.GetTenantID(r.Context())
 		workspaceID := chi.URLParam(r, "workspaceID")
 
-		bindings, err := rbacService.ListWorkspaceMembers(r.Context(), tenantID, workspaceID)
+		bindings, err := bindingsClient.ListWorkspaceMembers(r.Context(), tenantID, workspaceID)
 		if err != nil {
 			logger.Error("workspace_members_lookup_failed",
 				zap.String("workspace_id", workspaceID), zap.Error(err))
-			writeError(w, http.StatusInternalServerError, "internal_error",
-				"Failed to load workspace members.")
+			writeBindingError(w, logger, err)
 			return
 		}
 
-		usernames, err := tenantUsernames(r, authService, tenantID)
+		usernames, err := tenantUsernames(r, bindingsClient, tenantID)
 		if err != nil {
 			logger.Error("tenant_member_lookup_failed",
 				zap.String("tenant_id", tenantID), zap.Error(err))
@@ -398,10 +424,11 @@ func ListWorkspaceMembers(
 
 // AddWorkspaceMember grants a tenant member access to a workspace.
 //
-// Both facts it depends on are owned by the gateway: tenant membership of the
-// target account and the workspace role binding itself.
+// The tenant-membership check of the target account and the binding write are
+// both performed by identity-service, which owns those tables; the gateway has
+// already authorized the ACTOR through the Authorize middleware.
 func AddWorkspaceMember(
-	authService *auth.Service, rbacService *rbac.Service, logger *zap.Logger,
+	bindingsClient *authz.Bindings, resolver *authz.Resolver, logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		actorID := middleware.GetUserID(r.Context())
@@ -424,29 +451,16 @@ func AddWorkspaceMember(
 			req.Role = rbac.RoleWorkspaceViewer
 		}
 
-		inTenant, err := authService.HasMember(r.Context(), tenantID, req.TargetUserID)
-		if err != nil {
-			logger.Error("tenant_member_lookup_failed",
-				zap.String("tenant_id", tenantID), zap.Error(err))
-			writeError(w, http.StatusBadGateway, "upstream_error",
-				"Failed to verify tenant membership.")
-			return
-		}
-		if !inTenant {
-			logger.Warn("workspace_member_add_rejected_foreign_user",
-				zap.String("workspace_id", workspaceID),
-				zap.String("tenant_id", tenantID))
-			writeError(w, http.StatusBadRequest, "validation_failed",
-				"Target user is not a member of this tenant.")
-			return
-		}
-
-		if err := rbacService.GrantWorkspaceMember(
+		if err := bindingsClient.GrantWorkspaceMember(
 			r.Context(), actorID, tenantID, workspaceID, req.TargetUserID, req.Role,
 		); err != nil {
-			writeRBACError(w, logger, err)
+			writeBindingError(w, logger, err)
 			return
 		}
+		// The target's cached snapshot no longer reflects their access, so drop
+		// it: the new binding must apply to their very next request.
+		resolver.Invalidate(req.TargetUserID, tenantID)
+
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
 			"success":     true,
 			"workspaceId": workspaceID,
@@ -456,11 +470,12 @@ func AddWorkspaceMember(
 	}
 }
 
-// RemoveWorkspaceMember revokes workspace access and asks the SQLMesh Service
-// to drop the member's local working copy. The binding is removed first: a
-// failed cleanup must never leave the access in place.
+// RemoveWorkspaceMember revokes workspace access and asks the control plane to
+// drop the member's local working copy. The binding is removed first: a failed
+// cleanup must never leave the access in place.
 func RemoveWorkspaceMember(
-	cfg *config.Config, rbacService *rbac.Service, logger *zap.Logger,
+	cfg *config.Config, bindingsClient *authz.Bindings, resolver *authz.Resolver,
+	logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		actorID := middleware.GetUserID(r.Context())
@@ -468,19 +483,21 @@ func RemoveWorkspaceMember(
 		workspaceID := chi.URLParam(r, "workspaceID")
 		memberUserID := chi.URLParam(r, "memberUserID")
 
-		if err := rbacService.RevokeWorkspaceMember(
+		if err := bindingsClient.RevokeWorkspaceMember(
 			r.Context(), actorID, tenantID, workspaceID, memberUserID,
 		); err != nil {
-			writeRBACError(w, logger, err)
+			writeBindingError(w, logger, err)
 			return
 		}
+		// Revocation must take effect immediately, not after the cache TTL.
+		resolver.Invalidate(memberUserID, tenantID)
 
 		// Best effort: the access is already gone, the checkout is disposable.
 		path := fmt.Sprintf("%s/%s/members/%s?user_id=%s&tenant_id=%s",
 			workspacesBasePath, url.PathEscape(workspaceID), url.PathEscape(memberUserID),
 			url.QueryEscape(actorID), url.QueryEscape(tenantID))
 		if _, err := callUpstream(r, http.MethodDelete,
-			cfg.Services.SQLMeshServiceURL, path, nil, logger); err != nil {
+			controlPlaneURL(cfg), path, nil, logger); err != nil {
 			logger.Warn("workspace_member_cleanup_failed",
 				zap.String("workspace_id", workspaceID),
 				zap.String("user_id", memberUserID), zap.Error(err))
@@ -492,8 +509,15 @@ func RemoveWorkspaceMember(
 
 // DeleteWorkspace proxies workspace deletion and then drops every role binding
 // of the deleted workspace.
+//
+// The caller's query string is deliberately NOT forwarded beyond the identity
+// parameters: deletion takes no options. In particular there is no
+// delete_remote passthrough anymore — the remote Git repository is always
+// preserved, so accepting a parameter that the control plane ignores would only
+// suggest otherwise.
 func DeleteWorkspace(
-	cfg *config.Config, rbacService *rbac.Service, logger *zap.Logger,
+	cfg *config.Config, bindingsClient *authz.Bindings, resolver *authz.Resolver,
+	logger *zap.Logger,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		actorID := middleware.GetUserID(r.Context())
@@ -504,19 +528,16 @@ func DeleteWorkspace(
 		if !ok {
 			return
 		}
-		if r.URL.Query().Get("delete_remote") == "true" {
-			query += "&delete_remote=true"
-		}
 		path := fmt.Sprintf("%s/%s?%s", workspacesBasePath, url.PathEscape(workspaceID), query)
 
 		resp, err := callUpstream(r, http.MethodDelete,
-			cfg.Services.SQLMeshServiceURL, path, nil, logger)
+			controlPlaneURL(cfg), path, nil, logger)
 		if err != nil {
-			http.Error(w, `{"error":"upstream service unavailable"}`, http.StatusBadGateway)
+			httperr.WriteUpstreamUnavailable(w)
 			return
 		}
 		if resp.OK() {
-			if err := rbacService.PurgeWorkspace(
+			if err := bindingsClient.PurgeWorkspace(
 				r.Context(), actorID, tenantID, workspaceID,
 			); err != nil {
 				// The workspace is gone; a stale binding only hides a dead
@@ -524,6 +545,8 @@ func DeleteWorkspace(
 				logger.Error("workspace_bindings_purge_failed",
 					zap.String("workspace_id", workspaceID), zap.Error(err))
 			}
+			// Every member of the deleted workspace holds a stale snapshot.
+			resolver.InvalidateTenant(tenantID)
 		}
 		writeUpstream(w, resp)
 	}
@@ -531,9 +554,9 @@ func DeleteWorkspace(
 
 // tenantUsernames maps user ids to usernames inside a tenant.
 func tenantUsernames(
-	r *http.Request, authService *auth.Service, tenantID string,
+	r *http.Request, bindingsClient *authz.Bindings, tenantID string,
 ) (map[string]string, error) {
-	members, err := authService.ListMembers(r.Context(), tenantID)
+	members, err := bindingsClient.ListTenantMembers(r.Context(), tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -542,6 +565,31 @@ func tenantUsernames(
 		usernames[member.UserID] = member.Username
 	}
 	return usernames, nil
+}
+
+// writeBindingError maps identity-service binding failures onto HTTP codes,
+// keeping the user-facing wording of the pre-P5.5 local implementation.
+func writeBindingError(w http.ResponseWriter, logger *zap.Logger, err error) {
+	switch {
+	case errors.Is(err, authz.ErrBindingNotFound):
+		writeError(w, http.StatusNotFound, "member_not_found",
+			"This member has no access to the workspace.")
+	case errors.Is(err, authz.ErrRoleNotFound):
+		writeError(w, http.StatusNotFound, "role_not_found", "Role not found.")
+	case errors.Is(err, authz.ErrLastOwnerLocked):
+		writeError(w, http.StatusConflict, "last_owner_locked",
+			"The last owner of a workspace cannot be removed or downgraded.")
+	case errors.Is(err, authz.ErrNotTenantMember):
+		writeError(w, http.StatusBadRequest, "validation_failed",
+			"Target user is not a member of this tenant.")
+	case errors.Is(err, authz.ErrBindingsUnavailable):
+		writeError(w, http.StatusBadGateway, "identity_unavailable",
+			"Identity service is unavailable. Please retry.")
+	default:
+		logger.Error("workspace_binding_error", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "internal_error",
+			"Unexpected error. Please retry.")
+	}
 }
 
 // identityQuery builds the `user_id=..&tenant_id=..` query string from the
@@ -557,40 +605,9 @@ func identityQuery(w http.ResponseWriter, r *http.Request) (string, bool) {
 		url.QueryEscape(userID), url.QueryEscape(tenantID)), true
 }
 
-// ListGitCredentials proxies Git credentials listing to SQLMesh Service.
-// Uses user_id from request context.
-func ListGitCredentials(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		userID := middleware.GetUserID(r.Context())
-		targetURL := fmt.Sprintf("/api/v1/git/credentials?user_id=%s", url.QueryEscape(userID))
-		proxyGet(w, r, cfg.Services.SQLMeshServiceURL, targetURL, logger)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Credential management — user_id + path params
-// ---------------------------------------------------------------------------
-
-// DeleteGitCredential proxies Git credential deletion to SQLMesh Service.
-// Appends user_id from context as a query param for authorization.
-func DeleteGitCredential(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		credentialID := chi.URLParam(r, "credentialID")
-		userID := middleware.GetUserID(r.Context())
-		targetURL := fmt.Sprintf("/api/v1/git/credentials/%s?user_id=%s",
-			url.PathEscape(credentialID), url.QueryEscape(userID))
-		proxyDelete(w, r, cfg.Services.SQLMeshServiceURL, targetURL, logger)
-	}
-}
-
-// SetDefaultGitCredential proxies setting a credential as default to SQLMesh Service.
-// Appends user_id from context as a query param for authorization.
-func SetDefaultGitCredential(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		credentialID := chi.URLParam(r, "credentialID")
-		userID := middleware.GetUserID(r.Context())
-		targetURL := fmt.Sprintf("/api/v1/git/credentials/%s/default?user_id=%s",
-			url.PathEscape(credentialID), url.QueryEscape(userID))
-		proxyPatch(w, r, cfg.Services.SQLMeshServiceURL, targetURL, nil, logger)
-	}
-}
+// Git credentials have no handler here on purpose. They are user-scoped control
+// plane data and the control plane reads the owner from the identity headers, so
+// the four hand-written handlers that used to append "?user_id=..." were passing
+// a parameter the endpoints do not even accept — while SanitizeIdentity already
+// guarantees no client-supplied owner survives. The whole group is a transparent
+// proxy in the router.

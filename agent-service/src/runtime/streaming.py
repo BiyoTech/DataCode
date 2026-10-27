@@ -2,7 +2,9 @@
 
 import asyncio
 import json as _json_module
+import time
 import typing as t
+from dataclasses import dataclass
 
 from agents.items import ItemHelpers, ToolApprovalItem
 from agents.stream_events import (
@@ -14,6 +16,7 @@ from openai.types.responses.response_text_delta_event import ResponseTextDeltaEv
 
 from src.agents.registry import AgentRegistry
 from src.context.event_bus import event_bus
+from src.context.execution_style import ExecutionPolicy, get_policy
 from src.context.session import SessionContext, session_manager
 from src.context.tool_context import ToolContext
 from src.protocol.messages import (
@@ -31,10 +34,9 @@ from src.protocol.messages import (
 )
 from src.runtime.approval import PendingApproval, register_pending_approval
 from src.runtime.artifacts import FILE_WRITING_TOOLS, guess_language
-from src.context.execution_style import ExecutionPolicy, get_policy
+from src.runtime.policy_resolver import resolve_default_tool_level
 from src.runtime.resume import PendingResume, register_pending_resume
 from src.runtime.timeline import publish_and_persist
-from src.runtime.policy_resolver import resolve_default_tool_level
 from src.tools.registry import ToolRegistry, risk_badge_for_level
 from src.utils.logging import get_logger
 
@@ -97,6 +99,49 @@ async def publish_tool_approval_request(
     return True
 
 
+@dataclass
+class _TextStreamProfile:
+    """Shape of the model's text stream, as observed by this service.
+
+    Whether the UI types out an answer or drops it in one block is decided by
+    the provider, not by this pipeline: every delta is published and flushed
+    immediately. This records the evidence needed to tell the two apart from a
+    log line — a provider that buffers its response shows up as a handful of
+    deltas whose largest is the whole answer, spanning almost no time.
+    """
+
+    deltas: int = 0
+    chars: int = 0
+    largest_delta: int = 0
+    first_delta_at: float = 0.0
+    last_delta_at: float = 0.0
+
+    def record(self, delta_text: str, now: float) -> None:
+        if not self.deltas:
+            self.first_delta_at = now
+        self.deltas += 1
+        self.chars += len(delta_text)
+        self.largest_delta = max(self.largest_delta, len(delta_text))
+        self.last_delta_at = now
+
+    def log(self, session_id: str, agent_name: str, started_at: float) -> None:
+        if not self.deltas:
+            return
+        logger.info(
+            "model_text_stream_profile",
+            session_id=session_id,
+            agent_name=agent_name,
+            deltas=self.deltas,
+            chars=self.chars,
+            largest_delta=self.largest_delta,
+            # Time to the first token and the span the tokens covered. A
+            # buffered provider yields span_ms ~ 0 with ttft_ms ~ the whole
+            # model latency.
+            ttft_ms=int((self.first_delta_at - started_at) * 1000),
+            span_ms=int((self.last_delta_at - self.first_delta_at) * 1000),
+        )
+
+
 async def stream_agent_run(
     session: SessionContext,
     streamed_result: t.Any,
@@ -142,6 +187,8 @@ async def stream_agent_run(
     # card stuck "running" and skipping artifact emission.
     tool_call_cache: t.Dict[str, t.Dict[str, t.Any]] = dict(seed_tool_calls or {})
     approval_emitted = False
+    profile = _TextStreamProfile()
+    stream_started_at = time.monotonic()
 
     async for event in streamed_result.stream_events():
         if isinstance(event, RawResponsesStreamEvent):
@@ -149,9 +196,14 @@ async def stream_agent_run(
                 delta_text = event.data.delta
                 full_response += delta_text
                 segment_text += delta_text
+                profile.record(delta_text, time.monotonic())
                 await event_bus.publish(
                     session.session_id,
-                    message_delta(session.session_id, agent_name=current_agent_name, delta=delta_text),
+                    message_delta(
+                        session.session_id,
+                        agent_name=current_agent_name,
+                        delta=delta_text,
+                    ),
                 )
                 # Yield control back to the event loop so the SSE consumer can flush this
                 # delta right away. event_bus.publish only does a non-blocking put_nowait and
@@ -252,6 +304,20 @@ async def stream_agent_run(
                 if hasattr(item, "raw_item") and hasattr(item.raw_item, "content"):
                     for content_block in item.raw_item.content:
                         if hasattr(content_block, "text"):
+                            if content_block.text != segment_text:
+                                # The two should be identical: the SDK builds
+                                # this text by concatenating the same deltas we
+                                # streamed. A mismatch means the provider's
+                                # stream and its final message disagree, which
+                                # the user sees as text that changes or repeats
+                                # itself once the bubble is finalized.
+                                logger.warning(
+                                    "model_final_text_differs_from_stream",
+                                    session_id=session.session_id,
+                                    agent_name=current_agent_name,
+                                    streamed_chars=len(segment_text),
+                                    final_chars=len(content_block.text),
+                                )
                             segment_text = content_block.text
 
         elif isinstance(event, AgentUpdatedStreamEvent):
@@ -272,8 +338,14 @@ async def stream_agent_run(
             current_agent_name = new_agent_name
             await publish_and_persist(
                 session.session_id,
-                agent_start(session.session_id, agent_name=current_agent_name, mode=session.mode.value),
+                agent_start(
+                    session.session_id,
+                    agent_name=current_agent_name,
+                    mode=session.mode.value,
+                ),
             )
+
+    profile.log(session.session_id, current_agent_name, stream_started_at)
 
     if getattr(streamed_result, "interruptions", []):
         approval_emitted = await publish_tool_approval_request(
@@ -584,11 +656,18 @@ async def resume_after_max_turns(session: SessionContext, pending: PendingResume
     workspace_ctx = session.workspace_context
     tool_context = build_tool_context(session)
     current_agent_name = pending.current_agent_name or "triage"
-    logger.info("resume_from_run_state", session_id=session.session_id, current_agent=current_agent_name)
+    logger.info(
+        "resume_from_run_state",
+        session_id=session.session_id, current_agent=current_agent_name,
+    )
 
     await publish_and_persist(
         session.session_id,
-        agent_start(session.session_id, agent_name=current_agent_name, mode=session.mode.value),
+        agent_start(
+            session.session_id,
+            agent_name=current_agent_name,
+            mode=session.mode.value,
+        ),
     )
 
     agent_mode = "craft" if session.scenario == "chatbi" else session.mode.value

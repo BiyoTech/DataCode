@@ -14,6 +14,7 @@ import type {
   ModelDetail,
   ModelGraph,
   ModelTreeNode,
+  ModelGatewayError,
   LineageNodeMap,
   ColumnLineageResult,
 } from '@/types/models'
@@ -22,6 +23,15 @@ export const useModelsStore = defineStore('models', () => {
   // ─────────── State ───────────
   const models = ref<ModelSummary[]>([])
   const modelsLoading = ref(false)
+  /**
+   * Gateways that could not be listed, from the last successful fetch.
+   *
+   * The listing is aggregated across every configured gateway and a failure is
+   * skipped rather than blanking the result — so without this the sidebar shows
+   * a partial (or empty) tree with no hint that one warehouse never answered.
+   * An unreachable gateway is the user's connection settings to fix.
+   */
+  const gatewayErrors = ref<ModelGatewayError[]>([])
   const selectedModelName = ref<string | null>(null)
   const modelDetail = ref<ModelDetail | null>(null)
   const detailLoading = ref(false)
@@ -65,9 +75,13 @@ export const useModelsStore = defineStore('models', () => {
         params: { workspace_path: ws.path, environment, ...(gateway ? { gateway } : {}) },
       })
       models.value = data.models || []
+      gatewayErrors.value = data.gateway_errors || []
     } catch (e: any) {
+      // Every gateway failed: the backend raises rather than returning an empty
+      // list, so this is always a real failure and never "no models defined".
       notifyError(e, 'Failed to fetch models')
       models.value = []
+      gatewayErrors.value = []
     } finally {
       modelsLoading.value = false
     }
@@ -241,6 +255,7 @@ export const useModelsStore = defineStore('models', () => {
   function reset() {
     models.value = []
     modelsLoading.value = false
+    gatewayErrors.value = []
     lineageGraph.value = {}
     lineageNodes.value = {}
     lineageForModel.value = null
@@ -337,6 +352,7 @@ export const useModelsStore = defineStore('models', () => {
     // State
     models,
     modelsLoading,
+    gatewayErrors,
     selectedModelName,
     modelDetail,
     detailLoading,

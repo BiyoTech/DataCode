@@ -18,15 +18,11 @@ from pathlib import Path
 from typing import List, Optional
 
 import yaml
+from datacode_common.command_verbs import split_connectors
 
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# Shell connectors — commands are split on these to prevent bypass
-# ---------------------------------------------------------------------------
-_CONNECTOR_PATTERN = re.compile(r"(?:;|\&\&|\|\||\|)\s*")
 
 # Default policy file path relative to project root
 _DEFAULT_POLICY_PATH = str(
@@ -147,7 +143,11 @@ class CommandPolicy:
                             best_priority = prio
                             best_rule = rule
                             triggered = [cmd]
-                        elif prio == best_priority and best_rule is not None and cmd not in triggered:
+                        elif (
+    prio == best_priority
+    and best_rule is not None
+    and cmd not in triggered
+):
                             triggered.append(cmd)
                         # Continue scanning — a higher-priority rule may still match
 
@@ -255,8 +255,13 @@ class CommandPolicy:
         """Split a command on shell connectors into sub-commands for matching.
 
         Example: "echo a && rm -rf /" → ["echo a", "rm -rf /"]
+
+        The connector set comes from ``datacode_common.command_verbs``, shared
+        with the runtime's command router: both sides must agree on what "one
+        command" is, or a string this policy evaluated as two sub-commands could
+        be routed as one.
         """
-        return [s.strip() for s in _CONNECTOR_PATTERN.split(command) if s.strip()]
+        return split_connectors(command)
 
     @staticmethod
     def _normalize(command: str) -> str:

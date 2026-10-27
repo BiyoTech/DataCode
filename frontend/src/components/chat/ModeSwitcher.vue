@@ -13,7 +13,8 @@ const modes: { id: SessionMode; icon: string }[] = [
 ]
 
 function selectMode(mode: SessionMode) {
-  chatStore.switchMode(mode)
+  // Optional on the store contract: only created with enableModeSwitch.
+  void chatStore.switchMode?.(mode)
 }
 </script>
 

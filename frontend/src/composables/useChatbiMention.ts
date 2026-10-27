@@ -141,11 +141,12 @@ export function useChatbiMention() {
     const knowledge = _filterItems(buildKnowledgeItems(), q).slice(0, MAX_PER_GROUP)
     const adhoc = _filterItems(buildAdhocItems(), q).slice(0, MAX_PER_GROUP)
 
-    return [
+    const groups: MentionGroup[] = [
       { type: 'table', items: tables },
       { type: 'knowledge', items: knowledge },
       { type: 'adhoc', items: adhoc },
-    ].filter((g) => g.items.length > 0)
+    ]
+    return groups.filter((g) => g.items.length > 0)
   }
 
   /** Filter items by matching query against label + subtitle + id. */

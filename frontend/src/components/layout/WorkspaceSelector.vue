@@ -32,7 +32,6 @@ const gitBindUrl = ref('')
 const isGitBinding = ref(false)
 // Deletion confirmation target.
 const deleteTarget = ref<WorkspaceInfo | null>(null)
-const deleteAlsoRemote = ref(false)
 const isDeleting = ref(false)
 
 // Supported SQL engine types
@@ -160,7 +159,6 @@ function openDeleteDialog(ws: WorkspaceInfo) {
   if (!canDeleteWorkspace(ws)) return
   showDropdown.value = false
   deleteTarget.value = ws
-  deleteAlsoRemote.value = false
 }
 
 async function confirmDelete() {
@@ -168,7 +166,7 @@ async function confirmDelete() {
   if (!ws || isDeleting.value) return
   isDeleting.value = true
   try {
-    await workspaceStore.deleteWorkspace(ws.id, deleteAlsoRemote.value)
+    await workspaceStore.deleteWorkspace(ws.id)
     deleteTarget.value = null
   } catch (e) {
     notifyError(e, t('workspace.deleteFailed'))
@@ -321,6 +319,7 @@ function closeCreateDialog() {
             :placeholder="t('workspace.gitRepoUrlPlaceholder')"
           />
           <span class="field-hint">{{ t('workspace.gitRepoUrlHint') }}</span>
+          <span class="field-hint">{{ t('workspace.gitRepoAutoCreateHint') }}</span>
         </div>
         <p class="dialog-hint">{{ t('workspace.sharedHint') }}</p>
         <div class="dialog-actions">
@@ -396,10 +395,9 @@ function closeCreateDialog() {
         <p class="dialog-hint">
           {{ t('workspace.deleteConfirm', { name: deleteTarget.name }) }}
         </p>
-        <label v-if="deleteTarget.gitRepoUrl" class="dialog-checkbox">
-          <input v-model="deleteAlsoRemote" type="checkbox" />
-          <span>{{ t('workspace.deleteAlsoRemote', { url: deleteTarget.gitRepoUrl }) }}</span>
-        </label>
+        <p v-if="deleteTarget.gitRepoUrl" class="dialog-hint">
+          {{ t('workspace.deleteKeepsRemote', { url: deleteTarget.gitRepoUrl }) }}
+        </p>
         <div class="dialog-actions">
           <button class="btn-cancel" @click="deleteTarget = null">{{ t('common.cancel') }}</button>
           <button class="btn-danger" :disabled="isDeleting" @click="confirmDelete">
@@ -567,16 +565,6 @@ function closeCreateDialog() {
 
 .ws-item-action-danger:hover:not(.is-disabled) {
   color: var(--danger, #e34d59);
-}
-
-.dialog-checkbox {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 4px 0 12px;
-  font-size: 13px;
-  color: var(--text-secondary);
-  cursor: pointer;
 }
 
 .btn-danger {

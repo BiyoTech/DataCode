@@ -1,0 +1,335 @@
+{
+  "_comment": [
+    "THE permission catalog: the single declaration of which permission codes exist",
+    "at all, plus the built-in role templates seeded into every tenant.",
+    "",
+    "This file is the SOURCE. The Go and Python constant tables next to it are",
+    "GENERATED from it by scripts/gen-rbac-catalog.py; both languages also assert",
+    "their generated table against this file, so a drift fails the test suites",
+    "instead of surfacing in production as a permission nobody can ever hold.",
+    "",
+    "Relationship to the database: identity-service synchronizes this catalog into",
+    "the `permissions` table on startup (Store.SyncPermissions). The table is a",
+    "projection used to render the role editor and to keep historical role",
+    "compositions readable after a code is retired; it is never a source of truth",
+    "and is never written through the API, so a permission code cannot be invented",
+    "by writing to the database. ROLE COMPOSITION (roles / role_permissions) is",
+    "the opposite: the database owns it and tenants may edit it, including for the",
+    "built-in roles.",
+    "",
+    "Adding a permission point = adding an entry here + regenerating. Adding it to",
+    "a role template also backfills tenants whose built-in role is un-customized",
+    "(Store.EnsureTenantRoles); customized roles are reported as drift instead."
+  ],
+  "scopes": [
+    "tenant",
+    "workspace"
+  ],
+  "permissions": [
+    {
+      "code": "tenant:member:read",
+      "scope": "tenant",
+      "resource": "member",
+      "action": "read",
+      "description": "View tenant members"
+    },
+    {
+      "code": "tenant:member:write",
+      "scope": "tenant",
+      "resource": "member",
+      "action": "write",
+      "description": "Add, update and remove tenant members"
+    },
+    {
+      "code": "tenant:role:read",
+      "scope": "tenant",
+      "resource": "role",
+      "action": "read",
+      "description": "View roles and their permissions"
+    },
+    {
+      "code": "tenant:role:write",
+      "scope": "tenant",
+      "resource": "role",
+      "action": "write",
+      "description": "Create, update and delete roles"
+    },
+    {
+      "code": "tenant:workspace:create",
+      "scope": "tenant",
+      "resource": "workspace",
+      "action": "create",
+      "description": "Create workspaces inside the tenant"
+    },
+    {
+      "code": "tenant:workspace:join",
+      "scope": "tenant",
+      "resource": "workspace",
+      "action": "join",
+      "description": "Can be granted access to workspaces",
+      "note": "Marks accounts that may be granted access to a workspace. Members without it never appear in a workspace member picker."
+    },
+    {
+      "code": "tenant:agent:use",
+      "scope": "tenant",
+      "resource": "agent",
+      "action": "use",
+      "description": "Use agent sessions and language models"
+    },
+    {
+      "code": "workspace:read",
+      "scope": "workspace",
+      "resource": "workspace",
+      "action": "read",
+      "description": "Open the workspace and read its metadata"
+    },
+    {
+      "code": "workspace:delete",
+      "scope": "workspace",
+      "resource": "workspace",
+      "action": "delete",
+      "description": "Delete the workspace"
+    },
+    {
+      "code": "workspace:member:read",
+      "scope": "workspace",
+      "resource": "member",
+      "action": "read",
+      "description": "View workspace members"
+    },
+    {
+      "code": "workspace:member:write",
+      "scope": "workspace",
+      "resource": "member",
+      "action": "write",
+      "description": "Grant and revoke workspace access"
+    },
+    {
+      "code": "workspace:git:bind",
+      "scope": "workspace",
+      "resource": "git",
+      "action": "bind",
+      "description": "Bind or rebind the Git repository"
+    },
+    {
+      "code": "workspace:git:push",
+      "scope": "workspace",
+      "resource": "git",
+      "action": "push",
+      "description": "Push commits to the remote repository",
+      "note": "Also governs USING a Git credential. Managing one's own credentials is user-scoped and requires no permission point."
+    },
+    {
+      "code": "workspace:env:read",
+      "scope": "workspace",
+      "resource": "env",
+      "action": "read",
+      "description": "View environments and their status",
+      "note": "An environment is the platform's development line: one Git branch + one SQLMesh virtual environment + one Dagster deployment. Creating and destroying one touches shared team resources and is separated from ordinary code writes."
+    },
+    {
+      "code": "workspace:env:create",
+      "scope": "workspace",
+      "resource": "env",
+      "action": "create",
+      "description": "Create environments, including their Git branch"
+    },
+    {
+      "code": "workspace:env:delete",
+      "scope": "workspace",
+      "resource": "env",
+      "action": "delete",
+      "description": "Destroy non-production environments"
+    },
+    {
+      "code": "workspace:env:promote",
+      "scope": "workspace",
+      "resource": "env",
+      "action": "promote",
+      "description": "Merge into the production branch and enable branch schedules",
+      "note": "Guards actions that make one environment's code or schedules authoritative for the team."
+    },
+    {
+      "code": "workspace:code:read",
+      "scope": "workspace",
+      "resource": "code",
+      "action": "read",
+      "description": "Read models, files and lineage"
+    },
+    {
+      "code": "workspace:code:write",
+      "scope": "workspace",
+      "resource": "code",
+      "action": "write",
+      "description": "Create, modify and delete files"
+    },
+    {
+      "code": "workspace:plan:preview",
+      "scope": "workspace",
+      "resource": "plan",
+      "action": "preview",
+      "description": "Run plan previews without applying"
+    },
+    {
+      "code": "workspace:plan:apply",
+      "scope": "workspace",
+      "resource": "plan",
+      "action": "apply",
+      "description": "Apply plans to an environment"
+    },
+    {
+      "code": "workspace:query:run",
+      "scope": "workspace",
+      "resource": "query",
+      "action": "run",
+      "description": "Execute ad-hoc queries"
+    },
+    {
+      "code": "workspace:knowledge:read",
+      "scope": "workspace",
+      "resource": "knowledge",
+      "action": "read",
+      "description": "Read business knowledge documents"
+    },
+    {
+      "code": "workspace:knowledge:write",
+      "scope": "workspace",
+      "resource": "knowledge",
+      "action": "write",
+      "description": "Create and delete knowledge documents"
+    },
+    {
+      "code": "workspace:ontology:read",
+      "scope": "workspace",
+      "resource": "ontology",
+      "action": "read",
+      "description": "Read the semantic ontology"
+    },
+    {
+      "code": "workspace:pipeline:read",
+      "scope": "workspace",
+      "resource": "pipeline",
+      "action": "read",
+      "description": "View pipelines, assets and runs"
+    },
+    {
+      "code": "workspace:pipeline:run",
+      "scope": "workspace",
+      "resource": "pipeline",
+      "action": "run",
+      "description": "Trigger and cancel pipeline runs"
+    },
+    {
+      "code": "workspace:logs:read",
+      "scope": "workspace",
+      "resource": "logs",
+      "action": "read",
+      "description": "Read workspace service logs and the error archive",
+      "note": "Kept separate from code:read because a log line may quote SQL, data values, remote hosts or agent tool output that reading a model file would not expose."
+    }
+  ],
+  "roles": [
+    {
+      "code": "admin",
+      "scope": "tenant",
+      "name": "Administrator",
+      "description": "Full control over tenant members and roles",
+      "permissions": [
+        "tenant:member:read",
+        "tenant:member:write",
+        "tenant:role:read",
+        "tenant:role:write",
+        "tenant:workspace:create",
+        "tenant:workspace:join",
+        "tenant:agent:use"
+      ]
+    },
+    {
+      "code": "developer",
+      "scope": "tenant",
+      "name": "Developer",
+      "description": "Can create workspaces and be granted workspace access",
+      "permissions": [
+        "tenant:member:read",
+        "tenant:role:read",
+        "tenant:workspace:create",
+        "tenant:workspace:join",
+        "tenant:agent:use"
+      ]
+    },
+    {
+      "code": "viewer",
+      "scope": "tenant",
+      "name": "Read-only member",
+      "description": "Read-only observer of tenant level resources",
+      "permissions": [
+        "tenant:member:read"
+      ]
+    },
+    {
+      "code": "workspace_owner",
+      "scope": "workspace",
+      "name": "Owner",
+      "description": "Workspace creator with full control; granted implicitly",
+      "permissions": "*workspace"
+    },
+    {
+      "code": "engineer",
+      "scope": "workspace",
+      "name": "Engineer",
+      "description": "Writes models and code, pushes and applies plans",
+      "permissions": [
+        "workspace:read",
+        "workspace:member:read",
+        "workspace:code:read",
+        "workspace:code:write",
+        "workspace:git:push",
+        "workspace:env:read",
+        "workspace:env:create",
+        "workspace:env:delete",
+        "workspace:plan:preview",
+        "workspace:plan:apply",
+        "workspace:query:run",
+        "workspace:knowledge:read",
+        "workspace:knowledge:write",
+        "workspace:ontology:read",
+        "workspace:pipeline:read",
+        "workspace:pipeline:run",
+        "workspace:logs:read"
+      ]
+    },
+    {
+      "code": "analyst",
+      "scope": "workspace",
+      "name": "Analyst",
+      "description": "Explores data and previews plans without writing code",
+      "permissions": [
+        "workspace:read",
+        "workspace:member:read",
+        "workspace:code:read",
+        "workspace:plan:preview",
+        "workspace:query:run",
+        "workspace:env:read",
+        "workspace:knowledge:read",
+        "workspace:ontology:read",
+        "workspace:pipeline:read",
+        "workspace:logs:read"
+      ]
+    },
+    {
+      "code": "viewer",
+      "scope": "workspace",
+      "name": "Read-only",
+      "description": "Read-only access to the workspace",
+      "permissions": [
+        "workspace:read",
+        "workspace:member:read",
+        "workspace:code:read",
+        "workspace:env:read",
+        "workspace:knowledge:read",
+        "workspace:ontology:read",
+        "workspace:pipeline:read"
+      ]
+    }
+  ]
+}

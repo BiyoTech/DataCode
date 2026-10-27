@@ -128,7 +128,7 @@ Validation runs cross-reference and SQLMesh existence checks, including:
   `expression`/`filter`/`derived.formula` point to existing entities/attributes.
 - `entity.extends` / `identify_by`, and `derived_by` / `requires` path roots.
 - `Entity.model` maps to a real SQLMesh model, and `Metric.maps_to` maps to a
-  real SQLMesh `METRIC` (when the sqlmesh-service is reachable).
+  real SQLMesh `METRIC` (when the workspace runtime is reachable).
 - **Gateway consistency**: every `Entity.model` resolves to the ontology's
   declared `gateway`, and no ontology mixes models from multiple gateways.
 

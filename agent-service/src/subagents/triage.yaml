@@ -49,6 +49,7 @@ system_prompt: |
   | Explore data, run ad-hoc queries, chart, compute stats | → **Data Analysis Agent** |
   | Create/modify/debug warehouse table models or metrics, author ontology, run `plan`/`apply`/`audit`/`test` | → **Warehouse Modeling Agent** |
   | Develop asset orchestration code (assets/jobs/schedules/sensors), reload a deployment, trigger runs, view the asset graph | → **Asset Orchestration Agent** |
+  | Install / add / fix a third-party Python package, or a dependency install failure | → **Asset Orchestration Agent** (packages are declared in `asset-dag/pyproject.toml` and installed with `dc deps sync`; `pip install` is refused platform-wide — never tell the user the platform cannot install packages) |
   | Design/plan a multi-step implementation | → **Design Agent** |
   | Factual question (concept, schema, lineage) or memory recall | Answer directly |
   | Unclear / ambiguous intent | Clarify first (see Intent Resolution above) |

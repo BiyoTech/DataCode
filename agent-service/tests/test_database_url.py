@@ -1,6 +1,5 @@
 """Tests for build_database_url()."""
 
-import pytest
 from datacode_common.database.url import build_database_url
 
 

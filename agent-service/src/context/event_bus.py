@@ -1,4 +1,4 @@
-"""Per-session event bus using asyncio.Queue.
+"""Per-session event bus: local asyncio.Queue + Redis fan-out.
 
 Decouples Agent execution (producer) from the SSE endpoint (consumer).
 Provides an async publish/subscribe interface with heartbeat injection and a
@@ -15,9 +15,26 @@ Ownership model (why it matters):
   atomically takes over — migrating buffered events and retiring the old queue
   so its stale consumer exits immediately. There is never more than one live
   consumer per session queue.
+
+Cross-replica fan-out:
+  POST /chat may land on one replica while the SSE stream is connected to
+  another. A process-wide Redis Pub/Sub pump (one subscription connection for
+  ALL sessions) bridges that: publish() writes locally AND to the session's
+  channel; the pump feeds messages from OTHER replicas into the local queue.
+  Messages carry the producing replica's id and are dropped when they
+  originated here (the local write already delivered them) — without that
+  filter every subscriber would see each local event twice.
+
+  Delivery is at-most-once across replicas by design: Pub/Sub does not replay
+  what was published while a pump was (re)connecting. The platform contract is
+  that clients reconnect and refill from the persisted timeline, so a missed
+  delta heals on the next interaction rather than being lost forever.
+
+  Without Redis everything degrades to the previous single-replica behaviour.
 """
 
 import asyncio
+import json
 import typing as t
 import uuid
 from dataclasses import dataclass, field
@@ -33,6 +50,12 @@ _STREAM_END = object()
 # Heartbeat interval in seconds.
 HEARTBEAT_INTERVAL = 30
 
+# Bound the queue of a session with a live subscriber. Local producers are
+# well-behaved, but a Redis pump flooding a slow consumer (client stopped
+# reading while the server keeps publishing) should be dropped-with-log rather
+# than allowed to grow without bound.
+_QUEUE_MAXSIZE = 2048
+
 
 @dataclass
 class _SessionQueue:
@@ -43,9 +66,151 @@ class _SessionQueue:
     lazily by publish()/POST chat before the SSE client connects).
     """
 
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=_QUEUE_MAXSIZE))
     active: bool = True
     owner: t.Optional[str] = None
+
+
+class _RedisFanout:
+    """Process-wide bridge between Redis Pub/Sub and the local queues.
+
+    One subscription connection covers every session (pattern subscription) —
+    a connection per SSE stream would exhaust the client pool under normal
+    concurrency. Started lazily on the first subscriber and never stopped:
+    an idle pub/sub connection costs one socket, while start/stop churn around
+    reconnects risks exactly the message loss this exists to prevent.
+    """
+
+    def __init__(self, bus: "SessionEventBus") -> None:
+        self._bus = bus
+        self._pump = None  # built lazily; None until Redis is proven available
+        self._replica_id = None
+
+    def _ensure_replica_id(self) -> str:
+        """This fan-out's producer identity (instance-level for testability)."""
+        if self._replica_id is None:
+            from datacode_common.redis import replica_id
+
+            self._replica_id = replica_id()
+        return self._replica_id
+
+    def _ensure_started(self) -> None:
+        """Start the pump if Redis is configured (fire-and-forget).
+
+        Called from synchronous contexts (attach_subscriber), hence the task
+        spawn. Errors surface through the pump's own logging; a Redis outage
+        parks the pump in its reconnect loop instead of failing callers.
+        """
+        if self._pump is not None:
+            return
+        asyncio.get_running_loop().create_task(self._start())
+
+    async def _start(self) -> None:
+        from datacode_common.redis import PatternPump, get_redis, redis_config
+
+        if get_redis() is None:
+            logger.info("session_event_bus_local_only", reason="platform_redis_disabled")
+            return
+        cfg = redis_config()
+        channel_prefix = f"{cfg.key_prefix}:agent:session"
+        # _replica_id stays None here: _ensure_replica_id() resolves it lazily
+        # so a pre-set identity (tests inject one to simulate a second
+        # replica) is not clobbered.
+        self._pump = PatternPump(
+            domain="agent-sse",
+            pattern=f"{channel_prefix}:*",
+            on_message=self._on_message,
+        )
+        await self._pump.start()
+        logger.info("session_event_bus_redis_fanout_started")
+
+    async def publish(self, session_id: str, event: ACPEvent) -> None:
+        """Broadcast an event to subscribers on other replicas.
+
+        Failures are logged at debug and swallowed: this is the cross-replica
+        half of a delivery whose local half has already succeeded, and a Redis
+        hiccup must not fail the agent run that produced the event. Publishing
+        needs no subscription of our own: a replica with zero local SSE
+        clients is still a producer for clients connected elsewhere.
+        """
+        try:
+            from datacode_common.redis import get_redis
+
+            client = get_redis()
+            if client is None:
+                return
+            envelope = json.dumps(
+                # event.to_json() yields a string; embedding it verbatim would
+                # double-escape. Parse it back so the envelope carries the
+                # event as a nested object.
+                {"origin": self._ensure_replica_id(), "event": json.loads(event.to_json())},
+                ensure_ascii=False,
+            )
+            await client.publish(
+                self._channel(session_id), envelope
+            )
+        except Exception as exc:
+            logger.debug(
+                "session_event_bus_fanout_publish_failed",
+                session_id=session_id,
+                error=str(exc),
+            )
+
+    def _channel(self, session_id: str) -> str:
+        from datacode_common.redis.client import redis_config
+
+        return f"{redis_config().key_prefix}:agent:session:{session_id}:events"
+
+    def _session_of(self, channel: str) -> t.Optional[str]:
+        """Extract the session id from '<prefix>:agent:session:<id>:events'."""
+        marker = ":agent:session:"
+        idx = channel.rfind(marker)
+        if idx < 0:
+            return None
+        rest = channel[idx + len(marker):]
+        if not rest.endswith(":events"):
+            return None
+        return rest[: -len(":events")]
+
+    async def _on_message(self, channel: str, payload: str) -> None:
+        """Deliver a remote event into the session's local queue."""
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            logger.warning("session_event_bus_malformed_message", channel=channel)
+            return
+        if message.get("origin") == self._ensure_replica_id():
+            return  # our own local write already delivered this event
+
+        session_id = self._session_of(channel)
+        if session_id is None:
+            return
+        try:
+            event = ACPEvent.from_json(message.get("event", ""))
+        except (ValueError, KeyError, TypeError) as exc:
+            # Unknown event type: this replica is older than the publisher.
+            # The event still reaches its client through the producing replica.
+            logger.debug(
+                "session_event_bus_remote_event_dropped",
+                session_id=session_id,
+                error=str(exc),
+            )
+            return
+
+        sq = self._bus._queues.get(session_id)
+        if sq is None or not sq.active:
+            # No local subscriber: the event's audience is elsewhere. History
+            # is served from the persisted timeline, so buffering is pointless.
+            return
+        try:
+            sq.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning(
+                "event_queue_full_dropping",
+                session_id=session_id,
+                event_type=event.type.value,
+                source="redis",
+            )
 
 
 class SessionEventBus:
@@ -61,6 +226,7 @@ class SessionEventBus:
 
     def __init__(self):
         self._queues: t.Dict[str, _SessionQueue] = {}
+        self._fanout = _RedisFanout(self)
 
     # ------------------------------------------------------------------
     # Producer side
@@ -89,18 +255,19 @@ class SessionEventBus:
 
         Always targets the queue currently owned by the live subscriber (or the
         lazy buffer queue), so events never race across a reconnect takeover.
+        The event is also fanned out to other replicas' subscribers.
         """
         sq = self._ensure_queue(session_id)
-        if not sq.active:
-            return
-        try:
-            sq.queue.put_nowait(event)
-        except asyncio.QueueFull:
-            logger.warning(
-                "event_queue_full_dropping",
-                session_id=session_id,
-                event_type=event.type.value,
-            )
+        if sq.active:
+            try:
+                sq.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "event_queue_full_dropping",
+                    session_id=session_id,
+                    event_type=event.type.value,
+                )
+        await self._fanout.publish(session_id, event)
 
     # ------------------------------------------------------------------
     # Consumer side
@@ -118,6 +285,7 @@ class SessionEventBus:
             up a fresh queue, migrate buffered events, and retire the old queue
             so its stale consumer exits on its next loop iteration.
         """
+        self._fanout._ensure_started()
         token = str(uuid.uuid4())
         existing = self._queues.get(session_id)
 
@@ -147,7 +315,10 @@ class SessionEventBus:
 
         new_sq = _SessionQueue(owner=token)
         for item in pending:
-            new_sq.queue.put_nowait(item)
+            try:
+                new_sq.queue.put_nowait(item)
+            except asyncio.QueueFull:
+                break
         self._queues[session_id] = new_sq
 
         # Retire the old queue and wake its consumer so it exits its get().

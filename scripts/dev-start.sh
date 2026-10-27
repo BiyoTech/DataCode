@@ -1,270 +1,233 @@
 #!/usr/bin/env bash
-# Start all services in development mode (zero external dependencies by default).
-# Uses embedded DuckDB + SQLite + file locks — no Docker/MySQL/Redis/PostgreSQL needed.
-# Ctrl+C stops everything.
+# Start the full dev stack on the host: identity, control, agent, runtime,
+# gateway — plus the Vite frontend unless --no-frontend.
 #
-# Usage:
-#   ./dev-start.sh                       # Default venv in each service's .venv/
-#   ./dev-start.sh --venv ~/.venvs/ad    # Use shared venv directory
-#   INFRA_MODE=docker ./dev-start.sh     # Start external engines via Docker
+# Dev storage contract (conf/platform.dev.yaml on top of conf/platform.yaml):
+#   PostgreSQL  localhost:5432, database "datacode", user "datacode"
+#   Redis       localhost:6379
+# Both are provided by deploy/docker-compose.infra.yml and started AUTOMATICALLY
+# when not already reachable (INFRA_MODE=none opts out). PostgreSQL everywhere —
+# the same engine Docker and Kubernetes run — so a dialect defect surfaces on
+# a laptop rather than in production.
+#
+# Migrations run once, BEFORE any service starts: control-service's alembic
+# chain plus identity's boot-time runner (AUTO_MIGRATE=1 below). --skip-migrate
+# skips that step for restarts against an already-migrated database.
+#
+# Secrets are env-only (never in conf/). Precedence: your shell environment
+# wins over <repo>/.env (see .env.example); the three platform secrets are
+# auto-generated under .data/ on first run and persist across restarts. The
+# PostgreSQL password lives in ONE place — .data/postgres_password — created
+# on first run (adopted from a running postgres or seeded), injected into
+# everything that needs it, and changed only via `make pg-set-password`.
+#
+# Logs: .data/logs/<service>.log (truncated each run) plus live [name]-
+# prefixed console output. Re-attach any time with `make dev-logs`.
+#
+# Stop: Ctrl+C — whole process groups die together (no orphaned go-run or
+# uvicorn-reloader children), SIGKILL fallback after a 10s grace window.
+# From another terminal: scripts/dev-stop.sh.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=scripts/dev-lib.sh
+. "$SCRIPT_DIR/dev-lib.sh"
 
-# --- Parse arguments ---
-VENV_DIR=""
-while [[ $# -gt 0 ]]; do
+usage() {
+  cat <<'EOF'
+Usage: dev-start.sh [OPTIONS]
+
+Options:
+  --no-frontend   Start backend services only (same as dev-backend.sh)
+  --skip-migrate  Skip the pre-start database migrations (restarts only)
+
+Environment:
+  DB_PASSWORD                 IGNORED — the truth is .data/postgres_password
+                              (change it with: make pg-set-password PASSWORD=...)
+  AGENT_SERVICE_LLM_API_KEY   LLM key for agent-service (without it every LLM
+                              call fails at runtime; per-model overrides exist,
+                              see conf/agent-service.yaml)
+  INFRA_MODE=auto|none        auto (default): start postgres/redis via Docker
+                              when not reachable; none: never start them
+
+Loads <repo>/.env when present; the real environment always wins.
+EOF
+}
+
+NO_FRONTEND=0
+SKIP_MIGRATE=0
+while [ $# -gt 0 ]; do
   case "$1" in
-    --venv)
-      VENV_DIR="$2"
-      shift 2
-      ;;
-    --venv=*)
-      VENV_DIR="${1#*=}"
-      shift
-      ;;
-    -h|--help)
-      echo "Usage: $0 [OPTIONS]"
-      echo ""
-      echo "Options:"
-      echo "  --venv PATH    Python virtual environment directory"
-      echo "                 Default: each service uses its own .venv/"
-      echo "                 If set, all Python services share one venv."
-      echo ""
-      echo "Environment variables:"
-      echo "  INFRA_MODE     none (default) | docker"
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
+    --no-frontend) NO_FRONTEND=1 ;;
+    --skip-migrate) SKIP_MIGRATE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option: %s (see --help)\n' "$1" >&2; exit 1 ;;
   esac
+  shift
 done
 
-# Color output helpers
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+printf '\033[0;36m============================================\033[0m\n'
+printf '\033[0;36m  DataCode - Development Mode\033[0m\n'
+printf '\033[0;36m  PostgreSQL localhost:5432 + Redis localhost:6379\033[0m\n'
+printf '\033[0;36m  profile: dev (conf/platform.dev.yaml)\033[0m\n'
+printf '\033[0;36m============================================\033[0m\n'
+printf '\n'
 
-# Track child PIDs for cleanup
-PIDS=()
+require_cmd go python3 node npm lsof nc openssl curl
+load_dotenv "$ROOT_DIR/.env"
 
-cleanup() {
-  echo ""
-  echo -e "${YELLOW}==> Stopping all services...${NC}"
-  for pid in "${PIDS[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null
-    fi
-  done
-  wait 2>/dev/null
-  echo -e "${GREEN}==> All services stopped.${NC}"
-  exit 0
-}
-trap cleanup SIGINT SIGTERM
-
-echo -e "${CYAN}============================================${NC}"
-echo -e "${CYAN}  DataCode - Development Mode${NC}"
-echo -e "${CYAN}  Zero external dependencies (DuckDB + SQLite)${NC}"
-echo -e "${CYAN}============================================${NC}"
-echo ""
-
-# --- Optional: external infrastructure ---
-INFRA_MODE="${INFRA_MODE:-none}"
-if [ "$INFRA_MODE" = "docker" ]; then
-  echo -e "${BLUE}==> Starting external infrastructure via Docker...${NC}"
-  if docker compose version &>/dev/null; then
-    docker compose -f "$ROOT_DIR/deploy/docker-compose.infra.yml" up -d
-  elif docker-compose version &>/dev/null; then
-    docker-compose -f "$ROOT_DIR/deploy/docker-compose.infra.yml" up -d
-  fi
-  echo -e "${GREEN}    Docker infrastructure started.${NC}"
-  echo ""
-fi
-
-# --- Ensure data directory exists (for SQLite & file locks) ---
-mkdir -p "$ROOT_DIR/.data"
-
-# --- Set DATACODE_ENV for platform config (dev overrides) ---
 export DATACODE_ENV="${DATACODE_ENV:-dev}"
 
-# --- Database password (env-only) ---
-# sqlmesh-service reads DB_PASSWORD from the environment. For local dev with
-# the default MySQL, set this to your local root password. For zero-dep mode
-# (SQLite), leave it empty — services that use SQLite ignore it.
-if [ -z "${DB_PASSWORD:-}" ]; then
-  export DB_PASSWORD="${DB_PASSWORD:-root@123}"
-  echo -e "${YELLOW}==> DB_PASSWORD not set, using local dev default.${NC}"
-fi
+# --- PostgreSQL password: one truth file ------------------------------------
+# .data/postgres_password is the single source of truth. First run creates it
+# (adopting the password a running postgres already accepts, so an existing
+# volume keeps working); afterwards the file wins over any DB_PASSWORD in the
+# shell/.env. This also has to happen BEFORE ensure_infra, whose compose call
+# bind-mounts the file into the postgres container.
+ensure_pg_password
 
-# --- Gateway JWT secret (env-only) ---
-# For local development we persist a random secret under .data/ (gitignored)
-# so issued sessions survive gateway restarts.
-if [ -z "${GW_JWT_SECRET:-}" ]; then
-  SECRET_FILE="$ROOT_DIR/.data/gateway_jwt_secret"
-  if [ ! -f "$SECRET_FILE" ]; then
-    openssl rand -base64 48 > "$SECRET_FILE"
-    chmod 600 "$SECRET_FILE"
-    echo -e "${BLUE}==> Generated local development JWT secret (.data/gateway_jwt_secret)${NC}"
-  fi
-  export GW_JWT_SECRET="$(cat "$SECRET_FILE")"
-fi
+# --- Storage: reach it, or bring it up ------------------------------------
+ensure_infra
 
-# --- Ensure Go dependencies ---
-echo -e "${BLUE}==> Checking Go dependencies...${NC}"
-for svc in gateway; do
-  if [ ! -f "$ROOT_DIR/$svc/go.sum" ]; then
-    echo "    [$svc] Running go mod tidy..."
-    (cd "$ROOT_DIR/$svc" && go mod tidy)
-  fi
-done
-echo -e "${GREEN}    Go deps OK.${NC}"
-echo ""
+# --- Platform secrets (persisted under .data/, gitignored) ---------------
+# GW_JWT_SECRET: identity mints the tokens, the gateway verifies them
+# locally — both sides must hold the same value. Same truth-file contract as
+# the postgres password: once .data/gateway_jwt_secret exists it wins over
+# any GW_JWT_SECRET in the shell, and the Makefile's container stacks inject
+# the same file — tokens minted here verify there and vice versa.
+ensure_jwt_secret
+export GW_JWT_SECRET="$(cat "$JWT_SECRET_FILE")"
+# identity internal token: guards identity-service's /internal/* API (the
+# authz snapshots the gateway decides with + the binding writes it
+# delegates, P5.5). Unset means the gateway denies every authorization-
+# requiring route — fail closed by design — so dev generates and persists one.
+ensure_secret IDENTITY_SERVICE_INTERNAL_TOKEN "$ROOT_DIR/.data/identity_internal_token" 32
+# runtime internal token: guards workspace-runtime's /internal/* — the
+# env-control command channel control-service dispatches every Git/SQLMesh side
+# effect through, plus lease placement (asked by the gateway and by
+# agent-service when a working copy is held by nobody yet). Fail closed when
+# unset, so dev generates one and hands the SAME value to every party: the
+# holder verifies it, and CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN is what control
+# sends on that channel, which must match.
+ensure_secret WORKSPACE_RUNTIME_INTERNAL_TOKEN "$ROOT_DIR/.data/runtime_internal_token" 32
+export CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN="${CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN:-$WORKSPACE_RUNTIME_INTERNAL_TOKEN}"
+# Task token secret (P6b): workspace-runtime mints sandbox tokens, the
+# egress proxy verifies them. Deliberately distinct from GW_JWT_SECRET
+# (users vs sandboxes). Dev does not start the egress proxy: there is no
+# NetworkPolicy locally, so a configured proxy would only mediate SOME
+# traffic — an illusion of control rather than the real thing.
+ensure_secret DATACODE_TASK_TOKEN_SECRET "$ROOT_DIR/.data/task_token_secret" 32
+# identity-service applies its own migrations in dev (production runs them
+# as a separate, observable pipeline step).
+export IDENTITY_SERVICE_AUTO_MIGRATE="${IDENTITY_SERVICE_AUTO_MIGRATE:-1}"
 
-# --- Ensure Python venvs ---
-echo -e "${BLUE}==> Checking Python dependencies...${NC}"
-if [ -n "$VENV_DIR" ]; then
-  # Shared venv mode: all Python services use one venv
-  VENV_DIR="$(cd "$(dirname "$VENV_DIR")" 2>/dev/null && pwd)/$(basename "$VENV_DIR")" || VENV_DIR="$VENV_DIR"
-  echo "    Using shared venv: $VENV_DIR"
-  if [ ! -d "$VENV_DIR" ]; then
-    echo "    Creating shared virtualenv..."
-    python3 -m venv "$VENV_DIR"
-  fi
-  # Install deps for all Python services into the shared venv
-  "$VENV_DIR/bin/pip" install -q -e "$ROOT_DIR/shared/python"
-  for svc in sqlmesh-service agent-service ontology-service dagster-service; do
-    if ! "$VENV_DIR/bin/python" -c "import fastapi, datacode_common" &>/dev/null; then
-      echo "    [$svc] Installing dependencies into shared venv..."
-      (cd "$ROOT_DIR/$svc" && "$VENV_DIR/bin/pip" install -q -e ".[dev]")
-    fi
-  done
-else
-  # Per-service venv mode (default)
-  for svc in sqlmesh-service agent-service ontology-service dagster-service; do
-    svc_dir="$ROOT_DIR/$svc"
-    if [ ! -d "$svc_dir/.venv" ]; then
-      echo "    [$svc] Creating virtualenv..."
-      python3 -m venv "$svc_dir/.venv"
-    fi
-    needs_install=false
-    if ! "$svc_dir/.venv/bin/python" -c "import fastapi" &>/dev/null; then
-      needs_install=true
-    fi
-    if [[ "$svc" == sqlmesh-service || "$svc" == agent-service || "$svc" == dagster-service ]] && \
-       ! "$svc_dir/.venv/bin/python" -c "import datacode_common" &>/dev/null; then
-      needs_install=true
-    fi
-    if [ "$needs_install" = true ]; then
-      echo "    [$svc] Installing dependencies..."
-      if [[ "$svc" == sqlmesh-service || "$svc" == agent-service || "$svc" == dagster-service ]]; then
-        "$svc_dir/.venv/bin/pip" install -q -e "$ROOT_DIR/shared/python"
-      fi
-      "$svc_dir/.venv/bin/pip" install -q -e "$svc_dir[dev]"
-    fi
-  done
-fi
-echo -e "${GREEN}    Python deps OK.${NC}"
-echo ""
-
-# --- Ensure Frontend node_modules ---
-echo -e "${BLUE}==> Checking Frontend dependencies...${NC}"
-if [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then
-  echo "    Installing npm packages..."
+# --- Dependencies ---------------------------------------------------------
+dev_info "checking dependencies"
+ensure_go_deps gateway
+ensure_go_deps identity-service
+# Probes live in dev-lib.sh (ensure_service_venvs) — one definition shared
+# with dev-setup.sh; the two entry points drifted once already and an older
+# venv "passed" the stale probe without the PostgreSQL driver.
+ensure_service_venvs
+if [ "$NO_FRONTEND" -eq 0 ] && [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then
+  dev_info "[frontend] npm install"
   (cd "$ROOT_DIR/frontend" && npm install)
 fi
-echo -e "${GREEN}    Frontend deps OK.${NC}"
-echo ""
 
-# --- Resolve venv activate path ---
-get_venv_activate() {
-  local svc="$1"
-  if [ -n "$VENV_DIR" ]; then
-    echo "$VENV_DIR/bin/activate"
-  else
-    echo "$ROOT_DIR/$svc/.venv/bin/activate"
-  fi
-}
-
-# --- Kill stale processes on service ports ---
-for port in 8001 8002 8003 8004; do
-  pid=$(lsof -ti :$port 2>/dev/null || true)
-  if [ -n "$pid" ]; then
-    echo -e "${YELLOW}    Port $port is in use (PID: $pid), killing...${NC}"
-    kill $pid 2>/dev/null || true
-    sleep 1
-  fi
+# --- Free stale ports from a previous (possibly crashed) run -------------
+dev_info "freeing dev ports"
+for port in $DEV_PORTS; do
+  kill_port_group "$port" "$(dev_port_label "$port")"
 done
 
-# --- Start application services ---
-echo -e "${BLUE}==> Starting SQLMesh Service (port 8002)...${NC}"
-(
-  cd "$ROOT_DIR/sqlmesh-service"
-  source "$(get_venv_activate sqlmesh-service)"
-  python -m uvicorn src.main:app --host 0.0.0.0 --port 8002 --reload 2>&1 | sed "s/^/[sqlmesh] /"
-) &
-PIDS+=($!)
+# --- Migrations: one place, before any service starts --------------------
+if [ "$SKIP_MIGRATE" -eq 0 ]; then
+  run_db_migrations
+else
+  dev_info "skipping migrations (--skip-migrate)"
+fi
 
-echo -e "${BLUE}==> Starting Agent Service (port 8001)...${NC}"
-(
-  cd "$ROOT_DIR/agent-service"
-  source "$(get_venv_activate agent-service)"
-  python -m uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload 2>&1 | sed "s/^/[agent]  /"
-) &
-PIDS+=($!)
+# --- Lifecycle plumbing ---------------------------------------------------
+SVC_NAMES=()
+SVC_PGIDS=()
 
-echo -e "${BLUE}==> Starting Ontology Service (port 8003)...${NC}"
-(
-  cd "$ROOT_DIR/ontology-service"
-  source "$(get_venv_activate ontology-service)"
-  python -m uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload 2>&1 | sed "s/^/[ontology] /"
-) &
-PIDS+=($!)
+cleanup() {
+  local rc="${1:-0}"
+  trap - INT TERM EXIT
+  if [ "${#SVC_PGIDS[@]}" -gt 0 ]; then
+    printf '\n'
+    dev_info "stopping all services"
+    stop_svc_groups
+    dev_ok "all services stopped"
+  fi
+  exit "$rc"
+}
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap 'cleanup "$?"' EXIT
 
-echo -e "${BLUE}==> Starting Dagster Service (port 8004)...${NC}"
-(
-  cd "$ROOT_DIR/dagster-service"
-  source "$(get_venv_activate dagster-service)"
-  python -m uvicorn src.main:app --host 0.0.0.0 --port 8004 --reload 2>&1 | sed "s/^/[dagster] /"
-) &
-PIDS+=($!)
+# --- Start services -------------------------------------------------------
+# identity first: it owns the identity tables, applies their migrations, and
+# the gateway cannot authorize a single request without it (P5.5 — the
+# gateway holds no identity data of its own any more).
+start_svc identity-service "$ROOT_DIR/identity-service" go run ./cmd/server/
+wait_http "identity-service" "http://localhost:8003/health" 90 "$LOG_DIR/identity-service.log"
 
-echo -e "${BLUE}==> Starting Gateway (port 8000)...${NC}"
-(
-  cd "$ROOT_DIR/gateway"
-  go run ./cmd/server/ 2>&1 | sed "s/^/[gateway]/"
-) &
-PIDS+=($!)
+# control, agent and runtime have no startup interdependency (only the
+# gateway needs identity up); start them together and gate on all three.
+start_svc control-service "$ROOT_DIR/control-service" \
+  "$ROOT_DIR/control-service/.venv/bin/python" -m uvicorn src.main:app --host 0.0.0.0 --port 8004 --reload
+start_svc agent-service "$ROOT_DIR/agent-service" \
+  "$ROOT_DIR/agent-service/.venv/bin/python" -m uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
+# workspace-runtime owns the working copies: SQLMesh engine + ontology +
+# Dagster data plane + git + files (design 06 P3). Heaviest import chain of
+# the stack (sqlmesh + dagster), hence the generous timeout.
+start_svc workspace-runtime "$ROOT_DIR/workspace-runtime" \
+  "$ROOT_DIR/workspace-runtime/.venv/bin/python" -m uvicorn src.main:app --host 0.0.0.0 --port 8002 --reload
 
-echo -e "${BLUE}==> Starting Frontend (port 5173)...${NC}"
-(
-  cd "$ROOT_DIR/frontend"
-  npx vite 2>&1 | sed "s/^/[frontend]/"
-) &
-PIDS+=($!)
+wait_http "control-service"   "http://localhost:8004/health" 120 "$LOG_DIR/control-service.log"
+wait_http "agent-service"     "http://localhost:8001/health" 120 "$LOG_DIR/agent-service.log"
+wait_http "workspace-runtime" "http://localhost:8002/health" 240 "$LOG_DIR/workspace-runtime.log"
 
-echo ""
-echo -e "${GREEN}============================================${NC}"
-echo -e "${GREEN}  All services started!${NC}"
-echo -e "${GREEN}============================================${NC}"
-echo ""
-echo -e "  ${CYAN}Frontend${NC}:          http://localhost:5173"
-echo -e "  ${CYAN}Gateway API${NC}:       http://localhost:8000"
-echo -e "  ${CYAN}Agent Service${NC}:     http://localhost:8001"
-echo -e "  ${CYAN}SQLMesh Service${NC}:   http://localhost:8002 (includes workspace management)"
-echo -e "  ${CYAN}Ontology Service${NC}:  http://localhost:8003 (semantic layer: entities/relationships/metrics)"
-echo -e "  ${CYAN}Dagster Service${NC}:   http://localhost:8004 (Data+AI pipeline orchestration)"
-echo ""
-echo -e "  ${YELLOW}Storage${NC}: DuckDB (data engine) + SQLite (chat history) + file locks"
-echo -e "  ${YELLOW}No external databases required!${NC}"
-echo ""
-echo -e "  Press ${RED}Ctrl+C${NC} to stop all services."
-echo ""
+start_svc gateway "$ROOT_DIR/gateway" go run ./cmd/server/
+wait_http "gateway" "http://localhost:8000/health" 90 "$LOG_DIR/gateway.log"
 
-# Wait for any child to exit
-wait
+if [ "$NO_FRONTEND" -eq 0 ]; then
+  start_svc frontend "$ROOT_DIR/frontend" npm run dev
+  wait_http "frontend" "http://localhost:5173/" 60 "$LOG_DIR/frontend.log"
+fi
+
+# --- Summary --------------------------------------------------------------
+printf '\n'
+dev_ok "all services started"
+cat <<'EOF'
+
+  Frontend:          http://localhost:5173
+  Gateway API:       http://localhost:8000
+  Identity Service:  http://localhost:8003   (identity / authz / placement)
+  Agent Service:     http://localhost:8001
+  Control Service:   http://localhost:8004   (registry / metadata / credentials)
+  Workspace Runtime: http://localhost:8002   (working copies: sqlmesh + ontology + dagster)
+
+  Storage:  PostgreSQL localhost:5432/datacode + Redis localhost:6379
+  Profile:  dev (conf/platform.dev.yaml; inspect any profile: make doctor)
+  Logs:     .data/logs/<service>.log   (re-attach: make dev-logs)
+
+  Press Ctrl+C to stop all services.
+EOF
+printf '\n'
+
+# --- Supervise ------------------------------------------------------------
+# If any service dies, surface its log tail and stop the rest — a half-up
+# stack fails in confusing ways otherwise.
+dev_info "supervising (Ctrl+C to stop)"
+while true; do
+  sleep 2
+  for i in "${!SVC_NAMES[@]}"; do
+    if ! kill -0 -- "-${SVC_PGIDS[$i]}" 2>/dev/null; then
+      dev_warn "${SVC_NAMES[$i]} exited unexpectedly; last lines:"
+      tail -n 30 "$LOG_DIR/${SVC_NAMES[$i]}.log" 2>/dev/null | sed 's/^/    /' >&2
+      exit 1   # EXIT trap -> cleanup() stops the remaining services
+    fi
+  done
+done

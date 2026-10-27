@@ -1,8 +1,28 @@
+// Package rbac holds the gateway's authorization DECISION vocabulary.
+//
+// It is STATELESS by design. It used to own the RBAC tables and answer decisions
+// from the database; identity-service is the single source of truth for that
+// data since P2, and keeping a second writer here blocked the P7 Global/Cell
+// database split. What remains is the part that must live where requests are
+// enforced:
+//
+//   - the ROUTE MAP (this file) — which permission each route requires and where
+//     its scope is found;
+//   - workspace path parsing (wspath.go) — deriving the scope of a request.
+//
+// The permission CATALOG itself lives in the shared module
+// (github.com/datacode/shared/rbac, imported here as "catalog"): the gateway and
+// identity-service must agree on the vocabulary, and two hand-written copies is
+// how a route ends up requiring a permission that no role can hold. The data
+// decisions are taken against arrives as an authorization snapshot
+// (internal/authz), not from a query.
 package rbac
 
 import (
 	"net/http"
 	"strings"
+
+	catalog "github.com/datacode/shared/rbac"
 )
 
 // ScopeSource tells the authorization middleware where the scope of a request
@@ -63,13 +83,13 @@ var rules = []Rule{
 
 	// ------------------------------------------------ identity & tenant members
 	{Method: http.MethodGet, Pattern: "/api/v1/auth/members",
-		Permission: PermTenantMemberRead, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantMemberRead, Source: ScopeSourceTenant},
 	{Method: http.MethodPost, Pattern: "/api/v1/auth/members",
-		Permission: PermTenantMemberWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantMemberWrite, Source: ScopeSourceTenant},
 	{Method: http.MethodPatch, Pattern: "/api/v1/auth/members/{}",
-		Permission: PermTenantMemberWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantMemberWrite, Source: ScopeSourceTenant},
 	{Method: http.MethodDelete, Pattern: "/api/v1/auth/members/{}",
-		Permission: PermTenantMemberWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantMemberWrite, Source: ScopeSourceTenant},
 	// Session lifecycle and the member picker directory are available to every
 	// authenticated identity.
 	{Pattern: "/api/v1/auth/*", Source: ScopeSourceNone},
@@ -77,159 +97,192 @@ var rules = []Rule{
 
 	// ------------------------------------------------------- role management
 	{Method: http.MethodGet, Pattern: "/api/v1/rbac/permissions",
-		Permission: PermTenantRoleRead, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantRoleRead, Source: ScopeSourceTenant},
 	{Method: http.MethodGet, Pattern: "/api/v1/rbac/roles",
-		Permission: PermTenantRoleRead, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantRoleRead, Source: ScopeSourceTenant},
 	{Method: http.MethodPost, Pattern: "/api/v1/rbac/roles",
-		Permission: PermTenantRoleWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantRoleWrite, Source: ScopeSourceTenant},
 	{Method: http.MethodPut, Pattern: "/api/v1/rbac/roles/{}",
-		Permission: PermTenantRoleWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantRoleWrite, Source: ScopeSourceTenant},
 	{Method: http.MethodDelete, Pattern: "/api/v1/rbac/roles/{}",
-		Permission: PermTenantRoleWrite, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantRoleWrite, Source: ScopeSourceTenant},
 
 	// ------------------------------------------------------------ workspaces
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces",
-		Permission: PermTenantWorkspaceCreate, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantWorkspaceCreate, Source: ScopeSourceTenant},
 	// The listing is already restricted to the caller's own bindings.
 	{Method: http.MethodGet, Pattern: "/api/v1/workspaces", Source: ScopeSourceNone},
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/bind-git",
-		Permission: PermWorkspaceGitBind, Source: ScopeSourceWorkspaceField},
+		Permission: catalog.PermWorkspaceGitBind, Source: ScopeSourceWorkspaceField},
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/sync",
-		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspaceField},
+		Permission: catalog.PermWorkspaceGitPush, Source: ScopeSourceWorkspaceField},
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/{}/open",
-		Permission: PermWorkspaceRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodGet, Pattern: "/api/v1/workspaces/{}/remote-branches",
-		Permission: PermWorkspaceRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodGet, Pattern: "/api/v1/workspaces/{}/members",
-		Permission: PermWorkspaceMemberRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceMemberRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/{}/members",
-		Permission: PermWorkspaceMemberWrite, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceMemberWrite, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodDelete, Pattern: "/api/v1/workspaces/{}/members/{}",
-		Permission: PermWorkspaceMemberWrite, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceMemberWrite, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodDelete, Pattern: "/api/v1/workspaces/{}",
-		Permission: PermWorkspaceDelete, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceDelete, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 
 	// ---------------------------------------------------------- environments
 	// The environment registry is the platform's development-line API: it owns
 	// the Git branch, the SQLMesh virtual environment and the Dagster
 	// deployment as one unit.
 	{Method: http.MethodGet, Pattern: "/api/v1/workspaces/{}/environments",
-		Permission: PermWorkspaceEnvRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceEnvRead, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	{Method: http.MethodPost, Pattern: "/api/v1/workspaces/{}/environments",
-		Permission: PermWorkspaceEnvCreate, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceEnvCreate, Source: ScopeSourceWorkspaceSegment, SegmentIndex: 3},
 	// Materializing a working copy of an existing environment is an ordinary
 	// read of the workspace: it creates no shared resource.
 	{Method: http.MethodPost, Pattern: "/api/v1/environments/{}/open",
-		Permission: PermWorkspaceRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
 	// Reconciliation may recreate a branch and a virtual environment, which is
 	// what creating an environment does — hence env:create, not env:read.
 	{Method: http.MethodPost, Pattern: "/api/v1/environments/{}/reconcile",
-		Permission: PermWorkspaceEnvCreate, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceEnvCreate, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
 	{Method: http.MethodDelete, Pattern: "/api/v1/environments/{}",
-		Permission: PermWorkspaceEnvDelete, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceEnvDelete, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
 	// Details, events and any future read (diff, drift) share one rule so a new
 	// backend read endpoint cannot degrade to "authenticated only".
 	{Method: http.MethodGet, Pattern: "/api/v1/environments/*",
-		Permission: PermWorkspaceEnvRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+		Permission: catalog.PermWorkspaceEnvRead, Source: ScopeSourceEnvironmentSegment, SegmentIndex: 3},
+
+	// ---------------------------------------------------------------- quotas
+	// Authenticated identity is enough: the endpoint reports the CALLER'S OWN
+	// tenant, resolved from the identity header, so there is nothing to
+	// authorize a scope against. Only GET is listed, which leaves any future
+	// write (an admin raising a limit) to be denied by the fallback until it is
+	// declared here deliberately.
+	{Method: http.MethodGet, Pattern: "/api/v1/quotas", Source: ScopeSourceTenant},
 
 	// ------------------------------------------------------- agent & models
-	{Pattern: "/api/v1/sessions/*", Permission: PermTenantAgentUse, Source: ScopeSourceTenant},
+	{Pattern: "/api/v1/sessions/*", Permission: catalog.PermTenantAgentUse, Source: ScopeSourceTenant},
 	{Method: http.MethodGet, Pattern: "/api/v1/models",
-		Permission: PermTenantAgentUse, Source: ScopeSourceTenant},
+		Permission: catalog.PermTenantAgentUse, Source: ScopeSourceTenant},
 
 	// --------------------------------------------------------------- sqlmesh
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/plan",
-		Permission: PermWorkspacePlanPreview, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspacePlanPreview, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/apply",
-		Permission: PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/apply/async",
-		Permission: PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/cancel",
-		Permission: PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspacePlanApply, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/query",
-		Permission: PermWorkspaceQueryRun, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceQueryRun, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/evaluate",
-		Permission: PermWorkspaceQueryRun, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceQueryRun, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/render",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/validate",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/schema/discover",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
 	// Repairing the platform-managed state_schema rewrites config.yaml, i.e. a
 	// code change, so it is gated like any other file write.
 	{Method: http.MethodPost, Pattern: "/api/v1/sqlmesh/config/state-schema/repair",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 	// Static service metadata carries no workspace context.
 	{Method: http.MethodGet, Pattern: "/api/v1/sqlmesh/meta", Source: ScopeSourceNone},
 	{Method: http.MethodGet, Pattern: "/api/v1/sqlmesh/modules", Source: ScopeSourceNone},
 	{Method: http.MethodGet, Pattern: "/api/v1/sqlmesh/*",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/sqlmesh/*",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 
 	// ------------------------------------------- sqlmesh identity-path routes
 	{Method: http.MethodPost, Pattern: "/api/v1/external-models/import",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodGet, Pattern: "/api/v1/gateways",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Method: http.MethodGet, Pattern: "/api/v1/gateways/*",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Method: http.MethodGet, Pattern: "/api/v1/schemas",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 
 	// ------------------------------------------------------------------- git
 	// Git credentials belong to the individual user, not to a workspace.
 	{Pattern: "/api/v1/git/credentials", Source: ScopeSourceNone},
 	{Pattern: "/api/v1/git/credentials/*", Source: ScopeSourceNone},
 	{Method: http.MethodPost, Pattern: "/api/v1/git/push",
-		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/git/publish",
-		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
 	// Merging one environment branch into another publishes the result on the
 	// remote, so it is gated like any other push. Merging into the PRODUCTION
 	// branch additionally requires workspace:env:promote, which the service
 	// checks from the granted permission set: the target branch lives in the
 	// body, and the route map is intentionally static.
 	{Method: http.MethodPost, Pattern: "/api/v1/git/merge",
-		Permission: PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceGitPush, Source: ScopeSourceWorkspacePath},
 	// Syncing a base branch into the caller's own working copy changes files
 	// only locally — an ordinary code write, no remote mutation.
 	{Method: http.MethodPost, Pattern: "/api/v1/git/sync",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodGet, Pattern: "/api/v1/git/*",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/git/*",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 
 	// ----------------------------------------------------------------- files
 	{Method: http.MethodGet, Pattern: "/api/v1/files/*",
-		Permission: PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/files/*",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+
+	// ------------------------------------------------------------------ deps
+	// Working-copy Python dependencies. Reads only — installing happens
+	// through the reload route, which is already gated as a code write.
+	//
+	// /baseline describes the runtime IMAGE, not any workspace, so it resolves
+	// no scope and carries no permission (ScopeSourceNone ignores one): it is
+	// the list a user needs in order to write a declaration that can install at
+	// all, every working copy's scaffolded pyproject.toml already quotes part
+	// of it, and requiring a workspace to read it would make the answer look
+	// workspace-specific when it is identical everywhere. Authenticated is
+	// enough, matching /sqlmesh/meta and /dagster/mode.
+	{Method: http.MethodGet, Pattern: "/api/v1/deps/baseline", Source: ScopeSourceNone},
+	{Method: http.MethodGet, Pattern: "/api/v1/deps/status",
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+
+	// ------------------------------------------------------------------- wip
+	// The durability-contract surface (design 07 Q6): reading one working
+	// copy's protection state is a code read; recovering or discarding a
+	// snapshot rewrites the working copy / the Git server's hidden ref, which
+	// is a code write.
+	{Method: http.MethodGet, Pattern: "/api/v1/wip/status",
+		Permission: catalog.PermWorkspaceCodeRead, Source: ScopeSourceWorkspacePath},
+	{Pattern: "/api/v1/wip/*",
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 
 	// ------------------------------------------------------------------ logs
 	// Read-only, and deliberately NOT ScopeOptional: a log query without a
 	// resolvable workspace has no meaning, so an unresolvable one must be
 	// rejected rather than degraded into "has the permission somewhere".
 	{Method: http.MethodGet, Pattern: "/api/v1/logs",
-		Permission: PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodGet, Pattern: "/api/v1/logs/*",
-		Permission: PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceLogsRead, Source: ScopeSourceWorkspacePath},
 
 	// ------------------------------------------------------------- knowledge
 	{Method: http.MethodGet, Pattern: "/api/v1/knowledge/*",
-		Permission: PermWorkspaceKnowledgeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceKnowledgeRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/knowledge/*",
 		// Uploads are multipart, so the workspace cannot always be resolved
 		// from the body; the permission is then required in some workspace.
-		Permission: PermWorkspaceKnowledgeWrite, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceKnowledgeWrite, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 
 	// -------------------------------------------------------------- ontology
 	{Method: http.MethodGet, Pattern: "/api/v1/ontology/*",
-		Permission: PermWorkspaceOntologyRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceOntologyRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/ontology/*",
-		Permission: PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspaceCodeWrite, Source: ScopeSourceWorkspacePath},
 
 	// --------------------------------------------------------------- dagster
 	{Method: http.MethodGet, Pattern: "/api/v1/dagster/health", Source: ScopeSourceNone},
@@ -239,19 +292,31 @@ var rules = []Rule{
 	// workspace MUST resolve from the body — unlike run cancellation, there is
 	// no id-only form of these calls.
 	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/ensure",
-		Permission: PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
 	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/reload",
-		Permission: PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
+	// A reload is asynchronous: reading its progress is a READ on the same
+	// working copy, so it takes pipeline:read rather than pipeline:run — a user
+	// who may look at a pipeline may watch a reload someone else triggered.
+	//
+	// The scope is NOT optional, unlike the catch-all GET rule below. The runtime
+	// is a headless Service and this request must reach the replica holding the
+	// copy's lease; a query with no workspace_path would be answered by whichever
+	// replica the DNS round-robin picked, which knows nothing about the job.
+	{Method: http.MethodGet, Pattern: "/api/v1/dagster/deployments/reload/status",
+		Permission: catalog.PermWorkspacePipelineRead, Source: ScopeSourceWorkspacePath},
+	{Method: http.MethodPost, Pattern: "/api/v1/dagster/deployments/reload/cancel",
+		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath},
 	// Tearing a deployment down is part of destroying an environment, and the
 	// request carries only the deployment name — hence env:delete in some
 	// workspace rather than pipeline:run on a resolvable one.
 	{Method: http.MethodDelete, Pattern: "/api/v1/dagster/deployments/*",
-		Permission: PermWorkspaceEnvDelete, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspaceEnvDelete, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Method: http.MethodGet, Pattern: "/api/v1/dagster/*",
-		Permission: PermWorkspacePipelineRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspacePipelineRead, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 	{Pattern: "/api/v1/dagster/*",
 		// Run cancellation is addressed by run id only, hence ScopeOptional.
-		Permission: PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
+		Permission: catalog.PermWorkspacePipelineRun, Source: ScopeSourceWorkspacePath, ScopeOptional: true},
 }
 
 // MatchRoute resolves the rule guarding a request. When no rule matches, read

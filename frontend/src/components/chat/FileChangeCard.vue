@@ -60,7 +60,9 @@ function toggleExpand() {
 }
 
 // Open a read-only side-by-side diff (before vs after) in the editor panel.
-function openDiff(e: MouseEvent) {
+// Accepts both pointer and keyboard triggers: the span is focusable and is
+// activated by Enter/Space as well as click.
+function openDiff(e: MouseEvent | KeyboardEvent) {
   e.stopPropagation()
   fileStore.openDiffFile(
     filePath.value,

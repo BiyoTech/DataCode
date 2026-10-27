@@ -41,6 +41,11 @@ export type EventType =
   | 'artifact.chart'
   // Todo / task list
   | 'todo.update'
+  // Background task lifecycle (backend protocol/messages.py EventType)
+  | 'task.created'
+  | 'task.running'
+  | 'task.completed'
+  | 'task.failed'
   // Human-in-the-loop
   | 'human.required'
   | 'human.response'

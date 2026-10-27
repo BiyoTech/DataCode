@@ -1,0 +1,112 @@
+# User-code node pool (design 04 §3, roadmap P6b).
+#
+# Under the Q2 decision (no sandboxed kernel), a container escape reaches the
+# NODE. This pool is therefore the primary mitigation for T8: it does not prevent
+# an escape, it bounds what an escape reaches. On a shared node the answer would
+# be "the platform's own pods and their service account tokens"; on this pool it
+# is "other sandboxes on the same node", which is a materially different incident.
+#
+# This is a mitigation, NOT a fix. The honest statement remains: the platform
+# does not claim container-escape resistance until L3_strong is enabled
+# (design 04 §8.1). Two operational requirements follow, and both belong in the
+# runbook rather than in YAML:
+#
+#   1. Kernel patch baseline. These nodes run untrusted code against a shared
+#      kernel, so a known-exploitable kernel here is a tenant-isolation failure,
+#      not a hygiene issue. Patch them FIRST, on a defined SLA, and record the
+#      current kernel version per node as part of the security review.
+#   2. No platform workload here, ever. A tolerating pod would silently
+#      reintroduce exactly the adjacency this pool exists to remove. The taint
+#      below is what enforces it; the review is what keeps it enforced.
+#
+# ── Applying the taint and label ─────────────────────────────────────────────
+# Nodes are provisioned by the cluster's own tooling, so this file documents the
+# required state rather than creating it. For an existing node:
+#
+#   kubectl taint nodes <node> datacode.io/user-code=true:NoSchedule
+#   kubectl label nodes <node> datacode.io/workload=user-code
+#
+# For a managed node group, set the same taint and label in the group's
+# definition so replacements inherit them — a node that comes back without the
+# taint becomes a platform node that runs user code.
+#
+# The isolation profile is what makes tasks land here: `node_pool: user-code` in
+# conf/isolation-profiles.yaml becomes the nodeSelector
+# `datacode.io/workload: user-code` plus a toleration for the taint above (see
+# workspace-runtime/src/tasks/backends/kubernetes.py::_scheduling).
+#
+# Note the interaction with the working-copy hand-off (design 04 §3.3 / S1): a
+# task Pod is also pinned to the node holding its lease. Both constraints must be
+# satisfiable at once, which means **the workspace-runtime replicas that own
+# working copies must themselves run on this pool** — otherwise the two selectors
+# have no common node and every task stays Pending. That is consistent with the
+# threat model: a runtime replica holds working copies, which are tenant data, but
+# it holds no platform credential beyond its own.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nodepool-user-code-contract
+  namespace: datacode-tasks
+  labels:
+    app: task-runner
+data:
+  # Read by the operator, and by a future admission check that verifies the
+  # cluster matches what the platform's security claims assume.
+  taint: "datacode.io/user-code=true:NoSchedule"
+  label: "datacode.io/workload=user-code"
+  covers-threats: "T8 (mitigated, not closed)"
+  requires: |
+    - kernel patch baseline with a defined SLA, tracked per node
+    - no platform workload tolerates this taint
+    - workspace-runtime replicas owning working copies run on this pool, so the
+      lease-node pin and the pool selector are satisfiable together
+  does-not-cover: |
+    Container escape itself. An escaped process reaches other sandboxes on the
+    same node. Enable L3_strong (design 04 §8.1) to close this.
+---
+# A LimitRange, so a task Pod that somehow omits its resource limits cannot take
+# a whole node with it. The isolation profile normally supplies these; this is the
+# backstop for the case where it did not.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: task-defaults
+  namespace: datacode-tasks
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "2"
+        memory: 4Gi
+        ephemeral-storage: 8Gi
+      defaultRequest:
+        cpu: 500m
+        memory: 1Gi
+        ephemeral-storage: 2Gi
+      max:
+        cpu: "8"
+        memory: 32Gi
+        ephemeral-storage: 64Gi
+---
+# A ResourceQuota bounding the whole task namespace. Without it, one tenant's
+# burst of tasks can exhaust the pool and deny every other tenant — a
+# cross-tenant availability failure (T5 at the cluster level rather than the
+# process level). Per-tenant quotas are P8; this is the namespace-wide ceiling.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: task-namespace-ceiling
+  namespace: datacode-tasks
+spec:
+  hard:
+    pods: "200"
+    requests.cpu: "100"
+    requests.memory: 200Gi
+    limits.cpu: "400"
+    limits.memory: 800Gi
+    # Bounds the per-task Secrets and ConfigMaps too: a leak in the cleanup path
+    # would otherwise accumulate until the API server object limit was reached.
+    count/secrets: "500"
+    count/configmaps: "500"
+    count/jobs.batch: "300"

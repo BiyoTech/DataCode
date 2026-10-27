@@ -67,6 +67,14 @@ func JWTAuth(issuer *auth.TokenIssuer, logger *zap.Logger) func(http.Handler) ht
 			ctx = context.WithValue(ctx, TenantIDKey, claims.TenantID)
 			ctx = context.WithValue(ctx, UsernameKey, claims.Username)
 			ctx = context.WithValue(ctx, RoleKey, claims.Role)
+			ctx = context.WithValue(ctx, PermsVersionKey, claims.PermsVersion)
+			// The cell the tenant lives in. Published for the cell router,
+			// which runs next and decides whether this cell may serve at all.
+			ctx = context.WithValue(ctx, CellIDKey, claims.CellID)
+
+			// Fill the access logger's identity slot: it wraps this middleware,
+			// so it cannot read the context this request is about to carry.
+			SetRequestIdentity(ctx, claims.Subject, claims.TenantID)
 
 			// Overwrite (never trust) client-supplied identity headers.
 			r.Header.Set("X-User-ID", claims.Subject)

@@ -5,7 +5,8 @@
 package handler
 
 import (
-	"io"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -17,6 +18,61 @@ import (
 // prefix on the gateway side that the backend does not expect
 // (e.g. /api/v1/sqlmesh/plan → /api/v1/plan).
 type PathRewriteFunc func(gatewayPath string) (backendPath string)
+
+// StatusError is an upstream-resolution error whose HTTP answer is defined by
+// the raiser rather than by this package.
+//
+// Routing failures default to 503 ("workspace temporarily unavailable") because
+// the usual cause is a lease that cannot be resolved right now. But some
+// failures are CONTRACT verdicts — a 429 LEASE_UNAVAILABLE capacity refusal
+// carries a Retry-After the client must honour — and flattening those into the
+// generic 503 would strip the one piece of information that makes the error
+// actionable. The interface is satisfied structurally, so the leaserouter (or
+// any future resolver) can raise typed errors without importing this package.
+type StatusError interface {
+	error
+	// HTTPStatus is the status the client should receive.
+	HTTPStatus() int
+	// ErrorCode is the platform contract error_code (design 08 §7).
+	ErrorCode() string
+	// RetryAfterValue is the Retry-After header value, "" when none.
+	RetryAfterValue() string
+}
+
+// ErrorBody is the optional richer payload a StatusError may provide. When the
+// raiser implements it, its keys are merged into the response body alongside
+// error_code; otherwise a generic message is derived from Error().
+type ErrorBody interface {
+	ErrorBody() map[string]any
+}
+
+// writeResolutionError answers a failed upstream resolution with the raiser's
+// verdict when it has one, and with the generic 503 otherwise.
+func writeResolutionError(w http.ResponseWriter, err error, logger *zap.Logger) {
+	var verdict StatusError
+	if errors.As(err, &verdict) {
+		body := map[string]any{
+			"error_code": verdict.ErrorCode(),
+			"message":    verdict.Error(),
+		}
+		if richer, ok := verdict.(ErrorBody); ok {
+			for key, value := range richer.ErrorBody() {
+				body[key] = value
+			}
+		}
+		if retryAfter := verdict.RetryAfterValue(); retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(verdict.HTTPStatus())
+		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+	logger.Warn("proxy_upstream_unresolved", zap.Error(err))
+	http.Error(w,
+		`{"error":"workspace is temporarily unavailable, please retry"}`,
+		http.StatusServiceUnavailable)
+}
 
 // IdentityPath returns a rewrite function that leaves the path unchanged.
 // Use this when the gateway path and the backend path are identical.
@@ -47,6 +103,47 @@ type ProxyTarget struct {
 	// PathRewrite converts the gateway request path to the backend path.
 	// Use IdentityPath() when no transformation is needed.
 	PathRewrite PathRewriteFunc
+	// ResolveUpstream optionally picks the upstream PER REQUEST, overriding
+	// BaseURL when it returns a non-empty address.
+	//
+	// This exists for working-copy routes (design 06 P4a): a working copy is
+	// owned by exactly ONE workspace-runtime replica, and load-balancing a
+	// request for it would put a second writer on the same Git worktree. The
+	// hook returns an error when no owner can be determined, which must be
+	// surfaced rather than papered over with BaseURL — falling back to the
+	// load-balanced Service is precisely the corruption being prevented.
+	ResolveUpstream func(*http.Request) (string, error)
+	// OnForwardFailure is called when a routing decision proved stale: either
+	// the upstream could not be reached (pod gone) or it answered
+	// 409 LEASE_NOT_HELD (lease moved within the cache TTL). In both cases the
+	// cached decision must be invalidated instead of being retried for the
+	// rest of its cache lifetime.
+	OnForwardFailure func(*http.Request)
+}
+
+// upstreamFor picks the base URL for one request.
+func (t ProxyTarget) upstreamFor(r *http.Request) (string, error) {
+	if t.ResolveUpstream == nil {
+		return t.BaseURL, nil
+	}
+	resolved, err := t.ResolveUpstream(r)
+	if err != nil {
+		return "", err
+	}
+	if resolved == "" {
+		return t.BaseURL, nil
+	}
+	return resolved, nil
+}
+
+// notifyForwardFailure runs the target's stale-route invalidation hook, if any:
+// the upstream chosen for this request could not be reached, so a cached
+// routing decision (a lease pointing at a pod that is gone) must not keep
+// being retried for the rest of its cache lifetime.
+func (t ProxyTarget) notifyForwardFailure(r *http.Request) {
+	if t.OnForwardFailure != nil {
+		t.OnForwardFailure(r)
+	}
 }
 
 // GenericProxy creates a transparent reverse-proxy handler.
@@ -63,59 +160,21 @@ func GenericProxy(target ProxyTarget, logger *zap.Logger) http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		baseURL, err := target.upstreamFor(r)
+		if err != nil {
+			// No owner could be determined. Answering 503 is deliberate for
+			// plain resolution failures: forwarding to an arbitrary replica
+			// would break the single-writer invariant the lease exists to
+			// hold. Contract verdicts (StatusError) keep their own status.
+			writeResolutionError(w, err, logger)
+			return
+		}
+
 		backendPath := rewrite(r.URL.Path)
 		if r.URL.RawQuery != "" {
 			backendPath += "?" + r.URL.RawQuery
 		}
 
-		switch r.Method {
-		case http.MethodGet:
-			proxyGet(w, r, target.BaseURL, backendPath, logger)
-
-		case http.MethodPost:
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				logger.Warn("generic_proxy_read_body_failed",
-					zap.String("method", r.Method),
-					zap.String("path", r.URL.Path),
-					zap.Error(err))
-				http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-				return
-			}
-			r.Body.Close()
-			proxyPost(w, r, target.BaseURL, backendPath, body, logger)
-
-		case http.MethodPut:
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				logger.Warn("generic_proxy_read_body_failed",
-					zap.String("method", r.Method),
-					zap.String("path", r.URL.Path),
-					zap.Error(err))
-				http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-				return
-			}
-			r.Body.Close()
-			proxyPut(w, r, target.BaseURL, backendPath, body, logger)
-
-		case http.MethodPatch:
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				logger.Warn("generic_proxy_read_body_failed",
-					zap.String("method", r.Method),
-					zap.String("path", r.URL.Path),
-					zap.Error(err))
-				http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-				return
-			}
-			r.Body.Close()
-			proxyPatch(w, r, target.BaseURL, backendPath, body, logger)
-
-		case http.MethodDelete:
-			proxyDelete(w, r, target.BaseURL, backendPath, logger)
-
-		default:
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		}
+		dispatchWithStaleRouteRetry(w, r, target, baseURL, backendPath, logger)
 	}
 }

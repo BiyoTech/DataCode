@@ -16,15 +16,16 @@ import (
 	"github.com/datacode/gateway/internal/config"
 )
 
-// SSEEvents proxies the Server-Sent Events stream from SQLMesh Service.
-// Streams events directly to the client without buffering for real-time updates.
+// SSEEvents proxies the Server-Sent Events stream from the working-copy owner
+// (workspace-runtime since P3). Streams events directly to the client without
+// buffering for real-time updates.
 func SSEEvents(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		targetPath := "/api/v1/events"
 		if ws := r.URL.Query().Get("workspace_path"); ws != "" {
 			targetPath += "?workspace_path=" + url.QueryEscape(ws)
 		}
-		proxySSE(w, r, cfg.Services.SQLMeshServiceURL, targetPath, logger)
+		proxySSE(w, r, workingCopyUpstream(cfg), targetPath, nil, logger)
 	}
 }
 
@@ -57,6 +58,14 @@ func SSELogs(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 		if encoded := query.Encode(); encoded != "" {
 			targetPath += "?" + encoded
 		}
-		proxySSE(w, r, cfg.Services.SQLMeshServiceURL, targetPath, logger)
+		proxySSE(w, r, workingCopyUpstream(cfg), targetPath, nil, logger)
 	}
+}
+
+// workingCopyUpstream returns the working-copy owner's base URL. There is no
+// fallback: the legacy per-service entries were removed from platform.yaml
+// with the services they named, so an unset services.runtime surfaces as proxy
+// errors rather than traffic silently routed elsewhere.
+func workingCopyUpstream(cfg *config.Config) string {
+	return cfg.Services.RuntimeServiceURL
 }

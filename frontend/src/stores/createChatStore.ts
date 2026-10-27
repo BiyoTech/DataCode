@@ -133,10 +133,24 @@ export function createChatStore(config: ChatStoreConfig) {
       }
     }
 
+    // True once the stream has been connected at least once, so a later
+    // 'connected' is recognised as a RECONNECT rather than the initial attach.
+    let streamWasConnected = false
+
     const { connect, disconnect } = useSSE({
       onEvent: handleServerEvent,
       onStateChange: (state) => {
         connectionState.value = state
+        if (state === 'connected') {
+          // Events published while the stream was down are only replayed when
+          // the server still holds the session's buffer queue — a backend
+          // restart loses it. Refill from the persisted timeline so a run that
+          // completed during the outage is shown instead of silently missing.
+          if (streamWasConnected) {
+            void _refillTimeline()
+          }
+          streamWasConnected = true
+        }
         // A terminal disconnect (reconnect attempts exhausted) while a run is
         // still in flight would otherwise leave the UI stuck in the "thinking"
         // state forever. Surface a warning and release the busy state so the
@@ -147,6 +161,44 @@ export function createChatStore(config: ChatStoreConfig) {
         }
       },
     })
+
+    /**
+     * Attach the event stream to a session. Starting a session is not a
+     * reconnect, so the refill-on-reconnect flag restarts with it.
+     */
+    function _startStream(sessionId: string) {
+      streamWasConnected = false
+      connect(sessionId)
+    }
+
+    /**
+     * Rebuild the timeline from the server's persisted events.
+     *
+     * Used after a reconnect: the persisted timeline is authoritative, so this
+     * both fills gaps and drops any half-streamed bubble whose remaining
+     * deltas were lost with the connection.
+     */
+    async function _refillTimeline() {
+      const sessionId = currentSessionId.value
+      if (!sessionId) return
+      try {
+        const { data } = await api.get(`/sessions/${sessionId}`)
+        // Re-anchor the busy state on the server's run flag: during the outage
+        // the run may have finished (clear a stale "thinking") or still be
+        // going (keep the composer busy even though its events arrive next).
+        isThinking.value = data.is_running === true
+        const events = data.timeline_events || []
+        if (events.length === 0) return
+        timeline.value = _buildTimelineFromEvents(events)
+        processedEventIds.clear()
+        for (const ev of events) {
+          if (ev.event_id) processedEventIds.add(ev.event_id)
+        }
+      } catch {
+        // Keep whatever the client already has: a failed refill must not wipe
+        // the visible conversation.
+      }
+    }
 
     const isConnected = computed(() => connectionState.value === 'connected')
 
@@ -221,7 +273,7 @@ export function createChatStore(config: ChatStoreConfig) {
         processedEventIds.clear()
 
         localStorage.setItem(config.lsSessionKey, data.session_id)
-        connect(data.session_id)
+        _startStream(data.session_id)
         fetchSessions()
 
         return data.session_id
@@ -245,6 +297,12 @@ export function createChatStore(config: ChatStoreConfig) {
         }
         currentExecutionStyle.value =
           data.execution_style || config.defaultExecutionStyle || 'agent'
+
+        // Restore the busy state from the server's authoritative run flag. The
+        // timeline alone cannot answer "is a run in flight?": a live run's last
+        // persisted event is routinely a message.complete (emitted mid-run to
+        // seal a text segment), so a session opened mid-run would look idle.
+        isThinking.value = data.is_running === true
 
         const timelineEvents: Array<{
           event_id: string
@@ -278,7 +336,7 @@ export function createChatStore(config: ChatStoreConfig) {
         }
 
         localStorage.setItem(config.lsSessionKey, data.session_id)
-        connect(data.session_id)
+        _startStream(data.session_id)
 
         return true
       } catch {
@@ -410,19 +468,27 @@ export function createChatStore(config: ChatStoreConfig) {
 
         await api.post(`/sessions/${currentSessionId.value}/chat`, body)
       } catch (e: any) {
-        // Roll back the just-added user bubble and busy state so the composer
-        // is immediately usable again after a rejected send.
-        if (timeline.value[timeline.value.length - 1] === userEntry) {
-          timeline.value.pop()
+        // Roll back the just-added user bubble so a rejected send leaves no
+        // ghost message. Locate it by identity: a second send fired before this
+        // one failed would otherwise remove the wrong bubble.
+        const idx = timeline.value.indexOf(userEntry)
+        if (idx >= 0) {
+          timeline.value.splice(idx, 1)
         }
-        isThinking.value = false
 
-        // 409: a run is already in flight for this session. Surface a soft,
-        // non-blocking warning instead of a hard error entry.
+        // 409: a run is already in flight for this session. The composer stays
+        // BUSY — that run's terminal event is still coming over the stream,
+        // and showing idle here is the same lie this store stopped telling for
+        // message.complete. If the registration is stale (owner replica died),
+        // cancel is the documented escape hatch that releases it.
         if (e?.response?.status === 409) {
           notifyError(e, 'A task is already running in this session. Please wait for it to finish.')
           return
         }
+
+        // Any other failure means the run never started: release the busy
+        // state so the composer is immediately usable again.
+        isThinking.value = false
         pushError(extractApiMessage(e, 'Failed to send message'))
       }
     }
@@ -491,6 +557,12 @@ export function createChatStore(config: ChatStoreConfig) {
           break
 
         case 'agent.finish':
+          // Terminal for the RUN, by backend invariant: every emission site
+          // (goal-loop finalizer, cancel, max-turns/budget pause, resume
+          // failure) is a point where no further work follows on this turn —
+          // including "paused", which only fires once the auto-resume budget
+          // is exhausted. If a backend change ever emits this mid-run, the
+          // composer goes idle mid-task again; keep it terminal.
           _flushStreamingBubble()
           entry.status = mapFinishOutcome(event.payload.outcome)
           timeline.value.push(entry)
@@ -530,8 +602,15 @@ export function createChatStore(config: ChatStoreConfig) {
           break
 
         case 'message.complete':
+          // A completed message is NOT a completed run. The backend seals one
+          // streamed text segment with this event before every tool call,
+          // reasoning step and handoff (and between todo-continuation segments),
+          // so a run in flight routinely produces several of these. Clearing
+          // the busy state here was what let the composer flip back to
+          // "sendable" in the middle of a task. The busy state is owned by the
+          // run's lifecycle events (agent.start / agent.finish / human.required
+          // / system.error), never by message boundaries.
           _finalizeMessage(event.payload.content, event.payload.agent_name, event.event_id)
-          isThinking.value = false
           break
 
         case 'artifact.created':

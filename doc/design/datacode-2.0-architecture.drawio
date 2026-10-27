@@ -1,0 +1,644 @@
+<mxfile host="drawio-plugin" modified="2026-08-26T13:39:06.721Z" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" version="22.1.22" etag="932qz6Mw_SOiHOjKpbQ0" type="embed" pages="4">
+  <diagram id="p1-overview" name="1-架构总览">
+    <mxGraphModel dx="1927" dy="987" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1800" pageHeight="1480" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="&lt;b&gt;DataCode 2.0 架构总览&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;图例&lt;/b&gt;&lt;br&gt;蓝色 = 无状态服务（自由 HPA）&lt;br&gt;橙色 = 工作区亲和服务（租约绑定）&lt;br&gt;紫色 = 单例控制面（Dagster 官方约束）&lt;br&gt;绿色 = 一次性沙箱执行体&lt;br&gt;灰色 = 存储 / 外部依赖&lt;br&gt;&lt;br&gt;&lt;b&gt;规模目标&lt;/b&gt;：1000 租户 × 1000 子用户&lt;br&gt;= 10^6 用户，日活 5%，5 个 Cell，每 Cell ~200 租户" style="text;html=1;strokeColor=#8E8E93;fillColor=#F2F2F7;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" parent="1" vertex="1">
+          <mxGeometry x="40" y="40" width="360" height="215" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="Frontend (Vue 3 + TS)&lt;br&gt;i18n zh/en · 用户时区可配置" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="560" y="60" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="Global Edge (Envoy / Ingress)&lt;br&gt;按 JWT.cell_id 路由，热路径零查库" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" parent="1" vertex="1">
+          <mxGeometry x="560" y="180" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="全局层（跨 Cell 单例）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#1565c0;strokeWidth=2;verticalAlign=top;align=left;spacing=6;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="880" y="40" width="560" height="210" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="identity-service (Go)&lt;br&gt;users / tenants / roles&lt;br&gt;permissions / authz API" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="900" y="100" width="170" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="Global PG&lt;br&gt;身份 + 授权" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1090" y="100" width="150" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="8" value="tenant_placement&lt;br&gt;租户 → Cell 映射表" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1260" y="100" width="160" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="10" value="Cell A（~200 租户 / 200k 用户 / 4000 活跃工作副本）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#333333;strokeWidth=2;verticalAlign=top;align=left;spacing=6;fontSize=13;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="40" y="310" width="1400" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="edge-gateway × N (Go)&lt;br&gt;JWT 本地验签 · 授权缓存 · 限流&lt;br&gt;&lt;b&gt;LeaseRouter：工作区亲和路由&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="600" y="350" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="control-service × N&lt;br&gt;环境注册中心 / Reconciler&lt;br&gt;租约分配 / 配额 / 任务提交" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="100" y="490" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="agent-service × N&lt;br&gt;对话编排 / ACP / SSE&lt;br&gt;按并发对话数扩容" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="330" y="490" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="dagster-webserver × N&lt;br&gt;GraphQL / UI（无状态）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1010" y="490" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="19" value="dagster-daemon × 1&lt;br&gt;&lt;b&gt;Cell 内单副本硬约束&lt;/b&gt;&lt;br&gt;schedule / sensor / 出队" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1230" y="490" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="workspace-runtime #1&lt;br&gt;N 租约（可配置）· 本地盘工作副本&lt;br&gt;SQLMesh+Ontology+Git+文件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="100" y="640" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="16" value="workspace-runtime #2&lt;br&gt;N 租约" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="330" y="640" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="17" value="workspace-runtime #33&lt;br&gt;N 租约" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="560" y="640" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="18" value="code location Pod × ~1100&lt;br&gt;按需 warm，import 用户代码&lt;br&gt;(L3-base, 独立节点池)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="920" y="640" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="workspace-sync (sidecar)&lt;br&gt;单一写者渲染 workspace.yaml" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1230" y="640" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="20" value="task-runner (L2 · runc)&lt;br&gt;纯 SQL plan/apply（可写凭证）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="100" y="790" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="task-runner (L3-base · runc)&lt;br&gt;agent shell / 用户 Python" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="330" y="790" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="dagster run worker (L3-base)&lt;br&gt;每 run 一个 Pod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="790" y="790" width="190" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="Cell PG&lt;br&gt;platform / agent / dagster" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="330" y="940" width="190" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="25" value="Cell Redis&lt;br&gt;租约表 / SSE bus / 限流" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="560" y="940" width="190" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="26" value="Event Store&lt;br&gt;timeline 按天分区 + Parquet 冷层" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="790" y="940" width="190" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="27" value="&lt;b&gt;Cell 内关键不变式&lt;/b&gt;&lt;br&gt;&lt;br&gt;① 一个工作副本（working copy）在任一时刻&lt;br&gt;   只被一个 workspace-runtime 挂载并写入&lt;br&gt;   → 工作副本可放 Pod 本地 NVMe，无需共享 PV&lt;br&gt;   → env_lock 退化为进程内锁&lt;br&gt;   → Context dirty 标志重新变得正确&lt;br&gt;&lt;br&gt;② 用户代码永不在平台进程内执行&lt;br&gt;   → P3 起 L3-proc 子进程（T2 消除）&lt;br&gt;   → P6 起 L2/L3-base 沙箱容器&lt;br&gt;&lt;br&gt;③ 服务间调用是 DAG，无环&lt;br&gt;   （原 sqlmesh⇄dagster、ontology→sqlmesh 环路&lt;br&gt;     因合并为进程内调用而消失）" style="text;html=1;strokeColor=#d79b00;fillColor=#fff9f0;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" parent="1" vertex="1">
+          <mxGeometry x="1010" y="940" width="410" height="205" as="geometry" />
+        </mxCell>
+        <mxCell id="30" value="Cell B&lt;br&gt;Cell C&lt;br&gt;Cell D&lt;br&gt;Cell E&lt;br&gt;&lt;br&gt;（结构同构&lt;br&gt;各 ~200 租户&lt;br&gt;独立 PG/Redis&lt;br&gt;独立 daemon）&lt;br&gt;&lt;br&gt;故障爆炸半径&lt;br&gt;= 20% 租户" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=#fafafa;strokeColor=#666666;verticalAlign=top;spacing=6;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="1480" y="300" width="240" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="39" value="共享外部依赖（跨 Cell）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#8E8E93;verticalAlign=top;align=left;spacing=6;fontSize=12;fontStyle=1" parent="1" vertex="1">
+          <mxGeometry x="40" y="1250" width="1400" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="40" value="Git Server&lt;br&gt;（代码唯一真源）" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="180" y="1300" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="41" value="对象存储 (S3/MinIO)&lt;br&gt;冷层 / 归档 / 资产" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="400" y="1300" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="42" value="LLM Providers&lt;br&gt;（仅 agent-service 出口）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="620" y="1300" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="43" value="客户数据仓库&lt;br&gt;Snowflake / BQ / PG" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" parent="1" vertex="1">
+          <mxGeometry x="840" y="1300" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="50" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;" parent="1" source="3" target="4" edge="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="51" value="HTTPS" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.4;exitY=1;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="4" target="11" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="648" y="310" />
+            </Array>
+            <mxPoint x="-14" y="-2" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="52" value="其他租户按 cell_id 路由" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=8 8;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.9;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#666666;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="4" target="30" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="820" y="275" />
+              <mxPoint x="1600" y="275" />
+            </Array>
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="53" value="authz/resolve（缓存 60s）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0.9;exitY=0;entryX=0.5;entryY=1;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="11" target="6" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="816" y="278" />
+              <mxPoint x="985" y="278" />
+            </Array>
+            <mxPoint x="30" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="54" value="元数据 API" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.2;exitY=1;entryX=0.8;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="11" target="12" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="648" y="452" />
+              <mxPoint x="252" y="452" />
+            </Array>
+            <mxPoint x="-40" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="55" value="对话 / SSE" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.35;exitY=1;entryX=0.8;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="11" target="13" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="684" y="473" />
+              <mxPoint x="482" y="473" />
+            </Array>
+            <mxPoint x="-24" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="56" value="lease-aware 路由" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.65;exitY=1;entryX=0.8;entryY=0;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="11" target="15" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="756" y="610" />
+              <mxPoint x="252" y="610" />
+            </Array>
+            <mxPoint x="-70" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="57" value="lease-aware 路由" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.78;exitY=1;entryX=0.8;entryY=0;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="11" target="16" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="787" y="437" />
+              <mxPoint x="840" y="437" />
+              <mxPoint x="840" y="620" />
+              <mxPoint x="482" y="620" />
+            </Array>
+            <mxPoint x="60" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="59" value="binder 指令" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.3;exitY=1;entryX=0.3;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="12" target="15" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-38" y="-4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="60" value="租约授予" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.72;exitY=1;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="12" target="16" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="237" y="582" />
+              <mxPoint x="368" y="582" />
+            </Array>
+            <mxPoint x="-4" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="61" value="工具调用（无本地执行）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="13" target="16" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="76" y="-4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="62" value="元数据读写" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.8;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="12" target="24" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="70" y="546" />
+              <mxPoint x="70" y="915" />
+            </Array>
+            <mxPoint x="-30" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="63" value="提交任务" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="15" target="20" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-34" y="-4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="64" value="提交 shell 任务" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="16" target="21" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="54" y="-4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="65" value="租约 / 协调" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0.8;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="15" target="25" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="252" y="750" />
+              <mxPoint x="655" y="750" />
+            </Array>
+            <mxPoint x="-90" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="66" value="K8s Endpoints 发现" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;endArrow=classic;strokeColor=#9673a6;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="23" target="18" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="67" value="gRPC tick" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;exitX=0.2;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#9673a6;labelBackgroundColor=#ffffff;labelBorderColor=none;entryDx=0;entryDy=0;" parent="1" source="19" target="18" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1268" y="590" />
+              <mxPoint x="1015" y="590" />
+            </Array>
+            <mxPoint x="34" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="68" value="launch run" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#9673a6;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="19" target="22" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1325" y="618" />
+              <mxPoint x="885" y="618" />
+            </Array>
+            <mxPoint x="100" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="69" value="加载用户代码 / sqlmesh run" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.2;exitY=0;entryX=0.8;entryY=1;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="22" target="17" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="828" y="752" />
+              <mxPoint x="712" y="752" />
+            </Array>
+            <mxPoint x="-6" y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="70" value="run / event storage" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.8;entryX=0.9;entryY=0;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="14" target="24" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="545" y="546" />
+              <mxPoint x="545" y="912" />
+              <mxPoint x="501" y="912" />
+            </Array>
+            <mxPoint x="60" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="71" value="timeline / 记忆事件" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="21" target="26" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="425" y="905" />
+              <mxPoint x="828" y="905" />
+            </Array>
+            <mxPoint x="-10" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="72" value="Git / 对象存储 / LLM / 客户数据仓库（全部经受控出口）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=8 8;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#8E8E93;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" parent="1" source="10" target="39" edge="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-12" as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p2-lease" name="2-工作区租约机制">
+    <mxGraphModel dx="1434" dy="810" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1520" pageHeight="1060" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="&lt;b&gt;工作区租约（Workspace Lease）&lt;/b&gt;&lt;br&gt;&lt;br&gt;lease_key = {tenant}/{workspace}/{user}/{env}&lt;br&gt;  （即工作副本的规范路径）&lt;br&gt;&lt;br&gt;Redis 键：&lt;br&gt;  {prefix}:{cell}:lease:{key} → runtime_id  EX 120&lt;br&gt;  {prefix}:{cell}:rt:{id} → 心跳(addr/leases/load) EX 30&lt;br&gt;&lt;br&gt;&lt;b&gt;TTL 是 crash 恢复界，不是操作超时&lt;/b&gt;：&lt;br&gt;watchdog 每 TTL/3 续期，apply 可跑数小时；&lt;br&gt;实例崩溃后 TTL 到期，租约自动可被接管。" style="text;html=1;strokeColor=#d79b00;fillColor=#fff9f0;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="430" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="edge-gateway&lt;br&gt;&lt;b&gt;LeaseRouter 中间件&lt;/b&gt;&lt;br&gt;解析 lease_key → 查租约 → 直连 Pod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="590" y="60" width="300" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="control-service&lt;br&gt;&lt;b&gt;LeaseController&lt;/b&gt;&lt;br&gt;分配 / 回收 / 扩缩容编排" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="220" width="240" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="Cell Redis&lt;br&gt;lease:{key} → runtime_id（SET NX EX）&lt;br&gt;rt:{id} → 实例心跳与容量&lt;br&gt;lease:claim:{key} → 防惊群锁" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="220" width="300" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="workspace-runtime #1&lt;br&gt;租约 16 / 16（满，不再接新）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="140" y="420" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="workspace-runtime #2&lt;br&gt;租约 9 / 16（可接新）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="440" y="420" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="8" value="workspace-runtime #3&lt;br&gt;draining（capacity=0）&lt;br&gt;等租约自然过期后下线" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;dashed=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="740" y="420" width="240" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="20" value="一个租约 = 四件资源（随租约一起创建与回收）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;align=left;spacing=6;fontSize=12;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="140" y="610" width="880" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="worktree&lt;br&gt;Pod 本地 NVMe&lt;br&gt;.repo + envs/{env}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="180" y="670" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="MetadataContext&lt;br&gt;runtime 内存（只读）&lt;br&gt;模型/列/依赖/血缘" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="400" y="670" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="SqlMeshExecutor&lt;br&gt;可执行 SQLMesh Context&lt;br&gt;P3 子进程 → P6 容器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="620" y="670" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="code location&lt;br&gt;按需 warm (L3)&lt;br&gt;cold 时为 0 资源" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="840" y="670" width="150" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="30" value="Git Server&lt;br&gt;（工作副本唯一真源）" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="300" y="880" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="31" value="task-runner (L2 / L3-base)&lt;br&gt;一次性沙箱容器（P6）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="640" y="880" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="40" value="&lt;b&gt;容量模型（单 Cell）&lt;/b&gt;&lt;br&gt;&lt;br&gt;每租约开销 ≈ 210 MB 内存 + 100 MB 盘&lt;br&gt;runtime 实例 limit 8 GB，基线 1.5 GB&lt;br&gt;→ 每实例 ≤ 16 租约（&lt;b&gt;可配置，Q3&lt;/b&gt;）&lt;br&gt;准入 = 内存预算 + 真实 RSS 双判断&lt;br&gt;运行期 EWMA 自适应（仓库规模差一个数量级）&lt;br&gt;&lt;br&gt;峰值并发编辑会话 400&lt;br&gt;→ 400 / 16 = 25 实例，留余量 33 实例&lt;br&gt;→ 264 GB 内存 / 66 vCPU&lt;br&gt;&lt;br&gt;对比随机路由：2000 × 200 MB = 400 GB&lt;br&gt;且命中率极低。租约后 84 GB 且 100% 命中。" style="text;html=1;strokeColor=#6c8ebf;fillColor=#f5f9ff;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="420" width="430" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="41" value="&lt;b&gt;三道防线保证「单挂载」不变式&lt;/b&gt;&lt;br&gt;&lt;br&gt;① Redis SET NX —— 正常情况原子获取&lt;br&gt;② 文件 flock（.repo/.datacode-lease）&lt;br&gt;   —— Redis 降级 / 同节点冲突&lt;br&gt;③ Git worktree 自身约束&lt;br&gt;   —— 一个分支至多一个 worktree&lt;br&gt;&lt;br&gt;&lt;b&gt;残余风险（显式接受）&lt;/b&gt;：Redis 长时间不可用&lt;br&gt;且副本数变化时可能短暂双挂载。最坏后果是&lt;br&gt;一个用户的未提交改动冲突（Git 报错而非&lt;br&gt;静默损坏），&lt;b&gt;不是跨租户泄露&lt;/b&gt;。&lt;br&gt;&lt;br&gt;&lt;b&gt;未提交改动保护（Q6 契约）&lt;/b&gt;：编辑器 5s 草稿存&lt;br&gt;DB + drain 时 push refs/datacode-wip/*（零丢失）&lt;br&gt;+ 每 10 min 快照（非优雅崩溃上界，&lt;b&gt;已接受&lt;/b&gt;）。" style="text;html=1;strokeColor=#b85450;fillColor=#fff5f5;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="650" width="430" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="50" value="① GET lease:{key}" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="3" target="5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1150" y="100" />
+            </Array>
+            <mxPoint x="-60" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="51" value="② miss → acquire" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.5;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="100" />
+            </Array>
+            <mxPoint x="70" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="52" value="③ 读 rt:* 心跳，选最空闲实例" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.4;entryX=0;entryY=0.33;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="53" value="④ 授予租约" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="4" target="7">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="320" y="378" />
+              <mxPoint x="488" y="378" />
+            </Array>
+            <mxPoint x="-6" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="54" value="⑤ 直连持租约实例（Pod IP）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.8;entryY=0;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="3" target="7">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="740" y="356" />
+              <mxPoint x="632" y="356" />
+            </Array>
+            <mxPoint x="100" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="55" value="⑥ watchdog 续期 + 容量心跳" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.3;entryX=0.1;entryY=1;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="8" target="5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1030" y="450" />
+            </Array>
+            <mxPoint x="10" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="56" value="⑦ 建立租约资源" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="7" target="20">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="560" y="565" />
+              <mxPoint x="580" y="565" />
+            </Array>
+            <mxPoint x="60" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="57" value="⑧ 物化 worktree / WIP push" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.2;entryY=0;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="21" target="30">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="275" y="822" />
+              <mxPoint x="344" y="822" />
+            </Array>
+            <mxPoint x="-30" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="58" value="⑨ 长任务转沙箱执行" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.3;entryY=0;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="23" target="31">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="715" y="840" />
+              <mxPoint x="712" y="840" />
+            </Array>
+            <mxPoint x="70" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p3-sandbox" name="3-沙箱隔离">
+    <mxGraphModel dx="1434" dy="810" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1520" pageHeight="1080" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="&lt;b&gt;分级沙箱隔离（P0 决策后）&lt;/b&gt;&lt;br&gt;&lt;br&gt;L1 平台进程内 —— 用户&lt;b&gt;数据&lt;/b&gt;（YAML/路径），严格校验&lt;br&gt;L2 标准容器 (runc) —— 用户 &lt;b&gt;SQL&lt;/b&gt;，&lt;b&gt;唯一允许可写仓库凭证&lt;/b&gt;&lt;br&gt;L3 用户&lt;b&gt;任意代码&lt;/b&gt; —— 分三档演进：&lt;br&gt;   &lt;b&gt;L3-proc&lt;/b&gt;（P3）独立进程 + 独立 UID + 清空 env + rlimit&lt;br&gt;   &lt;b&gt;L3-base&lt;/b&gt;（P6）标准容器 + 网络隔离 + 单工作副本挂载&lt;br&gt;   &lt;b&gt;L3-strong&lt;/b&gt;（待增强）+ gVisor / Kata&lt;br&gt;&lt;br&gt;&lt;b&gt;Q1&lt;/b&gt;：保留 SQLMesh Python model/macro ⇒ 必须真隔离&lt;br&gt;&lt;b&gt;Q2&lt;/b&gt;：暂不用 gVisor/Kata ⇒ T8 记为待增强&lt;br&gt;&lt;b&gt;安全默认&lt;/b&gt;：无法判定时用当前最强&lt;b&gt;已启用&lt;/b&gt;档位" style="text;html=1;strokeColor=#82b366;fillColor=#f4fbf4;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="560" height="195" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="&lt;b&gt;威胁消除时间线&lt;/b&gt;（现状 T1-T10 全部可行）&lt;br&gt;&lt;b&gt;T2 读平台凭证（最致命）&lt;/b&gt; → &lt;b&gt;P3&lt;/b&gt; 清空 env + 独立 UID&lt;br&gt;T5 资源耗尽（噪声邻居） → P3 rlimit ／ P6 cgroup&lt;br&gt;T10 篡改平台文件 → P3 独立 UID ／ P6 readOnlyRootFs&lt;br&gt;T1 读其他租户工作区 → &lt;b&gt;P6&lt;/b&gt; 只挂载 1 个工作副本&lt;br&gt;T3 直连 PG / Redis → P6 NetworkPolicy default-deny&lt;br&gt;T6 云元数据 169.254.x → P6 出口代理拒绝内网段&lt;br&gt;T7 SSRF 内网横移 → P6 出口代理白名单&lt;br&gt;&lt;b&gt;T8 容器逃逸&lt;/b&gt; → ⚠️ &lt;b&gt;待增强&lt;/b&gt;（Q2）缓解：用户代码专属节点池&lt;br&gt;git hooks（当前被忽略） → P3 core.hooksPath=/dev/null" style="text;html=1;strokeColor=#b85450;fillColor=#fff5f5;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="640" y="40" width="620" height="195" as="geometry" />
+        </mxCell>
+        <mxCell id="10" value="平台侧（可信 · 持凭证）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#1565c0;strokeWidth=2;verticalAlign=top;align=left;spacing=6;fontSize=13;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="230" width="560" height="560" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="agent-service&lt;br&gt;审批 L1-L6（对话语义）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="90" y="290" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="workspace-runtime&lt;br&gt;租约所有者 · TaskSubmitter" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="330" y="290" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;L1 · 平台进程内执行（仅数据处理，无代码执行）&lt;/b&gt;&lt;br&gt;文件读写 / 列目录 / 代码搜索  （parse_workspace_path 5 段布局强校验）&lt;br&gt;ontology YAML 加载（yaml.safe_load）  git status / diff（禁用 hooks）&lt;br&gt;模型/血缘/列元数据只读查询（来自 MetadataContext，毫秒级）" style="text;html=1;strokeColor=#6c8ebf;fillColor=#f5f9ff;align=left;verticalAlign=top;whiteSpace=wrap;spacing=6;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="400" width="460" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="control-service&lt;br&gt;deployment / 配额 / 审计" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="90" y="540" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="&lt;b&gt;平台凭证（绝不进入沙箱）&lt;/b&gt;&lt;br&gt;DB_PASSWORD · REDIS_PASSWORD · LLM API keys · TOKEN_ENCRYPTION_SECRET · INTERNAL_TOKEN" style="text;html=1;strokeColor=#b85450;fillColor=#ffecec;align=left;verticalAlign=top;whiteSpace=wrap;spacing=6;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="650" width="460" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="20" value="隔离&lt;br&gt;边界&lt;br&gt;&lt;br&gt;&lt;b&gt;P3&lt;/b&gt;&lt;br&gt;L3-proc&lt;br&gt;独立 UID&lt;br&gt;清空 env&lt;br&gt;setrlimit&lt;br&gt;&lt;br&gt;&lt;b&gt;P6&lt;/b&gt;&lt;br&gt;L3-base&lt;br&gt;NetworkPolicy&lt;br&gt;default-deny&lt;br&gt;nonroot 65534&lt;br&gt;drop ALL&lt;br&gt;seccomp&lt;br&gt;独立节点池&lt;br&gt;&lt;br&gt;&lt;b&gt;待增强&lt;/b&gt;&lt;br&gt;gvisor (Q2)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#333333;strokeWidth=2;dashed=1;dashPattern=4 4;verticalAlign=middle;fontSize=11;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="630" y="230" width="140" height="560" as="geometry" />
+        </mxCell>
+        <mxCell id="30" value="沙箱侧（不可信 · 无平台凭证）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 8;fillColor=none;strokeColor=#2e7d32;strokeWidth=2;verticalAlign=top;align=left;spacing=6;fontSize=13;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="800" y="230" width="660" height="560" as="geometry" />
+        </mxCell>
+        <mxCell id="31" value="task-runner &lt;b&gt;L2&lt;/b&gt; (runc) · P6&lt;br&gt;纯 SQL plan/apply · query · git clone/push&lt;br&gt;&lt;b&gt;唯一持可写仓库凭证的档位&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="280" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="32" value="task-runner &lt;b&gt;L3-base&lt;/b&gt; (runc) · P6&lt;br&gt;agent shell · dagster run · Python macro&lt;br&gt;只读仓库凭证（写操作拆到 L2）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="410" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="33" value="&lt;b&gt;SqlMeshExecutor&lt;/b&gt; (per-lease)&lt;br&gt;&lt;b&gt;P3&lt;/b&gt;: L3-proc 持久子进程（协议在此冻结）&lt;br&gt;&lt;b&gt;P6&lt;/b&gt;: L3-base warm sandbox 容器（同协议）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="540" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="34" value="&lt;b&gt;code location&lt;/b&gt; (L3)&lt;br&gt;import 用户 asset-dag/definitions.py&lt;br&gt;P3 加固子进程 → P6 独立 Pod" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="670" width="280" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="35" value="&lt;b&gt;沙箱容器统一约束（L3-base, P6）&lt;/b&gt;&lt;br&gt;&lt;br&gt;挂载：&lt;b&gt;仅 1 个工作副本&lt;/b&gt; → /workspace&lt;br&gt;（不是整个 base_path，T1 的根本解）&lt;br&gt;&lt;br&gt;readOnlyRootFilesystem: true&lt;br&gt;runAsNonRoot / runAsUser 65534&lt;br&gt;capabilities: drop ALL&lt;br&gt;automountServiceAccountToken: false&lt;br&gt;&lt;b&gt;enableServiceLinks: false&lt;/b&gt;（不注入集群服务 env）&lt;br&gt;dnsPolicy: None（受控 resolver）&lt;br&gt;hostNetwork / hostPID / hostIPC: false&lt;br&gt;&lt;br&gt;cgroup：cpu 2 / mem 4Gi / pids 512&lt;br&gt;ephemeral-storage 8Gi&lt;br&gt;activeDeadlineSeconds 1800（硬超时）&lt;br&gt;&lt;br&gt;注入的唯一凭证：&lt;br&gt;  scoped task token（单任务 · 单工作副本 · TTL=任务时长）&lt;br&gt;  + 本工作副本自己配置的仓库凭证" style="text;html=1;strokeColor=#82b366;fillColor=#f4fbf4;align=left;verticalAlign=top;whiteSpace=wrap;spacing=6;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="280" width="240" height="480" as="geometry" />
+        </mxCell>
+        <mxCell id="40" value="egress-proxy（平台管控的唯一出网通道）&lt;br&gt;租户白名单 · 全量审计 · 流量配额 · 拒绝全部内网段" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="830" width="280" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="41" value="Git Server" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="880" y="960" width="130" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="42" value="客户数据仓库" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1030" y="960" width="130" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="43" value="&lt;b&gt;出口代理拒绝清单（default-deny 之外的显式拒绝）&lt;/b&gt;&lt;br&gt;&lt;br&gt;Cell PostgreSQL / Cell Redis / Event Store&lt;br&gt;identity-service / control-service / 其他 runtime 实例&lt;br&gt;169.254.0.0/16（云元数据服务，IAM 凭证）&lt;br&gt;10.0.0.0/8  172.16.0.0/12  192.168.0.0/16  127.0.0.0/8&lt;br&gt;9.0.0.0/8  11.0.0.0/8  21.0.0.0/8  30.0.0.0/8&lt;br&gt;PyPI（改为离线构建的受管镜像 + 白名单依赖清单）&lt;br&gt;LLM Provider（LLM 调用只在 agent-service 侧，沙箱无 key）" style="text;html=1;strokeColor=#b85450;fillColor=#ffecec;align=left;verticalAlign=top;whiteSpace=wrap;spacing=6;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="830" width="560" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="50" value="工具调用" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="51" value="提交 L2 任务" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#2e7d32;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="12" target="31">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-10" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="52" value="提交 L3 任务" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.8;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#2e7d32;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="12" target="32">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="690" y="346" />
+              <mxPoint x="690" y="455" />
+            </Array>
+            <mxPoint x="-20" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="53" value="租约期常驻" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.95;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="12" target="33">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="722" y="357" />
+              <mxPoint x="722" y="585" />
+            </Array>
+            <mxPoint x="-20" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="54" value="创建 / 删除 deployment Pod" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="14" target="34">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="752" y="575" />
+              <mxPoint x="752" y="715" />
+            </Array>
+            <mxPoint x="-90" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="55" value="唯一出网路径" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="34" target="40">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="60" y="-4" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="56" value="出网经代理" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=1;entryY=0.5;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="32" target="40">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1180" y="455" />
+              <mxPoint x="1180" y="870" />
+            </Array>
+            <mxPoint x="24" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="57" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#8E8E93;" edge="1" parent="1" source="40" target="41">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="58" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#8E8E93;" edge="1" parent="1" source="40" target="42">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="p4-flow" name="4-请求链路">
+    <mxGraphModel dx="1434" dy="810" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="1060" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="用户 / Frontend&lt;br&gt;点击「Apply @ dev_alice」" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="60" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="edge-gateway&lt;br&gt;JWT 本地验签 + 授权缓存&lt;br&gt;身份头覆写（防伪造 owner）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="190" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="edge-gateway&lt;br&gt;&lt;b&gt;LeaseRouter&lt;/b&gt;&lt;br&gt;解析 lease_key → 选上游实例" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="330" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="workspace-runtime&lt;br&gt;（持该工作副本租约的实例）&lt;br&gt;worktree 已在本地盘 · Context 已热" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="590" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="L3-proc 子进程（P3）&lt;br&gt;→ L2 / L3-base 容器（P6）&lt;br&gt;&lt;b&gt;无平台凭证&lt;/b&gt; · 只挂载本工作副本" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="740" width="220" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="结果回收 + 事件落库&lt;br&gt;plan_apply_history / task_records" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="100" y="890" width="220" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="10" value="identity-service&lt;br&gt;authz/resolve&lt;br&gt;（全局，60s 缓存）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="190" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="Cell Redis&lt;br&gt;lease:{key}&lt;br&gt;（本地缓存 10s，命中 &amp;gt;95%）" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="330" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="control-service&lt;br&gt;LeaseController&lt;br&gt;acquire → 选实例 → 通知&lt;br&gt;环境准入 guard + 配额" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="450" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="Git Server&lt;br&gt;fetch / worktree add&lt;br&gt;（仅租约首次物化）" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="590" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="客户数据仓库&lt;br&gt;sqlmesh__{workspace_id}&lt;br&gt;（经出口代理，白名单）" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="740" width="200" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="Cell PG / Event Store" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#F2F2F7;strokeColor=#8E8E93;boundedLbl=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="420" y="890" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="20" value="&lt;b&gt;链路说明（每步的关键约束）&lt;/b&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;① HTTPS&lt;/b&gt; —— 全局边缘按 JWT.cell_id 路由到本 Cell，热路径不查库。&lt;br&gt;&lt;br&gt;&lt;b&gt;② 认证与授权&lt;/b&gt; —— JWT 本地验签（无网络跳）；授权集合来自 identity-service&lt;br&gt;并以 perms_version 失效。SanitizeIdentity 覆写请求里客户端自带的 user_id，&lt;br&gt;使伪造 owner 不可能。RBAC 是全平台单一强制点，非 HTTP 入口亦可调 authz API。&lt;br&gt;&lt;br&gt;&lt;b&gt;③ 解析 lease_key&lt;/b&gt; —— 从 workspace_path 解析 {tenant}/{ws}/{user}/{env}（5 段布局&lt;br&gt;强校验），并校验调用者拥有该工作副本（OwnsWorkingCopy，纵深防御）。&lt;br&gt;&lt;br&gt;&lt;b&gt;④ 查租约&lt;/b&gt; —— 命中即直连该 runtime 的 Pod IP。Redis 不可用时降级为稳定&lt;br&gt;哈希路由，且 LeaseController 同步冻结扩缩容以保住单挂载不变式。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑤ miss → acquire&lt;/b&gt; —— claim 锁防惊群；读 rt:* 心跳选最空闲实例；租户级&lt;br&gt;加权公平避免大租户饿死小租户；无容量则 429 + Retry-After。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑥ 授予租约&lt;/b&gt; —— SET NX EX 原子获取 + flock 二次确认 + Git worktree 约束，&lt;br&gt;三道防线保证一个工作副本只被一个实例挂载写入。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑦ 物化工作副本&lt;/b&gt; —— shallow clone .repo + worktree add 到 Pod 本地 NVMe；&lt;br&gt;检测 refs/datacode-wip/{user}/{env} 并提示恢复未提交改动。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑧ 提交隔离执行&lt;/b&gt; —— P3 起走 L3-proc 常驻子进程（独立 UID + 清空 env +&lt;br&gt;rlimit，消除 T2）；P6 起纯 SQL 走 L2（可写凭证），含 Python model/macro 或&lt;br&gt;shell 走 L3-base（只读凭证）。环境写互斥此时是&lt;b&gt;进程内锁&lt;/b&gt;（租约已保证单&lt;br&gt;写者），无需分布式锁。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑨ SQL 执行&lt;/b&gt; —— 沙箱只持有本工作副本配置的仓库凭证，出网必经 egress-proxy&lt;br&gt;并被全量审计；内网段与云元数据服务一律拒绝。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑩⑪ 结果与审计&lt;/b&gt; —— 结果回传 runtime；历史与任务审计落 Cell PG；timeline 事件&lt;br&gt;进按天分区的 Event Store（30 天热 + Parquet 冷层）。&lt;br&gt;&lt;br&gt;&lt;b&gt;⑫ SSE 回报&lt;/b&gt; —— 跨副本 SSE 是 at-most-once；丢失的 delta 由客户端重连后从&lt;br&gt;持久化 timeline 回填，在下一次交互自愈。&lt;br&gt;&lt;br&gt;全链路一个 trace_id 串联（OTel），日志/指标均带 cell_id + tenant_id。&lt;br&gt;所有时间戳存 UTC，前端按用户时区渲染。" style="text;html=1;strokeColor=#8E8E93;fillColor=#fafafa;align=left;verticalAlign=top;whiteSpace=wrap;spacing=8;fontSize=11;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="680" y="60" width="660" height="910" as="geometry" />
+        </mxCell>
+        <mxCell id="50" value="①" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="51" value="② authz/resolve" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="3" target="10">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="52" value="③" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#1565c0;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="53" value="④ GET lease" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#d79b00;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="4" target="11">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="54" value="⑤ miss → acquire" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.9;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#1565c0;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="4" target="12">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="370" y="402" />
+              <mxPoint x="370" y="495" />
+            </Array>
+            <mxPoint x="-4" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="55" value="⑥ 授予租约" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.7;entryX=1;entryY=0.4;endArrow=classic;strokeColor=#d79b00;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="12" target="5">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="370" y="513" />
+              <mxPoint x="370" y="626" />
+            </Array>
+            <mxPoint x="4" y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="56" value="⑦ 物化 worktree" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.75;entryX=0;entryY=0.75;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="5" target="13">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="57" value="⑧ 提交沙箱任务" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#2e7d32;strokeWidth=2;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-58" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="58" value="⑨ SQL 执行（经出口代理）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="6" target="14">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="59" value="⑩ 结果回传" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;endArrow=classic;strokeColor=#2e7d32;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="-50" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="60" value="⑪ 历史 / 审计 / 事件" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitPerimeter=1;entryPerimeter=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#8E8E93;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="7" target="15">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint y="-14" as="offset" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="61" value="⑫ SSE 流式回报（at-most-once + timeline 回填）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;dashed=1;dashPattern=6 6;exitPerimeter=1;entryPerimeter=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;endArrow=classic;strokeColor=#d79b00;labelBackgroundColor=#ffffff;labelBorderColor=none;" edge="1" parent="1" source="7" target="2">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="55" y="930" />
+              <mxPoint x="55" y="95" />
+            </Array>
+            <mxPoint x="10" y="-160" as="offset" />
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

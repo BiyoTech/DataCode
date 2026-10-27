@@ -1,0 +1,129 @@
+# Control Service Configuration
+# Role: the platform's control plane — environment registry + reconciler +
+# TTL reaper, workspace metadata, Git credentials, quota bookkeeping (P5),
+# quota enforcement and capacity orchestration (P8).
+#
+# Cross-cutting defaults (database, workspace storage, runtime URL, logging)
+# are sourced from conf/platform.yaml. Only control-service-specific settings
+# live here.
+#
+# Every value can be overridden by an env var with the CONTROL_SERVICE_ prefix,
+# e.g. CONTROL_SERVICE_REST_PORT=8008.
+
+server:
+  rest_port: 8004                  # gateway 8000, agent 8001, runtime 8002, identity 8003
+
+runtime:
+  # Shared secret guarding /internal/env-control/* on workspace-runtime.
+  # Env-only in production: CONTROL_SERVICE_RUNTIME_INTERNAL_TOKEN. Must equal
+  # WORKSPACE_RUNTIME_INTERNAL_TOKEN on every runtime replica.
+  internal_token: ""               # fail closed when unset
+  # Generous default: scaffold/ensure-worktree run `sqlmesh init` and git.
+  request_timeout: 120
+
+  # Cell migration surface (P7): guards /internal/cell-migration/* on this
+  # control plane — the export/import/verify/purge endpoints driven by
+  # scripts/ops/cell-migrate.py. Env-only: CONTROL_SERVICE_CELL_MIGRATION_TOKEN,
+  # fail closed when unset (both cells need it for a migration to run).
+  # cell_migration_token: ""
+
+concurrency:
+  # Multi-replica control planes MUST select redis: the same key namespace
+  # (sm:env_lock:*) is shared with workspace-runtime's apply path, which is
+  # what makes destroy/create mutually exclusive with a running apply.
+  env_lock_backend: auto           # auto | redis | in_memory
+  env_lock_ttl_seconds: 120        # crash-recovery bound, renewed while held
+
+environments:
+  max_per_workspace: 20
+  sandbox_default_ttl_hours: 168   # 7 days
+  reaper_enabled: true
+  reaper_interval: 3600            # hourly scan
+  sandbox_expiry_grace_hours: 24
+
+dagster:
+  # Deployment linkage talks to the runtime's Dagster data plane directly.
+  request_timeout: 60
+
+reconcile:
+  # Periodic five-way reconciliation (design 05 §5.1). The four original parties
+  # are also repaired as a side effect of ordinary traffic; the lease and sandbox
+  # parties are NOT — an abandoned sandbox's stale lease is precisely the one
+  # nobody ever requests again, and an orphaned code location Pod keeps running
+  # user code that no user will ever address. Hence a timer.
+  sweep_enabled: true
+  sweep_interval: 3600             # hourly, like the reaper
+  # Detection is always on; REPAIR starts off. The sweep runs unattended across
+  # every workspace and its repairs delete Kubernetes objects and Redis keys, so
+  # read a few cycles of the drift log first, then flip this on.
+  sweep_repair: false
+  # Upper bound per tick; workspaces are visited oldest-activity-first, so a
+  # truncated sweep still covers the ones least likely to be repaired by user
+  # traffic. 0 removes the bound.
+  sweep_max_workspaces: 200
+  # How long a task may be recorded as pending/running with no sandbox Pod before
+  # it is called a zombie. The audit row is written BEFORE the vehicle exists, so
+  # every healthy task looks like this briefly; the window must cover image pull
+  # and scheduling on a cold node.
+  zombie_task_grace_seconds: 900
+  # Interrupted workspace create/delete (workspace_operations). A record with no
+  # progress for this long is treated as abandoned by its process and resumed
+  # by the sweep (acting only with sweep_repair). Must exceed the slowest
+  # legitimate step — a first clone of a large repository.
+  operation_resume_grace_seconds: 900
+  # Resume attempts before a record becomes 'abandoned' (needs a human).
+  operation_resume_max_attempts: 5
+  operation_resume_batch: 50
+
+retention:
+  # Audit tables are append-only (task_records / lease_history); this is their
+  # expiry. A task's window ends at its LAST transition, not creation. 0 days
+  # disables one table without disabling the loop.
+  enabled: true
+  interval: 86400                # daily
+  task_record_days: 90           # "what happened to my plan/apply" (user-facing)
+  lease_history_days: 30         # capacity analytics input; grows faster
+  # Rows deleted per statement — a first run after months must not lock the
+  # table with one giant DELETE.
+  batch_size: 5000
+
+quota:
+  # Platform-wide DEFAULTS applied to tenants without a tenant_quotas row.
+  # A row overrides per-tenant; a zero in a row is an explicit ban. Fail-open
+  # by design: if the counters cannot be read the check is skipped loudly
+  # (quota is capacity governance, not a security boundary).
+  defaults:
+    max_workspaces: 50
+    max_environments: 500
+    max_concurrent_leases: 64
+    max_runtime_replicas: 4
+  # Retry-After seconds advertised on 429 quota rejections.
+  retry_after_seconds: 60
+  # TTL of the quota snapshot published to Redis for the runtime's lease
+  # acquire path (refreshed by the capacity loop below). A dead control plane
+  # therefore degrades to enforcement-off after one TTL instead of freezing
+  # every tenant at its last limits.
+  publish_ttl_seconds: 120
+
+capacity:
+  # LeaseController (P8): reads lease heartbeats from Redis — never a metrics
+  # stack (the observability half of P8 is deferred; capacity must not depend
+  # on it). Disabled by default: a single-runtime dev topology has no scaling
+  # surface, and enabling this without Redis would refuse to start.
+  controller_enabled: false
+  controller_interval: 30          # seconds between ticks
+  # Hysteresis band: scale up at/above, consider scaling down at/below. The
+  # gap prevents a steady-state workload from flapping the replica count.
+  scale_up_threshold: 0.85
+  scale_down_threshold: 0.30
+  min_replicas: 1
+  max_replicas: 10
+  # log: track a number, log decisions (dev; no cluster SDK needed).
+  # kubernetes: scale the StatefulSet via the scale subresource (needs the
+  # k8s extra: pip install -e ".[k8s]"). Scale-down is drain-first in both.
+  driver: log
+  k8s_namespace: default
+  k8s_statefulset: workspace-runtime
+  # A drain that has not finished after this long is expired: scale down
+  # anyway; the SIGTERM drain protects the victim's uncommitted work.
+  drain_timeout_seconds: 600

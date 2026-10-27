@@ -1,0 +1,137 @@
+# Gateway — a cell's edge (design 03 §2, P7).
+#
+# Stateless beyond Redis: verifies tokens minted by the GLOBAL identity
+# service (same GW_JWT_SECRET), routes by the token's cell_id claim, then
+# proxies. All addresses come from the mounted platform config (profile
+# k8s-cell), which is why no service URL appears below as an env var.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: datacode
+  labels:
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: datacode
+  labels:
+    app: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: datacode/gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # The config mechanism, identical to every other deployment shape:
+            # conf/ from the ConfigMap, profile selected by DATACODE_ENV. The
+            # base declares the cell profile; overlays replace it where needed.
+            - name: CONFIG_PATH
+              value: /app/conf
+            - name: DATACODE_ENV
+              value: k8s-cell
+            # Identity arrives via the platform config + DATACODE_CELL_ID.
+            - name: DATACODE_CELL_ID
+              value: cell-0
+            # Token signing/verification, shared with identity-service.
+            - name: GW_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: gateway-jwt-secret
+            # Guards identity's /internal/* (authz snapshots, placement).
+            - name: IDENTITY_SERVICE_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: identity-internal-token
+            # Guards runtime's /internal/* (leases, env-control dispatch).
+            - name: WORKSPACE_RUNTIME_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-secrets
+                  key: runtime-internal-token
+            # Optional: Redis password when the cell Redis requires one.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: datacode-redis
+                  key: password
+                  optional: true
+          volumeMounts:
+            - name: conf
+              mountPath: /app/conf
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+      volumes:
+        - name: conf
+          configMap:
+            name: datacode-conf
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: gateway
+  namespace: datacode
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: datacode
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: gateway

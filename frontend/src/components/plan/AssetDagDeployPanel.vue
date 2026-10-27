@@ -26,6 +26,9 @@ import { useDagsterStore } from '@/stores/dagster'
 import { useEnvironmentStore } from '@/stores/environment'
 import { useGitStore } from '@/stores/git'
 import { notifyError } from '@/utils/notifyError'
+import DeploymentReloadProgress from '@/components/asset-dag/DeploymentReloadProgress.vue'
+import DepsConflictCard from '@/components/asset-dag/DepsConflictCard.vue'
+import DepsRelaxedNotice from '@/components/asset-dag/DepsRelaxedNotice.vue'
 import type { DeploymentDiff, DeploymentInfo } from '@/types/dagster'
 
 const { t } = useI18n()
@@ -37,6 +40,56 @@ const gitStore = useGitStore()
 
 const workspacePath = computed(() => workspaceStore.currentWorkspace?.path || '')
 const deployment = computed(() => dagster.deployment)
+
+/**
+ * Declared requirements the platform baseline cannot satisfy.
+ *
+ * Reported by `ensure` on the READ path, so a reload that cannot possibly
+ * succeed is visible before the user spends minutes discovering it. Takes
+ * precedence over `depsHint` below: while these exist, "reload to install" is
+ * not the action — a reload will refuse, and only an edit resolves it.
+ */
+const depsConflicts = computed(() => deployment.value?.deps?.conflicts ?? [])
+
+/**
+ * Platform packages this copy's overlay overrides.
+ *
+ * Answered by `ensure` from the manifest, so it is visible on every page open
+ * rather than only in the reload that yielded them: the divergence is a
+ * standing property of the copy, and whoever debugs odd behaviour later did not
+ * necessarily watch the install.
+ */
+const depsRelaxed = computed(() => deployment.value?.deps?.relaxed ?? [])
+
+/**
+ * Hint shown when the working copy's declared Python packages are not installed.
+ *
+ * `ensure` reports this state without installing anything, so the message names
+ * the action rather than performing it. Empty for `ready` and `empty`: there is
+ * nothing for the user to decide.
+ */
+const depsHint = computed(() => {
+  const deps = deployment.value?.deps
+  if (!deps || deps.state === 'ready' || deps.state === 'empty') return ''
+  // Suppressed while a conflict card is showing: it already explains the state
+  // and names the fix, and "reload to install" next to it would be wrong advice.
+  if (depsConflicts.value.length) return ''
+  const known = ['drifted', 'missing', 'incompatible', 'failed', 'declaration_invalid']
+  const key = known.includes(deps.state) ? deps.state : 'drifted'
+  return `${t(`deploy.depsHint.${key}`, { count: deps.declared })}${
+    deps.message ? ` (${deps.message})` : ''
+  }`
+})
+
+/** Re-read the deployment after the declaration was rewritten. */
+async function refreshAfterDepsFix() {
+  if (!workspacePath.value) return
+  try {
+    await dagster.ensureDeployment(workspacePath.value)
+  } catch (error) {
+    notifyError(error)
+  }
+}
 
 // Deployments of the CURRENT workspace only (one per environment); drives the
 // diff selectors and the inventory list. The raw service listing spans every
@@ -150,9 +203,22 @@ async function reload(): Promise<void> {
     await dagster.reloadDeployment(path)
     MessagePlugin.success(t('deploy.reloadSuccess'))
   } catch (e) {
-    notifyError(e, 'Failed to reload code location')
+    // The structured reason stays in the progress panel below; the toast is only
+    // the notification. A pip transcript does not fit in one.
+    notifyError(e, t('deploy.reloadFailed'))
   } finally {
     reloading.value = false
+  }
+}
+
+/** Withdraw the reload in flight. The install already started is left to finish. */
+async function cancelReload(): Promise<void> {
+  const path = workspacePath.value
+  if (!path) return
+  try {
+    await dagster.cancelReload(path)
+  } catch (e) {
+    notifyError(e, t('deploy.reloadCancelFailed'))
   }
 }
 
@@ -231,6 +297,28 @@ watch(
                 {{ t('deploy.fieldLocation') }}: {{ deployment.location_name }}
               </span>
             </div>
+            <!-- A declaration the platform cannot satisfy. Shown BEFORE any
+                 reload is attempted, because a reload cannot resolve it: the
+                 overlay would shadow the platform's own package rather than
+                 coexist with it, so only an edit resolves it. -->
+            <DepsConflictCard
+              v-if="depsConflicts.length"
+              :conflicts="depsConflicts"
+              :workspace-path="workspacePath"
+              @fixed="refreshAfterDepsFix"
+            />
+            <!-- Platform packages this copy overrides. Not a problem to fix —
+                 the install succeeded because of it — but the one place the
+                 divergence from the platform's own runtime is visible. -->
+            <DepsRelaxedNotice v-if="depsRelaxed.length" :relaxed="depsRelaxed" />
+            <!-- The declaration changed since the last install. Stated here
+                 rather than fixed silently: installing on a page load would be a
+                 multi-minute operation nobody asked for, so the drift is shown
+                 and the install stays behind the reload button. -->
+            <div v-if="depsHint" class="behind-hint">
+              <t-icon name="info-circle" size="14px" />
+              <span>{{ depsHint }}</span>
+            </div>
             <div class="deploy-actions">
               <button class="primary-btn" :disabled="reloading" @click="pullAndReload">
                 <t-icon name="download" size="13px" />
@@ -240,11 +328,26 @@ watch(
                 <t-icon name="refresh" size="13px" />
                 {{ t('deploy.reload') }}
               </button>
+              <button
+                v-if="reloading"
+                class="ghost-btn"
+                @click="cancelReload"
+              >
+                {{ t('deploy.reloadCancel') }}
+              </button>
               <button class="ghost-btn" @click="router.push('/app/asset-dag')">
                 <t-icon name="chart-bubble" size="13px" />
                 {{ t('deploy.openGraph') }}
               </button>
             </div>
+            <DeploymentReloadProgress
+              v-if="dagster.reloadJob"
+              class="mt-3"
+              :job="dagster.reloadJob"
+              :output="dagster.reloadOutput"
+              :workspace-path="workspacePath"
+              @deps-fixed="refreshAfterDepsFix"
+            />
           </div>
           <div v-else class="empty-hint">{{ t('deploy.empty') }}</div>
         </section>

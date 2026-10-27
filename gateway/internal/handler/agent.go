@@ -40,6 +40,6 @@ func AgentSSEEvents(cfg *config.Config, logger *zap.Logger) http.HandlerFunc {
 			zap.String("user_id", userID),
 		)
 
-		proxySSEWithContext(w, r, cfg.Services.AgentServiceURL, targetPath, extraHeaders, logger)
+		proxySSE(w, r, cfg.Services.AgentServiceURL, targetPath, extraHeaders, logger)
 	}
 }

@@ -1,25 +1,46 @@
-# Platform Docker overrides.
+# Profile: docker — single-machine, ALL-container stack (DATACODE_ENV=docker)
 #
-# Loaded on top of platform.yaml when DATACODE_ENV=docker.
-# Use for Docker infrastructure (e.g. PostgreSQL instead of MySQL).
+# Used by deploy/docker-compose.stack.yml (and the lease-verification data
+# plane), which mounts the repository's conf/ at /app/conf and sets
+# CONFIG_PATH. Every service runs in a container and resolves its peers by
+# compose service name; nothing reaches back to the host.
+#
+# This is the "one machine, real topology" profile: it exercises the same
+# container images, the same config mechanism and the same startup ordering as
+# production, on a laptop. What it does NOT provide is cell isolation (see the
+# cell/global profiles) or NetworkPolicy-enforced egress (Kubernetes only).
+#
+# Only the DIFFERENCE from conf/platform.yaml is expressed here.
 
 database:
-  type: "postgresql"
-  host: "localhost"
+  host: "postgres"
   port: 5432
   name: "datacode"
   username: "datacode"
   # password: env-only (DB_PASSWORD)
-  pool_size: 5
-  pool_overflow: 10
 
-  # All services use PostgreSQL in Docker (including gateway auth).
-  # To use a separate SQLite for gateway auth, uncomment:
-  # services:
-  #   gateway_auth:
-  #     type: "sqlite"
-  #     sqlite_path: ".data/gateway.db"
+redis:
+  host: "redis"
+  port: 6379
 
-logging:
-  level: "info"
-  format: "json"
+workspace:
+  # A named volume shared by the runtime replicas in this stack. Host bind
+  # mounts are the data-plane stack's concern, not this one's.
+  base_path: "/data/workspaces"
+
+services:
+  gateway:
+    http_url: "http://gateway:8000"
+  agent:
+    ws_url: "ws://agent-service:8001"
+    grpc_url: "agent-service:50051"
+    rest_url: "http://agent-service:8001"
+  # One stable name suffices for the control plane's dispatches: any replica
+  # can execute an env-control command, and working-copy traffic is routed by
+  # the lease directly to the owning replica rather than through this URL.
+  runtime:
+    rest_url: "http://workspace-runtime-1:8002"
+  identity:
+    rest_url: "http://identity-service:8003"
+  control:
+    rest_url: "http://control-service:8004"

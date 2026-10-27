@@ -1,0 +1,92 @@
+# RBAC for workspace-runtime's execution plane (design 04 §3, roadmap P6a).
+#
+# Why this file has to exist at all: with `task.backend=kubernetes` the runtime
+# is a controller. It creates one Job per task, a per-task Secret carrying the
+# scoped credentials, a per-task ConfigMap with the task spec, and it reads the
+# result back OUT OF THE POD LOG (that is the result channel — P6a chose it over
+# an HTTP callback, so `pods/log` is load-bearing, not diagnostic). Warm-pool
+# runners and Dagster code locations add bare Pods plus a Service each.
+#
+# Running on the namespace `default` ServiceAccount fails all of that with 403,
+# and the failure surfaces three layers away as "could not start a sandbox" —
+# which is why the permissions are declared next to the workload instead of
+# being a step in a runbook.
+#
+# Scope, and the two deliberate restrictions:
+#
+#   * A Role, not a ClusterRole. The runtime may act in `datacode-tasks` and
+#     NOWHERE else — notably not in its own namespace, where the platform's
+#     Secrets live.
+#   * The task Pods themselves keep running as `task-runner-noperm`
+#     (egress-plane.yaml), which has no binding anywhere and does not even
+#     mount a token. These permissions belong to the CREATOR, never to the
+#     created — a sandbox that could create Jobs could escape its own limits.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workspace-runtime
+  namespace: datacode
+  labels:
+    app: workspace-runtime
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: task-vehicle-controller
+  namespace: datacode-tasks
+  labels:
+    app: workspace-runtime
+rules:
+  # One-shot tasks: a Job per task, its status polled until terminal.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  # Pods: created directly for warm-pool runners, code locations and the
+  # container executor; listed by the orphan-Pod reconciler; read for phase.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "delete"]
+  # The RESULT channel for one-shot tasks (`@@DATACODE_TASK@@` lines). Without
+  # it every task completes and every result is lost.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-task credential envelope. `get` is absent on purpose: the runtime
+  # writes these and never needs to read one back, and not being able to read
+  # Secrets in this namespace is worth keeping.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  # Per-task spec delivery.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete"]
+  # Code-location Pods are dialled by the orchestrator, so each gets a Service;
+  # readiness is decided by watching that Service's endpoints.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get"]
+---
+# The binding crosses namespaces in the only direction that is safe: the
+# SUBJECT lives in `datacode`, the Role and this binding live in
+# `datacode-tasks`, so the task namespace grants the permission rather than the
+# platform namespace claiming it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workspace-runtime-task-vehicle
+  namespace: datacode-tasks
+  labels:
+    app: workspace-runtime
+subjects:
+  - kind: ServiceAccount
+    name: workspace-runtime
+    namespace: datacode
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: task-vehicle-controller

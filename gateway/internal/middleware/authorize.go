@@ -12,22 +12,25 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/datacode/gateway/internal/authz"
 	"github.com/datacode/gateway/internal/rbac"
 )
 
 // Capability headers published to downstream services. They are always
 // overwritten (or removed) so a client can never inject its own capabilities.
+//
+// Roles are deliberately NOT published. Downstream services authorize on the
+// granted PERMISSION SET, never on a role name — a role is a tenant-editable
+// composition, so a service branching on "engineer" would silently disagree with
+// the role editor. X-Workspace-ID is published because it is the resolved scope
+// the services log and audit against.
 const (
-	HeaderTenantRole    = "X-Tenant-Role"
-	HeaderWorkspaceID   = "X-Workspace-ID"
-	HeaderWorkspaceRole = "X-Workspace-Role"
-	HeaderPermissions   = "X-Granted-Permissions"
+	HeaderWorkspaceID = "X-Workspace-ID"
+	HeaderPermissions = "X-Granted-Permissions"
 )
 
 // capabilityHeaders is the list stripped from every inbound request.
-var capabilityHeaders = []string{
-	HeaderTenantRole, HeaderWorkspaceID, HeaderWorkspaceRole, HeaderPermissions,
-}
+var capabilityHeaders = []string{HeaderWorkspaceID, HeaderPermissions}
 
 // maxAuthzBodyBytes caps how much of a request body is buffered to locate the
 // workspace of a request. Larger payloads (file contents) are not inspected.
@@ -38,13 +41,17 @@ const maxAuthzBodyBytes = 1 << 20 // 1 MiB
 // It runs as a global middleware — before chi matches a route — so every
 // endpoint, including the transparent catch-all proxies, is covered. The route
 // map declares which permission a request requires and where its scope is
-// found; the decision itself is delegated to the RBAC service, which reads
-// roles and their permission composition from the database.
+// found.
+//
+// P2 change: the decision no longer reads the database. It is taken against an
+// authorization SNAPSHOT fetched from identity-service and cached in process
+// (see internal/authz). The gateway keeps the decision logic — route mapping,
+// scope resolution, capability publication — and gives up ownership of the
+// data, which is what lets identity be global while gateways are per-cell.
 //
 // On success the resolved capabilities are published into the request context
-// and onto trusted headers, so downstream services never have to authorize
-// again.
-func Authorize(rbacService *rbac.Service, logger *zap.Logger) func(http.Handler) http.Handler {
+// and onto trusted headers, so downstream services never authorize again.
+func Authorize(resolver *authz.Resolver, logger *zap.Logger) func(http.Handler) http.Handler {
 	sampler := newDenialSampler(20, 10*time.Second)
 
 	return func(next http.Handler) http.Handler {
@@ -78,27 +85,21 @@ func Authorize(rbacService *rbac.Service, logger *zap.Logger) func(http.Handler)
 			}
 
 			ctx := r.Context()
-			tenantRole := GetRole(ctx)
-
-			// Built-in roles are instantiated lazily per tenant so existing
-			// tenants pick up newly released roles without a migration.
-			if err := rbacService.EnsureTenantRoles(ctx, tenantID); err != nil {
-				logger.Error("authz_tenant_roles_unavailable",
-					zap.String("tenant_id", tenantID), zap.Error(err))
-				writeAuthError(w, http.StatusInternalServerError, "internal_error",
+			snapshot, err := resolver.Resolve(ctx, userID, tenantID, GetPermsVersion(ctx))
+			if err != nil {
+				// FAIL CLOSED: a request whose permissions cannot be
+				// established must not be served.
+				logger.Error("authz_snapshot_unavailable",
+					zap.String("path", r.URL.Path),
+					zap.String("tenant_id", tenantID),
+					zap.String("user_id", userID),
+					zap.Error(err))
+				writeAuthError(w, http.StatusServiceUnavailable, "authz_unavailable",
 					"Authorization data is temporarily unavailable.")
 				return
 			}
 
-			decision, err := decide(ctx, rbacService, r, rule, tenantID, userID, tenantRole)
-			if err != nil {
-				logger.Error("authz_decision_failed",
-					zap.String("path", r.URL.Path),
-					zap.String("tenant_id", tenantID), zap.Error(err))
-				writeAuthError(w, http.StatusInternalServerError, "internal_error",
-					"Authorization check failed.")
-				return
-			}
+			decision := decide(r, rule, snapshot, userID)
 			if !decision.allowed {
 				sampler.log(logger, "authz_denied", r, tenantID, userID,
 					rule.Permission, decision.reason)
@@ -107,12 +108,17 @@ func Authorize(rbacService *rbac.Service, logger *zap.Logger) func(http.Handler)
 			}
 
 			ctx = context.WithValue(ctx, WorkspaceIDKey, decision.workspaceID)
-			ctx = context.WithValue(ctx, WorkspaceRoleKey, decision.workspaceRole)
 			ctx = context.WithValue(ctx, PermissionsKey, decision.permissions)
+			// Published for lease-aware routing (design 06 P4a). Read here
+			// rather than downstream because the value may live in the JSON
+			// body, which this middleware has already buffered and restored —
+			// doing it a second time is how a proxy starts forwarding empty
+			// POSTs. Empty for routes that are not working-copy scoped.
+			if workspacePath := requestField(r, "workspace_path"); workspacePath != "" {
+				ctx = context.WithValue(ctx, WorkspacePathKey, workspacePath)
+			}
 
-			r.Header.Set(HeaderTenantRole, tenantRole)
 			r.Header.Set(HeaderWorkspaceID, decision.workspaceID)
-			r.Header.Set(HeaderWorkspaceRole, decision.workspaceRole)
 			r.Header.Set(HeaderPermissions, strings.Join(decision.permissions, ","))
 
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -142,79 +148,57 @@ type authzDecision struct {
 	permissions []string
 }
 
-// decide evaluates one request against its rule.
+// decide evaluates one request against its rule, using only the snapshot.
+//
+// Pure and synchronous by construction: everything it needs — the tenant
+// role's permissions, the caller's workspace bindings and those roles'
+// permissions — is already in the snapshot, so no decision can block on I/O.
 func decide(
-	ctx context.Context, rbacService *rbac.Service, r *http.Request,
-	rule rbac.Rule, tenantID, userID, tenantRole string,
-) (authzDecision, error) {
-	tenantPermissions, err := rbacService.EffectivePermissions(
-		ctx, tenantID, rbac.ScopeTenant, tenantRole)
-	if err != nil {
-		return authzDecision{}, err
-	}
+	r *http.Request, rule rbac.Rule, snapshot *authz.Snapshot, userID string,
+) authzDecision {
 	decision := authzDecision{
-		permissions: tenantPermissions,
+		permissions: snapshot.TenantPermissions,
 		reason:      DenyMissingPermission,
 	}
 
 	switch rule.Source {
 	case rbac.ScopeSourceNone:
 		decision.allowed = true
-		return decision, nil
+		return decision
 
 	case rbac.ScopeSourceTenant:
-		granted, err := rbacService.Can(ctx, tenantID, rbac.ScopeTenant, tenantRole, rule.Permission)
-		if err != nil {
-			return authzDecision{}, err
-		}
-		decision.allowed = granted
-		return decision, nil
+		decision.allowed = snapshot.HasTenantPermission(rule.Permission)
+		return decision
 	}
 
 	// Workspace-scoped rule: locate the workspace the request targets.
-	workspaceID, resolved := resolveWorkspaceID(r, rule, tenantID)
+	workspaceID, resolved := resolveWorkspaceID(r, rule, snapshot.TenantID)
 	if !resolved {
 		if !rule.ScopeOptional {
 			// The request does not say which workspace it acts on, so no
 			// workspace role can be evaluated.
 			decision.reason = DenyWorkspaceUnresolved
-			return decision, nil
+			return decision
 		}
 		// Instance-wide endpoint: the permission must hold in at least one of
 		// the caller's workspaces.
-		granted, err := rbacService.CanInAnyWorkspace(ctx, tenantID, userID, rule.Permission)
-		if err != nil {
-			return authzDecision{}, err
-		}
-		decision.allowed = granted
-		return decision, nil
+		decision.allowed = snapshot.CanInAnyWorkspace(rule.Permission)
+		return decision
 	}
 
-	workspaceRole, err := rbacService.WorkspaceRole(ctx, tenantID, workspaceID, userID)
-	if err != nil {
-		return authzDecision{}, err
-	}
+	workspaceRole := snapshot.WorkspaceRole(workspaceID)
 	if workspaceRole == "" {
 		// Not a member: the workspace does not exist as far as the caller
 		// is concerned.
 		decision.reason = DenyWorkspaceNotMember
-		return decision, nil
-	}
-	granted, err := rbacService.Can(ctx, tenantID, rbac.ScopeWorkspace, workspaceRole, rule.Permission)
-	if err != nil {
-		return authzDecision{}, err
-	}
-	workspacePermissions, err := rbacService.EffectivePermissions(
-		ctx, tenantID, rbac.ScopeWorkspace, workspaceRole)
-	if err != nil {
-		return authzDecision{}, err
+		return decision
 	}
 
-	decision.allowed = granted
+	decision.allowed = snapshot.HasWorkspacePermission(workspaceRole, rule.Permission)
 	decision.workspaceID = workspaceID
 	decision.workspaceRole = workspaceRole
-	decision.permissions = workspacePermissions
-	return decision, nil
+	decision.permissions = snapshot.PermissionsForWorkspaceRole(workspaceRole)
+	return decision
 }
 
 // resolveWorkspaceID extracts the workspace a request targets, according to the

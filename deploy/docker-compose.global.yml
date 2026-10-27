@@ -1,0 +1,99 @@
+# Global tier — the ONE stack shared by every cell (design 03 §2, P7),
+# profile: global.
+#
+# What belongs here, and why exactly this
+# ---------------------------------------
+# Identity: users, tenants, roles, and `tenant_placement` (which cell a tenant
+# lives in). Every cell reads it on the LOGIN path only, never on the hot path —
+# the cell id travels in the token, so a request that is already authenticated
+# needs nothing from this tier.
+#
+# That property is what makes the global tier's availability tolerable: if it is
+# down, existing sessions keep working in their cells (the gateway decides from a
+# cached authorization snapshot) and only new logins fail. Anything that would
+# have to be reached on every request must NOT be moved here.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.global.yml up -d
+#   # then bring up one or more cells:
+#   DATACODE_CELL_ID=cell-0 \
+#     docker compose -f deploy/docker-compose.cell.yml -p datacode-cell-0 up -d
+#
+# The cell stacks do NOT depend on this file at compose level (different
+# projects, and a cell must start even while the global tier is unavailable);
+# they reach it over the `datacode-global` network declared below.
+
+name: datacode-global
+
+services:
+  # The Global database. Separate instance, not a schema in a cell's database:
+  # a cell's database failure must not take identity down for every other cell,
+  # which is the entire reason the tiers are split.
+  global-pg:
+    image: postgres:16-alpine
+    container_name: datacode-global-pg
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_USER: datacode
+      # Password from the truth file (see deploy/docker-compose.infra.yml's
+      # postgres for the rationale): the Makefile injects DB_PASSWORD from
+      # the same file for every client, and only `make pg-set-password` may
+      # change it. The file must exist before `docker compose up` —
+      # `scripts/pg-password.sh ensure` creates it.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    ports:
+      # 5442, not 5432: a cell's own Postgres uses the standard port, and
+      # colliding here is how a cell service silently connects to the global
+      # database (or the reverse) on a developer machine.
+      - "5442:5432"
+    volumes:
+      - global_pg_data:/var/lib/postgresql/data
+      - ../.data/postgres_password:/run/secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datacode -d identity"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  identity-service:
+    build:
+      context: ..
+      dockerfile: identity-service/Dockerfile
+    container_name: datacode-identity-service
+    environment:
+      # ONE config mechanism, same as every other stack: the repository's
+      # conf/ mounted read-only, profile `global` on top of the shared base.
+      CONFIG_PATH: /app/conf
+      DATACODE_ENV: global
+      DB_PASSWORD: ${DB_PASSWORD}
+      # Signs the access tokens every cell's gateway verifies. ONE value across
+      # the whole installation: a per-cell secret would make a token minted for
+      # cell-1 unverifiable by cell-1's own gateway.
+      GW_JWT_SECRET: ${GW_JWT_SECRET:?injected by make from .data/gateway_jwt_secret}
+      # Guards /internal/* — the placement and cell-registry endpoints each
+      # cell's control plane calls at startup. No inline default: a well-known
+      # literal surviving into a non-local deployment would be an
+      # authentication bypass, so `:?` fails loudly without deploy/.env.
+      IDENTITY_SERVICE_INTERNAL_TOKEN: ${DATACODE_INTERNAL_TOKEN:?set in deploy/.env}
+      # Single replica: migrations at boot are race-free. Multi-replica installs
+      # must move this to a one-shot job, exactly like the cell tier does.
+      IDENTITY_SERVICE_AUTO_MIGRATE: "1"
+      # The global tier is not a cell. It still carries an id so its log lines
+      # and Redis keys are distinguishable from any cell's.
+      DATACODE_CELL_ID: global
+    volumes:
+      - ../conf:/app/conf:ro
+    ports:
+      - "8003:8003"
+    depends_on:
+      global-pg:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  global_pg_data:
+
+networks:
+  default:
+    name: datacode-global

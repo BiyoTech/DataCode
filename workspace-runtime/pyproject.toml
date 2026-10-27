@@ -1,0 +1,177 @@
+[project]
+name = "workspace-runtime"
+version = "0.1.0"
+description = "The sole owner of working copies: SQLMesh + Ontology + Dagster code locations + Git + files + gated tool execution (design 02)"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlmesh>=0.142.0",
+    "dagster>=1.13.0",
+    # The Dagster webserver. Since 1.13 it is a SEPARATE distribution from
+    # `dagster`, and the local instance (the shipped dev configuration:
+    # `dagster.mode: local` with `webserver_enabled: true`) cannot serve the
+    # asset DAG without it — `dagster dev` refuses to start and the
+    # `dagster-webserver` binary simply does not exist. Without this the
+    # instance GraphQL port is never bound and every asset-DAG query fails with
+    # "Dagster instance is unavailable".
+    #
+    # Kept in core rather than an extra because local mode is what dev and
+    # single-node deployments run; remote mode never starts these processes.
+    "dagster-webserver>=1.13.0",
+    "fastapi>=0.115.0",
+    # Knowledge upload declares UploadFile/Form routes; FastAPI refuses to
+    # build the app without the multipart parser (RuntimeError at import
+    # time), so it is a hard dependency, not an extra.
+    "python-multipart>=0.0.18",
+    "uvicorn[standard]>=0.32.0",
+    "structlog>=24.4.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    "pyyaml>=6.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    # The default dialect of a scaffolded workspace. SQLMesh bundles it, but the
+    # platform relies on it directly (every new workspace starts on duckdb), so
+    # it is declared rather than inherited from sqlmesh's own dependency set.
+    "duckdb>=1.0.0",
+    # Required by the asset-dag the platform SCAFFOLDS into every working copy:
+    # src/templates/defs/assets/daft_assets.py.tpl computes features with Daft
+    # and advertises itself as running "out of the box". Code locations share
+    # this service's interpreter by design (see
+    # CodeLocationManager._spawn_grpc), so a scaffold dependency is a service
+    # dependency — it cannot be a per-workspace choice.
+    #
+    # The import sits INSIDE the asset body, so a missing package does not break
+    # loading: the location reports itself healthy, the asset shows up in the
+    # DAG, and materializing it is what fails. That makes this the quietest
+    # possible dependency to omit, which is why it is pinned by
+    # tests/test_scaffold_dependencies.py rather than left to memory.
+    "getdaft>=0.5.0",
+    # Core, not an extra: PostgreSQL is the platform engine everywhere (dev,
+    # Docker, Kubernetes — no shipped profile selects anything else), so an
+    # install without the driver crash-loops at startup (same contract as
+    # control-service and agent-service).
+    "asyncpg>=0.30.0",
+    # The SYNCHRONOUS driver SQLMesh imports when it loads a workspace's
+    # config.yaml — distinct from asyncpg above, which serves this service's OWN
+    # database. A workspace project declares its warehouse independently
+    # (`gateways.*.connection.type`), so loading one that targets postgres needs
+    # it even though this process never connects through it: SQLMesh's config
+    # validation imports the engine library before any connection is made.
+    # Without it every gateway listing / plan / apply on a postgres project
+    # fails with "Failed to import the 'postgres' engine library".
+    "psycopg2-binary>=2.9.0",
+    "httpx>=0.27.0",
+    "sqlglot>=25.0.0",
+    # Required, not optional: the lease server, the distributed env lock and the
+    # runtime heartbeat all speak Redis (see src/lease/, datacode_common.redis).
+    "redis>=5.0.0",
+    # Local shared package, NOT published to any index. Install it beforehand
+    # or in the same pip command, e.g.
+    # `pip install ./shared/python -e ./workspace-runtime`.
+    "datacode-common",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[project.optional-dependencies]
+# ── SQLMesh engine drivers ─────────────────────────────────────────────────
+#
+# A workspace project names its OWN warehouse in config.yaml, and SQLMesh
+# imports that engine's library before it can even parse the file. So the
+# dialects the create dialog offers are only servable when the matching driver
+# is installed — and without one the failure is a 422 "Failed to import the
+# '<engine>' engine library" rather than anything about the warehouse.
+#
+# Hence: the two engines every install needs are core (above), and the rest are
+# opt-in groups named after the dialect. Declaring them here is what makes the
+# dialog honest — `pip install "./workspace-runtime[clickhouse]"` is the
+# documented way to serve ClickHouse projects, and tests/
+# test_sqlmesh_engine_drivers.py fails if the UI ever offers a dialect with no
+# way to install it.
+#
+# MySQL is not selected by any shipped profile; the dialect stays available for
+# bespoke deployments via this extra. pymysql is the driver SQLMesh imports
+# (aiomysql is this service's own async database driver).
+mysql = ["aiomysql>=0.2.0", "pymysql>=1.1.0"]
+clickhouse = ["clickhouse-connect>=0.8.0"]
+# Also the opt-in for pyspark in USER code: installed this way, pyspark becomes
+# importable from code locations too, since they share this interpreter — and it
+# becomes part of the platform BASELINE, so a working copy that declares pyspark
+# installs nothing instead of failing.
+#
+# That failure is the reason this extra is the only supported route. PyPI carries
+# exactly one artefact per pyspark release: a ~300 MB SOURCE distribution (it
+# bundles the JVM jars). The dependency installer takes wheels only — there is no
+# compiler in the install sandbox and a package's build script is never executed —
+# so `pyspark>=3.5.0` in `asset-dag/pyproject.toml` fails with `deps_no_wheel` for
+# every version that exists. Declaring it is not the fix; being in the image is.
+#
+# Deliberately NOT in the default image: pyspark plus the JRE it needs is well
+# over half a gigabyte on every replica, for the benefit of the deployments that
+# actually use Spark. `docker build --build-arg RUNTIME_EXTRAS=spark` (see the
+# Dockerfile, which also installs the JRE) is how a deployment opts in;
+# `pip install "./workspace-runtime[spark]"` is the equivalent for a dev venv.
+spark = ["pyspark>=3.5.0"]
+trino = ["trino>=0.330.0"]
+mssql = ["pyodbc>=5.1.0"]
+
+# ── User code, as loaded by code locations ──────────────────────────────────
+#
+# A Dagster code location imports the user's ``defs/`` package on THIS service's
+# interpreter: locations deliberately share one interpreter rather than getting
+# a per-workspace venv (see ``CodeLocationManager._spawn_grpc``). Anything user
+# code may import is therefore a service dependency whether or not it is
+# declared — declaring it is what turns an accident into a promise.
+#
+# The distinction is not theoretical. pandas, numpy and pyarrow were present in
+# the image purely as transitive dependencies of sqlmesh and daft, and this file
+# never mentioned them. An upstream dependency bump could have removed any of
+# them without a single test noticing, and it would surface as a code location
+# that refuses to load (module-level import) or — quieter still — as an asset
+# that looks healthy until somebody materializes it (import inside the body).
+#
+# Declared rather than assumed, and installed everywhere the code actually runs:
+# the image (see the Dockerfile) and the dev venvs (see scripts/dev-lib.sh).
+usercode = [
+    # Upper bound is what the rest of the platform already constrains: sqlmesh
+    # requires pandas<3.0.0 and daft's pandas support <2.4.0. Left unbounded, a
+    # future resolver would happily install 3.x and break both.
+    "pandas>=2.0.0,<3.0.0",
+    "numpy>=1.26.0",
+    "pyarrow>=14.0.0",
+    "scikit-learn>=1.4.0",
+    "scipy>=1.12.0",
+]
+# Only the Kubernetes task backend needs a cluster client (design 06 P6a). Kept
+# optional so a single-node or development install — which uses the local
+# backend — does not carry it. `task_backend: kubernetes` without this extra
+# fails at startup with a message naming the extra, never silently.
+#
+# Optional here means optional for a VENV, not for a deployment: the image
+# installs it unconditionally (see the Dockerfile), because one image serves
+# every profile and a missing cluster client is a startup failure, not a
+# degraded feature. A dev venv never submits to Kubernetes.
+k8s = ["kubernetes>=31.0.0"]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "DTZ"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

@@ -5,8 +5,8 @@
 """
 
 import typing as t
-from agents import Agent
 
+from agents import Agent
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -73,11 +73,11 @@ def load_all_agents() -> None:
     Mirrors the pattern used by ToolRegistry.load_all_tools().
     """
     from src.agents import (  # noqa: F401
-        triage,
-        warehouse_modeling_agent,
         asset_orchestration_agent,
         data_analysis_agent,
-        memory_agent,
         design_agent,
+        memory_agent,
+        triage,
+        warehouse_modeling_agent,
     )
     logger.info("all_agents_loaded", agents=list(AgentRegistry._agents.keys()))

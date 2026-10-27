@@ -191,7 +191,7 @@ erDiagram
     Workspace ||--o{ WorkspaceMember : "成员"
 
     Permission {
-        string code PK "sqlmesh:plan:apply"
+        string code PK "workspace:plan:apply"
         string domain
         string resource_type
         string action
@@ -229,39 +229,77 @@ erDiagram
 
 ### 4.2 权限点目录（按能力，而非按数据资源）
 
+> **单一真相源**：`shared/rbac-catalog.json`。Go 侧（`shared/go/rbac`）与 Python 侧
+> （`datacode_common.rbac`）的常量表由 `scripts/gen-rbac-catalog.py` 生成，两侧各自
+> 读同一份 JSON 做漂移断言。identity-service 启动时把目录同步进 `permissions` 表；
+> 该表是**投影**（供角色编辑器下发选项、让已下线权限码的历史角色组合仍可读），
+> 永不作为真相源、永不经 API 写入——因此权限码无法靠写库"发明"出来。
+>
+> 下表为当前实现的完整目录（7 个租户级 + 21 个工作区级）。新增权限点 = 改 JSON +
+> 重新生成；漏改任一侧则两个语言的测试之一必红。
+
+**租户作用域**（判据：与具体工作区无关的租户级能力）
+
+| 权限点 | 语义 |
+|--------|------|
+| `tenant:member:read` / `tenant:member:write` | 查看 / 增删改租户成员 |
+| `tenant:role:read` / `tenant:role:write` | 查看 / 管理角色与其权限组合 |
+| `tenant:workspace:create` | 在租户内创建工作区 |
+| `tenant:workspace:join` | 可被授予工作区访问权（无此权限者不出现在成员选择器中） |
+| `tenant:agent:use` | 使用 Agent 会话与语言模型 |
+
+**工作区作用域**（判据："**能不能用这个能力**"，与"操作哪些数据"无关，后者归引擎）
+
 | 权限点 | 语义 | 覆盖端点（示例） |
 |--------|------|-----------------|
-| `workspace:read` | 进入工作区、读元数据/模型列表/血缘 | `/models`, `/lineage`, `/files` read |
-| `workspace:manage` | 创建/删除工作区、绑定 Git、成员管理 | `/workspaces*`, `/git/credentials` |
-| `sqlmesh:file:write` | 修改模型/审计/测试等工程文件 | `/files/write`, `/files/delete`, Agent 文件工具 |
-| `sqlmesh:plan:preview` | 发起 plan 预览 | `/plan` |
-| `sqlmesh:plan:apply` | 发起 apply（**目标环境由 §6 审批策略再判**） | `/apply`, `/apply/async` |
-| `sqlmesh:plan:restate` | 重跑历史区间 | `/apply` 的 `restate_models` |
-| `sqlmesh:environment:delete` | 删除逻辑环境 | `DELETE /environments/{name}` |
-| `sqlmesh:query:execute` | 执行 ad-hoc 查询能力（**读哪张表由引擎判**） | `/query`, `/evaluate`, `/table-diff`, `/test` |
-| `sqlmesh:datasource:introspect` | 探查外部 schema / 导入外部模型 | `/schema/discover`, `/external-models/import` |
-| `agent:session:create` | 使用 Agent 对话 | agent-service 会话端点 |
-| `agent:tool:shell` | 使用 shell 工具（高危，独立权限点） | Agent shell 工具 |
-| `dagster:job:trigger` | 手动触发调度 | Dagster 触发端点 |
-| `dagster:schedule:manage` | 管理调度定义 | 调度 CRUD |
-| `platform:change_request:approve` | 审批发布请求 | 审批端点 |
-| `platform:audit:read` | 查看他人操作审计 | `/apply/history` 全量、审计页 |
-| `platform:rbac:manage` | 管理角色与绑定 | 权限管理 API |
+| `workspace:read` | 打开工作区、读元数据 | `POST /workspaces/{id}/open` |
+| `workspace:delete` | 删除工作区 | `DELETE /workspaces/{id}` |
+| `workspace:member:read` / `:write` | 查看 / 授予撤销工作区成员 | `/workspaces/{id}/members` |
+| `workspace:git:bind` | 绑定或重绑 Git 仓库 | `POST /workspaces/bind-git` |
+| `workspace:git:push` | 推送到远端，**亦即"使用某个 Git 凭证"** | `/git/push`, `/git/publish`, `/git/merge` |
+| `workspace:env:read` / `:create` / `:delete` | 环境（分支 + 虚拟环境 + 部署三合一）的读 / 建 / 毁 | `/workspaces/{id}/environments`, `/environments/*` |
+| `workspace:env:promote` | 合并进 production 分支、启用非生产部署的调度 | `POST /git/merge`（目标为 prod 时的附加门） |
+| `workspace:code:read` / `:write` | 读 / 写模型、文件、血缘 | `/files/*`, `/sqlmesh/render`, `/wip/*` |
+| `workspace:plan:preview` / `:apply` | plan 预览 / 应用 | `/sqlmesh/plan`, `/sqlmesh/apply` |
+| `workspace:query:run` | 执行 ad-hoc 查询（**读哪张表由引擎判**） | `/sqlmesh/query`, `/sqlmesh/evaluate` |
+| `workspace:knowledge:read` / `:write` | 业务知识文档读 / 写 | `/knowledge/*` |
+| `workspace:ontology:read` | 读语义本体 | `/ontology/*` |
+| `workspace:pipeline:read` / `:run` | 查看 / 触发取消流水线 | `/dagster/*` |
+| `workspace:logs:read` | 读工作区服务日志与错误归档（与 `code:read` 分离：日志行可能引用 SQL、数据值、远端主机） | `/logs/*` |
 
-> 判据是"**能不能用这个能力**"，与"操作哪些数据"无关。后者归引擎。
+**刻意不设权限点的资源：Git 凭证（用户个人 PAT）**
+
+`/git/credentials*` 只要求**已认证身份**，边界是**归属**而非角色：网关重写身份头并覆盖
+请求里任何 `user_id`，控制面按 `caller.user_id` 过滤读、按 `(credential_id, user_id)`
+解析写。权限门开在"**用**凭证做什么"（`workspace:git:push`、prod 另加
+`workspace:env:promote`），而不是"管我自己的令牌"。
+
+> 反面教材（已修复）：控制面曾断言一个不在目录里的 `git:credential:write`。它不在
+> `permissions` 表 → 角色编辑器无该复选框 → identity 拒绝手动授予，于是**任何角色
+> （含 admin）都不可能持有它**，凭证写入对所有人恒 403。守护措施：`require_permission`
+> 在导入期校验目录成员（非法码则服务启动即失败），网关路由表测试断言"每个路由要求的
+> 权限必须至少能被一个内置角色持有"，AST 扫描禁止手写权限码字面量。
 
 ### 4.3 内置角色
 
-| 角色 | 功能权限 | prod apply |
-|------|---------|-----------|
-| `PlatformAdmin` | 全部 | 直接允许 |
-| `TenantAdmin` | 租户内全部（含 `platform:rbac:manage`） | 直接允许 |
-| `WorkspaceOwner` | 工作区内全部（含成员管理） | 需审批（可按 workspace 配置为直接允许） |
-| `DataEngineer` | `workspace:read`, `sqlmesh:file:write`, `plan:preview`, `plan:apply`, `query:execute`, `agent:session:create` | 需审批 |
-| `Analyst` | `workspace:read`, `query:execute`, `agent:session:create` | 无 `plan:apply` |
-| `Viewer` | `workspace:read` | — |
-| `Approver` | `platform:change_request:approve`, `workspace:read` | 无自有 apply |
-| `AgentServiceAccount` | 无自有权限（恒取委托人权限 ∩ 工具白名单） | — |
+角色**定义**在代码（`shared/rbac-catalog.json` 的 `roles`），角色**组合**在数据库且
+**租户可编辑**（含内置角色）。seeder 写 `tenant_id=''` 的模板行，租户首次被解析时克隆
+一份实例，此后 seeder 不再触碰实例——这正是租户的编辑能跨重启存活的原因。
+
+| 角色 | 作用域 | 权限集 |
+|------|--------|--------|
+| `admin` | tenant | 成员读写 + 角色读写 + `workspace:create` + `workspace:join` + `agent:use` |
+| `developer` | tenant | 成员读 + 角色读 + `workspace:create` + `workspace:join` + `agent:use` |
+| `viewer` | tenant | `tenant:member:read` |
+| `workspace_owner` | workspace | 全部工作区权限（由目录推导，新增权限点自动纳入） |
+| `engineer` | workspace | 读写代码、push、环境增删、plan 预览与应用、查询、知识读写、本体读、流水线读跑、日志读 |
+| `analyst` | workspace | 读代码、plan 预览、查询、环境读、知识/本体/流水线读、日志读（**无** `code:write`、**无** `plan:apply`） |
+| `viewer` | workspace | 读工作区/成员/代码/环境/知识/本体/流水线 |
+
+**滚动升级语义**：向模板新增权限时，`EnsureTenantRoles` 只回填**未被定制**的内置角色
+（当前权限集是模板子集者）。已被租户定制的角色**不覆盖**（否则会静默撤销租户的授权），
+改为记 `builtin_role_permission_drift` 结构化告警，并可经内部只读端点
+`GET /internal/tenants/{tid}/rbac/role-drift` 查询积压，由管理员决定是否补授。
 
 ### 4.4 判定位置与算法
 
@@ -346,7 +384,7 @@ decide(principal, permission_code, scope) -> Verdict
 
 Workspace 已按"租户级共享 + Git 为唯一代码载体 + 每人独立本地工作副本"落地。
 
-**标识与路径约定**（唯一来源：`sqlmesh-service/src/workspace/paths.py`）
+**标识与路径约定**（唯一来源：`workspace-runtime/src/api/deps.py`，校验函数 `validate_workspace_path`）
 
 | 项 | 约定 |
 |----|------|
@@ -386,7 +424,7 @@ workspace_members
 - 列表接口按 `tenant_id` + `workspace_members` 单次 JOIN 过滤，**非成员看不到该 workspace**；直接访问返回 **404**（防枚举）。
 - 创建者自动写入 `workspace_owner` 成员行（与 workspace 插入同事务）；其余租户成员需 Owner **手动授权**。
 - Owner-only 操作：成员增删、绑定 Git、删除 workspace（返回 403）。
-- 租户成员目录由 Gateway 提供（`GET /api/v1/auth/tenant-members`，仅返回 `userId`/`username`）；添加成员时 Gateway 先校验目标用户 ∈ 调用方租户，sqlmesh-service 再校验调用方是否为 Owner。
+- 租户成员目录由 identity-service 提供（`GET /api/v1/auth/tenant-members`，经网关代理，仅返回 `userId`/`username`）；添加成员时 identity-service 先校验目标用户 ∈ 调用方租户，workspace 成员授权走 identity 的内部 bindings API（P5.5 起 identity 是身份数据集的唯一写入方）。
 
 **打开与 openable 语义**
 
@@ -416,7 +454,7 @@ sequenceDiagram
     participant ST as SQLMesh State / Engine
 
     C->>API: apply(environment, categories, expected_fingerprint)
-    API->>PDP: functional_check(sqlmesh:plan:apply, workspace)
+    API->>PDP: functional_check(workspace:plan:apply, workspace)
     PDP-->>API: allow
     API->>PS: apply(principal, ...)
     PS->>PDP: release_gate(principal, target_environment)
@@ -444,7 +482,7 @@ sequenceDiagram
 | 环境 | 默认策略 |
 |------|---------|
 | `dev_{username}` 个人环境 | 直接 allow（服务端按登录身份生成环境名，不接受任意命名） |
-| 共享 dev / staging | 有 `sqlmesh:plan:apply` 即 allow |
+| 共享 dev / staging | 有 `workspace:plan:apply` 即 allow |
 | `prod` | `NEEDS_APPROVAL`（可按 workspace 配置允许 `WorkspaceOwner` bypass） |
 | `restate` on prod | 恒 `NEEDS_APPROVAL`（覆盖历史数据，风险等同写生产） |
 | `DELETE /environments/*` | 需 `sqlmesh:environment:delete`；prod 环境恒需审批 |
@@ -537,5 +575,5 @@ sequenceDiagram
 | DuckDB 无引擎鉴权 | 嵌入式引擎无 `GRANT` | 定位为本地开发引擎，不承载生产敏感数据（产品文档需明示） |
 | 引擎侧 `GRANT` 需人工治理 | 平台不自动同步引擎权限 | P4 提供 Trino/PG 角色与 GRANT 规范；平台只读展示 |
 | 缓存最终一致 | 角色/绑定回收存在收敛窗口 | 版本号轮询 ≤5s；高敏操作（prod apply / environment delete）强制回源判定 |
-| Git 批量落盘无法逐文件前置拦截 | pull / checkout 会批量改文件 | `sqlmesh:file:write` 为 workspace 级能力权限，配合审批与审计；不做逐文件资源鉴权 |
+| Git 批量落盘无法逐文件前置拦截 | pull / checkout 会批量改文件 | `workspace:code:write` 为 workspace 级能力权限，配合审批与审计；不做逐文件资源鉴权 |
 | Ontology / Dagster 资源级权限未纳入 | 本期只做能力权限 | 后续按需扩展 permission code，无需改 PDP 结构 |

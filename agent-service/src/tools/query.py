@@ -1,18 +1,17 @@
 """Tool: query — execute ad-hoc SQL queries against the data warehouse.
 
 Provides read-only SQL query execution for data analysis and exploration.
-Queries are routed through SQLMesh Service to respect project gateway configuration.
+Queries are routed through workspace-runtime, which owns the working copy and
+therefore its gateway configuration.
 """
 
 import re
 import typing as t
 
-import httpx
 from agents import RunContextWrapper, function_tool
-
-from src.config import settings
 from src.context.tool_context import ToolContext
 from src.tools.registry import ToolRegistry
+from src.tools.runtime_client import RuntimeUnavailable, get_runtime_client
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -77,37 +76,32 @@ async def query(ctx: RunContextWrapper[ToolContext], sql: str, limit: int = 100)
     # Defense-in-depth: reject destructive keywords before hitting the backend.
     validation_error = _validate_readonly_sql(sql)
     if validation_error:
-        logger.warning("query_rejected_readonly_violation", workspace_path=workspace_path, sql_len=len(sql))
+        logger.warning(
+    "query_rejected_readonly_violation",
+    workspace_path=workspace_path, sql_len=len(sql),
+)
         return validation_error
 
     logger.info("query_tool_called", workspace_path=workspace_path, limit=limit, sql_len=len(sql))
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{settings.sqlmesh_service_url}/api/v1/query",
-                json={
-                    "workspace_path": workspace_path,
-                    "sql": sql,
-                    "row_limit": limit,
-                },
-                timeout=60.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-    except httpx.HTTPStatusError as e:
-        # Extract the error detail from the SQLMesh service response body
-        detail = ""
-        try:
-            error_body = e.response.json()
-            detail = error_body.get("detail", {}).get("message", str(error_body))
-        except Exception:
-            detail = e.response.text[:500]
-        logger.warning("query_http_error", status_code=e.response.status_code, detail=detail)
-        return f"Query failed (HTTP {e.response.status_code}): {detail}"
-    except httpx.RequestError as e:
-        logger.warning("query_request_error", error=str(e))
-        return f"Failed to connect to SQLMesh Service: {e}"
+        data = await get_runtime_client().post(
+            "/api/v1/query",
+            workspace_path=workspace_path,
+            json={
+                "workspace_path": workspace_path,
+                "sql": sql,
+                "row_limit": limit,
+            },
+            timeout=60.0,
+        )
+    except RuntimeUnavailable as exc:
+        # The client already resolved the lease, repaired a stale route and
+        # waited out a materializing copy; reaching here means the query genuinely
+        # could not run, so say so plainly rather than handing the LLM a status
+        # code it cannot act on.
+        logger.warning("query_failed", workspace_path=workspace_path, error=str(exc))
+        return f"Query failed: {exc}"
 
     columns = data.get("columns", [])
     rows = data.get("rows", [])

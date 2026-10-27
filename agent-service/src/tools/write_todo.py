@@ -4,7 +4,6 @@ import json
 from typing import Any
 
 from agents import RunContextWrapper, function_tool
-
 from src.context.event_bus import event_bus
 from src.context.session import session_manager
 from src.context.tool_context import ToolContext

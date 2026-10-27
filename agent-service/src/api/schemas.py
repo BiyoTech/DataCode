@@ -7,7 +7,9 @@ class CreateSessionRequest(BaseModel):
     user_id: str
     title: str = ""
     mode: str = "ask"
-    execution_style: str = "agent"
+    # Empty = the client did not choose; the service's configured default
+    # (agent.default_execution_style) applies.
+    execution_style: str = ""
     scenario: str = "dev"
 
 

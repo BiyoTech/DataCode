@@ -33,8 +33,39 @@ class PendingResume:
 _pending_resumes: t.Dict[str, PendingResume] = {}
 
 
+def _register_remote(session_id: str) -> None:
+    """Make the paused run's existence visible to every replica (best-effort).
+
+    The TTL mirrors the local entry so a replica crash self-heals both sides.
+    """
+    import asyncio
+
+    from src.runtime.session_coordination import KIND_RESUME, get_session_coordination
+
+    coro = get_session_coordination().register_pending(
+        KIND_RESUME, session_id, "", _PENDING_RESUME_TTL_SECONDS
+    )
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+
+
+def _unregister_remote(session_id: str) -> None:
+    import asyncio
+
+    from src.runtime.session_coordination import KIND_RESUME, get_session_coordination
+
+    coro = get_session_coordination().unregister_pending(KIND_RESUME, session_id, "")
+    try:
+        asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+
+
 def register_pending_resume(resume: PendingResume) -> None:
     _pending_resumes[resume.session_id] = resume
+    _register_remote(resume.session_id)
     logger.info(
         "resume_registered",
         session_id=resume.session_id,
@@ -43,7 +74,16 @@ def register_pending_resume(resume: PendingResume) -> None:
 
 
 def pop_pending_resume(session_id: str) -> t.Optional[PendingResume]:
-    return _pending_resumes.pop(session_id, None)
+    popped = _pending_resumes.pop(session_id, None)
+    if popped is not None:
+        _unregister_remote(session_id)
+    return popped
+
+
+def peek_pending_resume(session_id: str) -> t.Optional[PendingResume]:
+    """Read without consuming: chat routing checks BEFORE deciding to forward
+    a resume request to the replica that owns the run state."""
+    return _pending_resumes.get(session_id)
 
 
 def is_resume_intent(content: str) -> bool:
