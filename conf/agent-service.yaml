@@ -20,17 +20,17 @@ server:
 llm:
   default_model: "databricks-gpt-5-4"       # Default model ID used when user doesn't specify
   models:
-    - id: "databricks-gpt-5-4"
-      name: "databricks-gpt-5-4"
+    - id: "glm-5.1"
+      name: "glm-5.1"
       provider: "openai"
-      api_key: ""                           # Set via env AGENT_SERVICE_LLM_MODELS__0__API_KEY
-      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"
+      api_key: "bce-v3/ALTAK-HKGB7wUzBu4KWyH6jBKWo/8ec24c5865973d2dfaff696fc35afbf5713de544"                           # Set via env AGENT_SERVICE_LLM_MODELS__0__API_KEY
+      base_url: "https://qianfan.baidubce.com/v2"
       max_tokens: 8192
-    - id: "databricks-gpt-5-1"
-      name: "databricks-gpt-5-1"
+    - id: "glm-5.3"
+      name: "glm-5.3"
       provider: "openai"
-      api_key: ""                           # Set via env AGENT_SERVICE_LLM_MODELS__1__API_KEY
-      base_url: "https://dbc-d356df58-5967.cloud.databricks.com/ai-gateway/mlflow/v1"
+      api_key: "bce-v3/ALTAK-HKGB7wUzBu4KWyH6jBKWo/8ec24c5865973d2dfaff696fc35afbf5713de544"                           # Set via env AGENT_SERVICE_LLM_MODELS__1__API_KEY
+      base_url: "https://qianfan.baidubce.com/v2"
       max_tokens: 4096
 
 # Agent behavior

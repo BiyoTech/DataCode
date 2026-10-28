@@ -12,6 +12,11 @@ Risk model (single source of truth):
   - If ``level`` is omitted, ``DEFAULT_TOOL_LEVEL`` (1 = read-only) is used.
   - At runtime, ``confirmation_threshold`` determines whether user approval is
     needed: ``tool.level >= threshold`` → human approval required.
+  - The SDK-level ``needs_approval`` hook is *derived* from ``level`` and
+    injected by ``register()`` — tool authors never write it by hand, so
+    "low level but asks for approval" style drift is structurally
+    impossible. The only sanctioned escape hatch is
+    ``approval_override=True`` (+ mandatory reason) on ``register()``.
   - Badge text and tone are computed by ``risk_badge_for_level()``.
 
 Level definitions:
@@ -82,14 +87,23 @@ class ToolRegistry:
         name: str,
         level: int = DEFAULT_TOOL_LEVEL,
         description: str = "",
+        approval_override: bool = False,
+        approval_reason: str = "",
     ) -> t.Callable:
         """Decorator — register a tool function with metadata.
 
         Args:
             name: Tool name identifier.
             level: Risk level (1=read, 2=file write, 3=Plan, 4=Apply,
-                   5=Deploy, 6=Admin).
+                   5=Deploy, 6=Admin). **Single source of truth** for
+                   approval: the SDK-level ``needs_approval`` callback is
+                   derived from ``level`` and injected here, so tool authors
+                   never write it by hand.
             description: Human-readable description (for UI display).
+            approval_override: Escape hatch — force approval for this tool
+                   even below the threshold. Must be paired with
+                   *approval_reason*; overrides are logged for auditability.
+            approval_reason: Mandatory when *approval_override* is True.
 
         Usage::
 
@@ -98,16 +112,36 @@ class ToolRegistry:
             async def schema_discovery(...) -> str:
                 ...
         """
+        if approval_override and not approval_reason.strip():
+            raise ValueError(
+                f"Tool '{name}' uses approval_override without a reason; "
+                "an auditable reason is required."
+            )
+
         def decorator(func: ToolCallable) -> ToolCallable:
             metadata = {
                 "level": level,
                 "description": description,
+                "approval_override": approval_override,
             }
             cls._tools[name] = (func, metadata)
 
-            if hasattr(func, "needs_approval"):
-                func.needs_approval = cls._build_needs_approval(name)
+            # Inject the approval decision derived from `level` into the
+            # already-constructed SDK tool object. In openai-agents,
+            # `needs_approval` is a mutable dataclass field on FunctionTool
+            # (read by the run loop); older layouts kept it on the
+            # on_invoke_tool wrapper, so we set both for compatibility.
+            approval_fn = cls._build_needs_approval(
+                name, override=approval_override
+            )
+            cls._attach_needs_approval(func, approval_fn, name)
 
+            if approval_override:
+                logger.warning(
+                    "approval_override_declared",
+                    tool_name=name,
+                    reason=approval_reason,
+                )
             logger.info("tool_registered", tool_name=name, level=level)
             return func
         return decorator
@@ -141,17 +175,25 @@ class ToolRegistry:
         logger.info("tool_metadata_registered", tool_name=name, level=level)
 
     @classmethod
-    def _build_needs_approval(cls, tool_name: str) -> t.Callable[..., t.Awaitable[bool]]:
+    def _build_needs_approval(
+        cls, tool_name: str, override: bool = False
+    ) -> t.Callable[..., t.Awaitable[bool]]:
         """Build the approval-check function for a tool.
 
         Logic: ``tool.level >= confirmation_threshold`` → approval required.
         The threshold is read from ``run_context.context`` first (supports
         session-level override), falling back to ``DEFAULT_CONFIRMATION_THRESHOLD``.
+
+        If *override* is set, approval is always required (audited escape
+        hatch for e.g. sensitive-data tools below the threshold).
         """
+
         async def _needs_approval(
-    run_context: t.Any, tool_parameters: t.Dict[str, t.Any], call_id: str
-) -> bool:
+            run_context: t.Any, tool_parameters: t.Dict[str, t.Any], call_id: str
+        ) -> bool:
             del tool_parameters, call_id
+            if override:
+                return True
             tool_level = cls.get_tool_level(tool_name)
             context = getattr(run_context, "context", None)
             threshold = getattr(
@@ -161,7 +203,76 @@ class ToolRegistry:
             )
             return tool_level >= threshold
 
+        # Mark the callback so _verify_approval_bindings can recognize it.
+        _needs_approval._tool_registry_name = tool_name  # type: ignore[attr-defined]
         return _needs_approval
+
+    @classmethod
+    def _attach_needs_approval(
+        cls, func: ToolCallable, approval_fn: t.Callable, tool_name: str
+    ) -> bool:
+        """Attach *approval_fn* as the SDK approval hook on *func*.
+
+        The decorator stack means ``func`` is an already-built SDK tool object
+        (e.g. ``FunctionTool``). Returns True if at least one attachment
+        point was found; logs a warning otherwise so the mismatch surfaces at
+        import time rather than as a stray approval card at run time.
+        """
+        targets: t.List[t.Any] = []
+        if hasattr(func, "on_invoke_tool"):
+            targets.append(func)
+            invoke = getattr(func, "on_invoke_tool", None)
+            if invoke is not None and invoke is not func:
+                targets.append(invoke)
+        elif hasattr(func, "needs_approval"):
+            targets.append(func)
+
+        if not targets:
+            logger.warning(
+                "approval_hook_not_found",
+                tool_name=tool_name,
+                hint=(
+                    "Registered object is not an SDK tool; approval policy "
+                    "cannot be enforced for it."
+                ),
+            )
+            return False
+
+        attached = False
+        for target in targets:
+            try:
+                target.needs_approval = approval_fn
+                attached = True
+            except (AttributeError, TypeError):
+                # e.g. a bound-method on_invoke_tool wrapper that rejects
+                # attribute assignment; other targets may still work.
+                continue
+        if not attached:
+            logger.warning(
+                "approval_hook_readonly",
+                tool_name=tool_name,
+            )
+        return attached
+
+    @classmethod
+    def _verify_approval_bindings(cls) -> None:
+        """Startup check: every registered SDK tool carries our approval hook.
+
+        Catches regressions where a tool reaches the agent without a
+        registry-derived ``needs_approval`` (which would silently fall back
+        to the SDK default instead of the level-based policy).
+        """
+        for name, (tool, _meta) in cls._tools.items():
+            if tool is None or not hasattr(tool, "on_invoke_tool"):
+                continue
+            bound = getattr(tool, "needs_approval", None)
+            expected = getattr(bound, "_tool_registry_name", None)
+            if expected != name:
+                logger.warning(
+                    "approval_binding_mismatch",
+                    tool_name=name,
+                    bound_type=type(bound).__name__ if bound is not None else "None",
+                )
 
     @classmethod
     def get_tools_by_level(cls, max_level: int) -> t.List[ToolCallable]:
@@ -282,5 +393,10 @@ def load_all_tools() -> None:
     "(subject to command policy)."
 ),
         )
+
+    # Verify that every SDK tool carries the registry-derived approval hook.
+    # A mismatch here means the level-based approval policy is silently
+    # bypassed, so surface it before the service accepts traffic.
+    ToolRegistry._verify_approval_bindings()
 
     logger.info("all_tools_loaded", count=len(ToolRegistry._tools))

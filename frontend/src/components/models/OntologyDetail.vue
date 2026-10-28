@@ -111,6 +111,10 @@ watch(
           <t-icon name="error-circle" size="13px" />
           {{ t('models.ontology.warningsCount', { n: warningCount }) }}
         </span>
+        <span v-else-if="errorCount > 0" class="status-badge error">
+          <t-icon name="error-circle-filled" size="13px" />
+          {{ t('models.ontology.errorsCount', { n: errorCount }) }}
+        </span>
       </div>
       <p class="path">{{ relativePath }}</p>
     </header>
@@ -129,6 +133,36 @@ watch(
     <div v-else-if="loadError === 'unknown'" class="state-block error">
       <t-icon name="error-circle" size="16px" />
       <span>{{ t('common.error') }}</span>
+    </div>
+
+    <!-- Schema-invalid YAML: the model could not be parsed, but the backend
+         reports exactly which fields are wrong — show them instead of a
+         generic error so the user (or agent) can fix the file. -->
+    <div v-else-if="!model" class="schema-invalid">
+      <div class="state-block error schema-invalid-head">
+        <t-icon name="error-circle-filled" size="16px" />
+        <span>
+          {{ t('models.ontology.schemaInvalid') }} —
+          {{ t('models.ontology.errorsCount', { n: errorCount }) }}
+        </span>
+      </div>
+      <ul class="issue-list">
+        <li
+          v-for="(err, i) in validationErrors"
+          :key="i"
+          class="issue"
+          :class="err.severity"
+        >
+          <t-icon
+            :name="err.severity === 'error' ? 'error-circle-filled' : 'error-circle'"
+            size="13px"
+          />
+          <div class="issue-body">
+            <code class="issue-path">{{ err.path }}</code>
+            <span class="issue-msg">{{ err.message }}</span>
+          </div>
+        </li>
+      </ul>
     </div>
 
     <template v-else-if="model">
@@ -215,6 +249,62 @@ watch(
   font-size: 11px;
   font-weight: 500;
   border-radius: 4px;
+}
+
+/* ── Schema-invalid state ── */
+.schema-invalid {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px;
+}
+
+.schema-invalid-head {
+  margin-bottom: 12px;
+}
+
+.issue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  font-size: 12px;
+}
+
+.issue.error {
+  border-color: var(--td-error-color-3);
+}
+
+.issue.warning {
+  border-color: var(--td-warning-color-3);
+}
+
+.issue-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.issue-path {
+  font-family: var(--td-font-family-mono);
+  color: var(--td-text-color-primary);
+  word-break: break-all;
+}
+
+.issue-msg {
+  color: var(--td-text-color-secondary);
+  word-break: break-word;
 }
 
 .status-badge.ok {

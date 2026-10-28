@@ -556,6 +556,8 @@ export default {
       // Header validation badge
       valid: '校验通过',
       errorsCount: '{n} 个错误',
+
+      schemaInvalid: 'Ontology 文件不符合 schema 定义',
       warningsCount: '{n} 个警告',
       validationIssues: '校验问题',
       // Stats / sections

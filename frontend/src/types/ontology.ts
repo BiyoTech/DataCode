@@ -132,8 +132,11 @@ export interface OntologyValidationError {
 }
 
 // Response envelope of GET /api/v1/ontology/{name}.
+// `model` is null when the YAML fails schema validation — the per-field
+// errors are then reported in `validation_errors` (schema_invalid: true).
 export interface OntologyModelResult {
-  model: SemanticModel
+  model: SemanticModel | null
+  schema_invalid?: boolean
   validation_errors: OntologyValidationError[]
   sqlmesh_checked: boolean
 }

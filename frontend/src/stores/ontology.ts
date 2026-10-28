@@ -100,7 +100,11 @@ export const useOntologyStore = defineStore('ontology', () => {
 
     if (!data) return null
     // Normalise the wire shape (relationships use aliased `from` / `to`).
-    data.model = _normaliseModel(data.model)
+    // `model` is null when the YAML fails schema validation — the per-field
+    // errors travel in `validation_errors` and the detail view renders them.
+    if (data.model) {
+      data.model = _normaliseModel(data.model)
+    }
     return data
   }
 

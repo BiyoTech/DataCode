@@ -572,6 +572,8 @@ export default {
       // Header validation badge
       valid: 'Valid',
       errorsCount: '{n} errors',
+
+      schemaInvalid: 'Ontology YAML failed schema validation',
       warningsCount: '{n} warnings',
       validationIssues: 'Validation Issues',
       // Stats / sections

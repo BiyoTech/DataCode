@@ -76,6 +76,34 @@ class OntologySchemaError(ValueError):
             f"with {len(errors)} error(s)"
         )
 
+    def to_validation_errors(self) -> list["ValidationError"]:
+        """Convert to the same ``ValidationError`` shape cross-ref checks use.
+
+        Keeping one error shape means the API, the CLI renderer, and the
+        frontend all display schema and cross-reference errors identically,
+        and an agent reading the output can map each item straight back to a
+        YAML path to fix. The offending input value is folded into the
+        message (truncated) because "Input should be ..." alone does not say
+        what was actually found.
+        """
+        rendered: list[ValidationError] = []
+        for err in self.errors:
+            message = str(err.get("message", ""))
+            input_value = err.get("input")
+            if input_value is not None:
+                snippet = repr(input_value)
+                if len(snippet) > 80:
+                    snippet = snippet[:77] + "..."
+                message = f"{message} (got {snippet})"
+            rendered.append(
+                ValidationError(
+                    path=str(err.get("location", "?")),
+                    message=message,
+                    severity="error",
+                )
+            )
+        return rendered
+
 
 # ============================================================
 # AI Context — structured prompts attachable at every level

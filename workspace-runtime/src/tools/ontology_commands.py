@@ -79,7 +79,16 @@ async def _validate(argv: Sequence[str], workspace_path: str) -> dict[str, Any]:
 
     from src.api.rest.ontology import validate_ontology
 
-    outcome = await validate_ontology(name=name, workspace_path=workspace_path)
+    try:
+        outcome = await validate_ontology(name=name, workspace_path=workspace_path)
+    except Exception as exc:  # noqa: BLE001 — the CLI must never crash the run
+        return render.result(
+            _EXIT_INVALID,
+            stdout=(
+                f'Ontology "{name}" could not be validated: '
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
     errors = [_as_dict(error) for error in outcome.get("errors") or []]
     if outcome.get("valid"):
         return render.result(
@@ -89,8 +98,14 @@ async def _validate(argv: Sequence[str], workspace_path: str) -> dict[str, Any]:
     lines = [
         f'Ontology "{name}" is INVALID ({len(errors)} error(s)):',
         "",
-        *render.validation_errors(errors),
     ]
+    if outcome.get("error_kind") == "schema":
+        lines.append(
+            "  The ontology YAML does not match the schema. "
+            "Fix the fields listed below (path: message)."
+        )
+        lines.append("")
+    lines.extend(render.validation_errors(errors))
     return render.result(_EXIT_INVALID, stdout="\n".join(lines))
 
 
@@ -111,7 +126,20 @@ async def _validate_all(workspace_path: str) -> dict[str, Any]:
     # ontologies for output nobody reads out of order anyway.
     for index, summary in enumerate(summaries, start=1):
         name = _as_dict(summary).get("name", "?")
-        outcome = await validate_ontology(name=name, workspace_path=workspace_path)
+        try:
+            outcome = await validate_ontology(name=name, workspace_path=workspace_path)
+        except Exception as exc:  # noqa: BLE001 — one bad file must not kill --all
+            # Schema-invalid YAML is already handled inside the handler (it
+            # returns structured errors); this guards the residual cases
+            # (e.g. YAML that is not a mapping, permission issues) so the
+            # agent still gets a readable, fixable per-file error.
+            lines.append(
+                f"[{index}/{total}] {name} ... INVALID "
+                f"(could not validate: {type(exc).__name__}: {exc})"
+            )
+            lines.append("")
+            invalid_count += 1
+            continue
         errors = [_as_dict(error) for error in outcome.get("errors") or []]
         if outcome.get("valid"):
             lines.append(f"[{index}/{total}] {name} ... VALID")

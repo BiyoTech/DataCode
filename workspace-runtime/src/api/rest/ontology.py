@@ -27,6 +27,7 @@ from src.ontology.models import (
     MetricDetail,
     MetricSummary,
     ModelSummary,
+    OntologySchemaError,
     RelationshipSummary,
     SemanticModel,
     ValidationError,
@@ -217,11 +218,30 @@ async def get_ontology(
         dict with ``model`` (SemanticModel), ``validation_errors`` (list of
         ValidationError), and ``sqlmesh_checked`` (whether SQLMesh existence
         checks were applied).
+
+        When the YAML fails schema validation the response degrades
+        gracefully: ``model`` is ``null``, ``schema_invalid`` is ``True``, and
+        ``validation_errors`` carries per-field errors — a 400 here would only
+        show the user an opaque failure and leave the agent nothing to act on.
     """
     try:
         registry, _ = _build_services(workspace_path)
 
-        model = registry.get_model(name)
+        try:
+            model = registry.get_model(name)
+        except OntologySchemaError as e:
+            logger.info(
+                "ontology_schema_invalid",
+                workspace=workspace_path,
+                ontology=name,
+                error_count=len(e.errors),
+            )
+            return {
+                "model": None,
+                "schema_invalid": True,
+                "validation_errors": e.to_validation_errors(),
+                "sqlmesh_checked": False,
+            }
         errors, sqlmesh_checked = await _validate_model(model, workspace_path, check_sqlmesh)
 
         logger.info(
@@ -233,6 +253,7 @@ async def get_ontology(
         )
         return {
             "model": model,
+            "schema_invalid": False,
             "validation_errors": errors,
             "sqlmesh_checked": sqlmesh_checked,
         }
@@ -266,10 +287,31 @@ async def validate_ontology(
     Returns:
         dict with ``ontology_name``, ``valid`` (bool), ``errors`` (list of
         ValidationError), and ``sqlmesh_checked`` (bool).
+
+    A YAML that fails schema validation is reported as ``valid=False`` with
+    ``error_kind="schema"`` and per-field errors — NOT as an HTTP 400. The
+    validate output is consumed by the ``sqlmesh ontology validate`` CLI and
+    by agents that fix the YAML from the reported paths, so an invalid file
+    is a normal, actionable result, not a transport-level failure.
     """
     try:
         registry, _ = _build_services(workspace_path)
-        model = registry.get_model(name)
+        try:
+            model = registry.get_model(name)
+        except OntologySchemaError as e:
+            logger.info(
+                "ontology_schema_invalid",
+                workspace=workspace_path,
+                ontology=name,
+                error_count=len(e.errors),
+            )
+            return {
+                "ontology_name": name,
+                "valid": False,
+                "error_kind": "schema",
+                "errors": e.to_validation_errors(),
+                "sqlmesh_checked": False,
+            }
         errors, sqlmesh_checked = await _validate_model(model, workspace_path, check_sqlmesh)
 
         logger.info(
@@ -282,6 +324,7 @@ async def validate_ontology(
         return {
             "ontology_name": name,
             "valid": len(errors) == 0,
+            "error_kind": "cross_reference",
             "errors": errors,
             "sqlmesh_checked": sqlmesh_checked,
         }
